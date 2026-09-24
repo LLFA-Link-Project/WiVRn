@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WiVRn contributors <git-am@invalid>
+Date: Thu, 24 Sep 2026 00:00:00 +0000
+Subject: [PATCH] survive: Handle WiVRn discovery and cleanup without a prober
+
+---
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -49,7 +49,9 @@
+ 
+ 
+ // If we haven't gotten a config for devices this long after startup, just start without those devices
+-#define DEFAULT_WAIT_TIMEOUT 3.5f
++#define DEFAULT_WAIT_TIMEOUT 12.0f
++#define MIN_DISCOVERY_TIME 3.0f
++#define DISCOVERY_QUIET_TIME 2.0f
+ 
+ // index in sys->controllers[] array
+ #define SURVIVE_LEFT_CONTROLLER_INDEX 0
+@@ -72,6 +74,8 @@
+ 	U_LOG_D("destroying survive device");
+ 	struct survive_device *survive = (struct survive_device *)xdev;
+ 
++	// The event thread looks up devices through these pointers under this lock.
++	os_mutex_lock(&survive->sys->lock);
+ 	if (survive == survive->sys->hmd) {
+ 		survive_vp2_teardown(survive);
+ 		vive_config_teardown(&survive->hmd.config);
+@@ -89,8 +93,10 @@
+ 			all_null = false;
+ 		}
+ 	}
+-
+-	if (survive->sys->hmd == NULL && all_null) {
++	bool last_device = survive->sys->hmd == NULL && all_null;
++	os_mutex_unlock(&survive->sys->lock);
++
++	if (last_device) {
+ 		U_LOG_D("Tearing down libsurvive context");
+ 
+ 		// Remove the variable tracking.
+@@ -1234,44 +1240,51 @@
+ 	 */
+ 	os_nanosleep(250 * 1000 * 1000);
+ 
+-	size_t objs = survive_simple_get_object_count(ss->ctx);
+-	U_LOG_IFL_D(ss->log_level, "Object count: %zu", objs);
+-
+ 	timepoint_ns start = os_monotonic_get_ns();
+-
+-	// First count how many non-lighthouse objects libsurvive knows.
+-	// Then poll events until we have gotten configs for this many, or until timeout.
+-	int configs_to_wait_for = 0;
++	timepoint_ns last_device_event = start;
++
++	// libsurvive may enumerate USB devices after the initial 250ms sleep.
++	// Keep refreshing the expected count while their configs are loading.
++	int configs_to_wait_for = -1;
+ 	int configs_gotten = 0;
+ 
+-	for (const SurviveSimpleObject *sso = survive_simple_get_first_object(ss->ctx); sso;
+-	     sso = survive_simple_get_next_object(ss->ctx, sso)) {
+-		enum SurviveSimpleObject_type t = survive_simple_object_get_type(sso);
+-		const char *name = survive_simple_object_name(sso);
+-		U_LOG_IFL_D(ss->log_level, "Object name %s: type %d", name, t);
+-
+-		// we only want to wait for configs of HMDs and controllers / trackers.
+-		// Note: HMDs will be of type SurviveSimpleObject_OBJECT until the config is loaded.
+-		if (t == SurviveSimpleObject_HMD || t == SurviveSimpleObject_OBJECT) {
+-			configs_to_wait_for++;
+-		}
+-	}
+-
+-	U_LOG_IFL_D(ss->log_level, "Waiting for %d configs", configs_to_wait_for);
+-	while (configs_gotten < configs_to_wait_for) {
++	while (true) {
++		int current_count = 0;
++		for (const SurviveSimpleObject *sso = survive_simple_get_first_object(ss->ctx); sso;
++		     sso = survive_simple_get_next_object(ss->ctx, sso)) {
++			enum SurviveSimpleObject_type t = survive_simple_object_get_type(sso);
++			// HMDs may still appear as OBJECT until their config is loaded.
++			if (t == SurviveSimpleObject_HMD || t == SurviveSimpleObject_OBJECT) {
++				current_count++;
++			}
++		}
++		if (current_count != configs_to_wait_for) {
++			configs_to_wait_for = current_count;
++			last_device_event = os_monotonic_get_ns();
++			U_LOG_IFL_D(ss->log_level, "Waiting for %d survive device configs", configs_to_wait_for);
++		}
++
+ 		struct SurviveSimpleEvent event = {0};
+ 		while (survive_simple_next_event(ss->ctx, &event) != SurviveSimpleEventType_None) {
+ 			if (event.event_type == SurviveSimpleEventType_ConfigEvent) {
+ 				_process_event(ss, &event);
+ 				configs_gotten++;
++				last_device_event = os_monotonic_get_ns();
+ 				U_LOG_IFL_D(ss->log_level, "Got config from device: %d/%d", configs_gotten,
+ 				            configs_to_wait_for);
++			} else if (event.event_type == SurviveSimpleEventType_DeviceAdded) {
++				last_device_event = os_monotonic_get_ns();
+ 			} else {
+ 				U_LOG_IFL_T(ss->log_level, "Skipping event type %d", event.event_type);
+ 			}
+ 		}
+ 
+-		if (time_ns_to_s(os_monotonic_get_ns() - start) > ss->wait_timeout) {
++		timepoint_ns now = os_monotonic_get_ns();
++		if (time_ns_to_s(now - start) >= MIN_DISCOVERY_TIME && configs_gotten >= configs_to_wait_for &&
++		    time_ns_to_s(now - last_device_event) >= DISCOVERY_QUIET_TIME) {
++			break;
++		}
++		if (time_ns_to_s(now - start) > ss->wait_timeout) {
+ 			U_LOG_IFL_D(ss->log_level, "Timed out after getting configs for %d/%d devices", configs_gotten,
+ 			            configs_to_wait_for);
+ 			break;
+@@ -1356,6 +1369,22 @@
+ 
+ 	ss->wait_timeout = DEFAULT_WAIT_TIMEOUT;
+ 
++	// Device destruction also tears down these objects on startup failure.
++	int ret = os_mutex_init(&ss->lock);
++	if (ret != 0) {
++		U_LOG_IFL_E(ss->log_level, "Failed to init mutex!");
++		survive_simple_close(ss->ctx);
++		free(ss);
++		return 0;
++	}
++	ret = os_thread_helper_init(&ss->event_thread);
++	if (ret != 0) {
++		U_LOG_IFL_E(ss->log_level, "Failed to init event thread helper!");
++		os_mutex_destroy(&ss->lock);
++		survive_simple_close(ss->ctx);
++		free(ss);
++		return 0;
++	}
+ 
+ 	while (!add_connected_devices(ss)) {
+ 		U_LOG_IFL_E(ss->log_level, "Failed to get device config from survive");
+@@ -1376,36 +1405,31 @@
+ 	}
+ 
+ 	for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
+-
+-		if (out_idx == XRT_MAX_DEVICES_PER_PROBE - 1) {
+-			U_LOG_IFL_W(ss->log_level, "Probed max of %d devices, ignoring further devices",
+-			            XRT_MAX_DEVICES_PER_PROBE);
+-			return out_idx;
+-		}
+-
+ 		if (ss->controllers[i] != NULL) {
+-			out_xdevs[out_idx++] = &ss->controllers[i]->base;
+-		}
+-	}
+-
+-	// Mutex before thread.
+-	int ret = os_mutex_init(&ss->lock);
+-	if (ret != 0) {
+-		U_LOG_IFL_E(ss->log_level, "Failed to init mutex!");
+-		survive_device_destroy((struct xrt_device *)ss->hmd);
+-		for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
+-			survive_device_destroy((struct xrt_device *)ss->controllers[i]);
+-		}
++			if (out_idx == XRT_MAX_DEVICES_PER_PROBE) {
++				U_LOG_IFL_W(ss->log_level, "Probed max of %d devices, ignoring further devices",
++				            XRT_MAX_DEVICES_PER_PROBE);
++				survive_device_destroy(&ss->controllers[i]->base);
++			} else {
++				out_xdevs[out_idx++] = &ss->controllers[i]->base;
++			}
++		}
++	}
++
++	if (out_idx == 0) {
++		os_thread_helper_destroy(&ss->event_thread);
++		os_mutex_destroy(&ss->lock);
++		survive_simple_close(ss->ctx);
++		free(ss);
+ 		return 0;
+ 	}
+ 
+-	os_thread_helper_init(&ss->event_thread);
+ 	ret = os_thread_helper_start(&ss->event_thread, run_event_thread, ss);
+ 	if (ret != 0) {
+ 		U_LOG_IFL_E(ss->log_level, "Failed to start event thread!");
+-		survive_device_destroy((struct xrt_device *)ss->hmd);
+-		for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
+-			survive_device_destroy((struct xrt_device *)ss->controllers[i]);
++		for (int i = 0; i < out_idx; i++) {
++			survive_device_destroy(out_xdevs[i]);
++			out_xdevs[i] = NULL;
+ 		}
+ 		return 0;
+ 	}
+diff --git a/src/xrt/drivers/survive/survive_vp2.c b/src/xrt/drivers/survive/survive_vp2.c
+--- a/src/xrt/drivers/survive/survive_vp2.c
++++ b/src/xrt/drivers/survive/survive_vp2.c
+@@ -15,6 +15,12 @@
+ bool
+ survive_vp2_init(struct survive_device *survive, struct survive_system *sys)
+ {
++	// WiVRn uses libsurvive for controllers and trackers without an xrt_prober.
++	if (sys->xp == NULL) {
++		SURVIVE_WARN(survive, "No prober available for Vive Pro 2 features");
++		return false;
++	}
++
+ 	struct xrt_prober_device **devices = NULL;
+ 	size_t device_count = 0;
+ 	xrt_result_t result = xrt_prober_lock_list(sys->xp, &devices, &device_count);
+-- 
+2.39.0

@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WiVRn contributors <git-am@invalid>
+Date: Thu, 24 Sep 2026 00:00:00 +0000
+Subject: [PATCH] survive: Clamp pose extrapolation when tracking updates stop
+
+---
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -239,7 +239,9 @@
+ 	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, name, &pose_offset);
+ 
+ 	struct xrt_space_relation space_relation;
+-	m_relation_history_get(survive->relation_hist, at_timestamp_ns, &space_relation);
++	// Avoid unbounded motion when libsurvive stops reporting a pose.
++	m_relation_history_get_clamped(survive->relation_hist, at_timestamp_ns, 50 * U_TIME_1MS_IN_NS, NULL,
++	                               &space_relation);
+ 
+ 	struct xrt_relation_chain relation_chain = {0};
+ 	m_relation_chain_push_pose(&relation_chain, &pose_offset);
+@@ -397,7 +399,8 @@
+ 
+ 	struct xrt_space_relation hand_relation;
+ 
+-	m_relation_history_get(survive->relation_hist, at_timestamp_ns, &hand_relation);
++	m_relation_history_get_clamped(survive->relation_hist, at_timestamp_ns, 50 * U_TIME_1MS_IN_NS, NULL,
++	                               &hand_relation);
+ 
+ 
+ 	u_hand_sim_simulate_for_valve_index_knuckles(&values, hand, &hand_relation, out_value);
+-- 
+2.39.0
