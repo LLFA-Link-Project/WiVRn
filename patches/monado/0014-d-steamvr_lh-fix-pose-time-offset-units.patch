@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 6 Oct 2026 18:00:00 +0900
+Subject: [PATCH] d/steamvr_lh: convert pose time offset from seconds to nanoseconds
+
+DriverPose_t::poseTimeOffset is expressed in seconds relative to the driver's
+PoseUpdated call. The relation history uses nanoseconds, so convert with 1e9
+instead of 1e6. Keep the offset and timestamp signed to support past poses
+without converting a negative floating-point offset to an unsigned integer.
+
+This changes only the pose timestamp conversion. Prediction limits and
+skeletal root handling are unchanged. User hardware testing found no notable
+fly-out improvement from this unit correction alone.
+---
+ src/xrt/drivers/steamvr_lh/device.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -1206,7 +1206,9 @@
+-	const uint64_t ts = chrono_timestamp_ns() + static_cast<uint64_t>(newPose.poseTimeOffset * 1000000.0);
++	// OpenVR poseTimeOffset is in seconds; relation history timestamps are in nanoseconds.
++	const int64_t pose_time_offset_ns = static_cast<int64_t>(newPose.poseTimeOffset * 1000000000.0);
++	const int64_t ts = chrono_timestamp_ns() + pose_time_offset_ns;
+ 
+ 	m_relation_history_push(relation_hist, &relation, ts);
+ }
+ 
+ vr::ETrackedPropertyError
+ Device::handle_properties(const vr::PropertyWrite_t *batch, uint32_t count)
