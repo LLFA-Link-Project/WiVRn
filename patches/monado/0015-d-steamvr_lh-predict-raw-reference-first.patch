@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 6 Oct 2026 18:00:00 +0900
+Subject: [PATCH] d/steamvr_lh: predict tracking reference before local pose offset
+
+Device::update_pose moves the driver tracking reference through the fixed
+driver-from-head transform before storing its relation. Its linear velocity
+includes the corresponding instantaneous tangential velocity. Predicting this
+offset point linearly can differ substantially from predicting the tracking
+reference and then composing the offset during fast rotation.
+
+Resolve forward prediction through the latter order, using the same selected
+history sample and predicted orientation. Update linear velocity to match the
+predicted offset point. Tie local-transform metadata to accepted history
+samples under a per-device mutex. Exact, interpolated and reverse-predicted
+relations retain their existing behavior. Profile offsets still apply after
+prediction. The raw tracking reference is not necessarily the physical center
+of rotation; constant-velocity prediction retains that limitation.
+
+Extracted from an opt-in diagnostic comparison. User-reported WiVRn A/E tests
+found substantially improved Index behavior. Tracker behavior returned to its
+earlier state when a 50 ms clamp was restored; no raw-reference-first Tracker
+regression has been established. Improvement is qualitative, not a measured
+future-ground-truth error. This is a reference patch for review.
+
+No timestamp conversion change, prediction toggles, diagnostic logging or
+clamp-policy change is included.
+
+Base: WiVRn Monado pin 09741cbcb45236f4f4f79790ea133cd90d68d5eb plus patches 0001-0014
+---
+
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -13,6 +13,7 @@
+ #include "math/m_predict.h"
+ #include "math/m_relation_history.h"
+ #include "math/m_space.h"
++#include "math/m_vec3.h"
+ 
+ #include "interfaces/context.hpp"
+ 
+@@ -779,9 +780,50 @@
+ 	return XRT_SUCCESS;
+ }
+ 
++// Predicting the driver-from-head point linearly freezes its tangential
++// velocity. Reconstruct the raw tracking reference instead, predict it with
++// constant velocity, then compose the fixed driver-from-head transform.
++static void
++predict_raw_reference_first(const xrt_space_relation &latest,
++                       const xrt_pose &local,
++                       double delta_s,
++                       xrt_space_relation *predicted)
++{
++	if (delta_s == 0) {
++		return;
++	}
++	if (!(latest.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) ||
++	    !(latest.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) ||
++	    !(latest.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT)) {
++		return;
++	}
++
++	xrt_quat inverse_local, raw_q0, raw_q1;
++	math_quat_invert(&local.orientation, &inverse_local);
++	math_quat_rotate(&latest.pose.orientation, &inverse_local, &raw_q0);
++	math_quat_rotate(&predicted->pose.orientation, &inverse_local, &raw_q1);
++	xrt_vec3 r0, r1, tangent0, tangent1;
++	math_quat_rotate_vec3(&raw_q0, &local.position, &r0);
++	math_quat_rotate_vec3(&raw_q1, &local.position, &r1);
++	math_vec3_cross(&latest.angular_velocity, &r0, &tangent0);
++	math_vec3_cross(&predicted->angular_velocity, &r1, &tangent1);
++
++	// Current path: p0 + (v_raw + tangent0) * dt.
++	// Alternative: p0 + v_raw * dt + (r1 - r0).
++	xrt_vec3 correction = m_vec3_sub(r1, r0);
++	if (latest.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) {
++		correction = m_vec3_sub(correction, m_vec3_mul_scalar(tangent0, float(delta_s)));
++	}
++	predicted->pose.position = m_vec3_add(predicted->pose.position, correction);
++	if (latest.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) {
++		predicted->linear_velocity = m_vec3_add(m_vec3_sub(latest.linear_velocity, tangent0), tangent1);
++	}
++}
++
+ void
+ Device::get_pose(uint64_t at_timestamp_ns, xrt_space_relation *out_relation)
+ {
++	std::lock_guard<std::mutex> lock(pose_history_mutex);
+ 	static const int64_t max_extrapolation_ns = []() -> int64_t {
+ 		int64_t raw = debug_get_num_option_lh_max_extrapolation_ms();
+ 		if (raw == -1) {
+@@ -791,8 +833,17 @@
+ 		return raw * U_TIME_1MS_IN_NS;
+ 	}();
+ 
+-	m_relation_history_get_clamped(this->relation_hist, at_timestamp_ns, max_extrapolation_ns, nullptr,
+-	                               out_relation);
++	const auto result = m_relation_history_get_clamped(
++	    this->relation_hist, at_timestamp_ns, max_extrapolation_ns, nullptr, out_relation);
++	if (result == M_RELATION_HISTORY_RESULT_PREDICTED) {
++		int64_t latest_ns;
++		xrt_space_relation latest{};
++		if (m_relation_history_get_latest(relation_hist, &latest_ns, &latest)) {
++			const int64_t delta_ns = std::min(static_cast<int64_t>(at_timestamp_ns) - latest_ns, max_extrapolation_ns);
++			predict_raw_reference_first(latest, latest_driver_from_head, double(delta_ns) / 1e9,
++			                            out_relation);
++		}
++	}
+ }
+ 
+ xrt_result_t
+@@ -1222,7 +1273,11 @@
+ 	const int64_t pose_time_offset_ns = static_cast<int64_t>(newPose.poseTimeOffset * 1000000000.0);
+ 	const int64_t ts = chrono_timestamp_ns() + pose_time_offset_ns;
+ 
+-	m_relation_history_push(relation_hist, &relation, ts);
++	// Keep the transform tied to the latest accepted history sample.
++	std::lock_guard<std::mutex> lock(pose_history_mutex);
++	if (m_relation_history_push(relation_hist, &relation, ts)) {
++		latest_driver_from_head = local;
++	}
+ }
+ 
+ vr::ETrackedPropertyError
+diff --git a/src/xrt/drivers/steamvr_lh/device.hpp b/src/xrt/drivers/steamvr_lh/device.hpp
+--- a/src/xrt/drivers/steamvr_lh/device.hpp
++++ b/src/xrt/drivers/steamvr_lh/device.hpp
+@@ -131,6 +131,9 @@
+ 	handle_property_write(const vr::PropertyWrite_t &prop);
+ 
+ private:
++	// Protect history pushes/queries together with their local-transform metadata.
++	mutable std::mutex pose_history_mutex;
++	mutable xrt_pose latest_driver_from_head = XRT_POSE_IDENTITY;
+ 	vr::ITrackedDeviceServerDriver *driver;
+ 
+ 	void
