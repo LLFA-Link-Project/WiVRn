@@ -888,6 +888,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	if (next_scene)
 	{
+		next_scene->poll_decoder_frames();
 		server_hid_forwarding = next_scene->hid_forwarding_enabled();
 
 		switch (next_scene->current_state())

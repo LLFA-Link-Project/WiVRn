@@ -854,18 +854,12 @@ bool scenes::stream::is_gui_interactable() const
 	return is_interactable(gui_status);
 }
 
-void scenes::stream::render(const XrFrameState & frame_state)
+void scenes::stream::poll_decoder_frames()
 {
-	if (state_ == state::shutdown)
-		application::pop_scene();
-
-	display_time_phase = frame_state.predictedDisplayPeriod ? frame_state.predictedDisplayTime % frame_state.predictedDisplayPeriod : 0;
-	display_time_period = frame_state.predictedDisplayPeriod;
-	real_display_period = last_display_time ? frame_state.predictedDisplayTime - last_display_time : frame_state.predictedDisplayPeriod;
-	last_display_time = frame_state.predictedDisplayTime;
-
-	std::shared_lock lock(decoder_mutex);
 #if WIVRN_USE_GSTREAMER && !defined(__ANDROID__)
+	std::shared_lock lock(decoder_mutex);
+	if (state_ == state::shutdown)
+		return;
 	try
 	{
 		for (auto & item: decoders)
@@ -881,6 +875,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		exit();
 	}
 #endif
+}
+
+void scenes::stream::render(const XrFrameState & frame_state)
+{
+	if (state_ == state::shutdown)
+		application::pop_scene();
+
+	display_time_phase = frame_state.predictedDisplayPeriod ? frame_state.predictedDisplayTime % frame_state.predictedDisplayPeriod : 0;
+	display_time_period = frame_state.predictedDisplayPeriod;
+	real_display_period = last_display_time ? frame_state.predictedDisplayTime - last_display_time : frame_state.predictedDisplayPeriod;
+	last_display_time = frame_state.predictedDisplayTime;
+
+	poll_decoder_frames();
+	std::shared_lock lock(decoder_mutex);
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
 	{
 		// TODO: stop/restart video stream

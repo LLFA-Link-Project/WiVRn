@@ -249,6 +249,8 @@ public:
 	void operator()(audio_data &&);
 
 	void push_blit_handle(wivrn::shard_accumulator * decoder, std::shared_ptr<wivrn::shard_accumulator::blit_handle> handle);
+	// Called on the render thread even while the lobby waits for initial frames.
+	void poll_decoder_frames();
 
 	void send_feedback(const wivrn::from_headset::feedback & feedback);
 

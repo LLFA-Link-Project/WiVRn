@@ -3,7 +3,9 @@
 This optional backend accepts WiVRn H.264/HEVC/AV1 access units and imports the
 converter's AR24 DMA-BUF output into Vulkan. It uses the installed GStreamer
 V4L2 devices, with no Rockchip device paths or driver names compiled in.
-RK3588/PanVK display and latency are **not yet verified** by this implementation.
+Orange Pi 5 startup logs verify H.264 decoding, RGA AR24 DMA-BUF output, and
+PanVK import in the explicit converter input copy mode. Actual headset display
+and latency are **not yet verified**.
 
 ## Build and select
 
@@ -57,6 +59,11 @@ FIFO position, or a guessed display timestamp. Missing/stale metadata causes an
 output to be discarded. Each decoder/pipeline has its own PTS map, reset on stream
 recreation. Resolution changes in samples create fresh Vulkan images with their
 actual metadata dimensions; a changed stream description recreates the decoder.
+
+Decoded frames are collected on the render thread both while the lobby waits
+for the first stereo frames and while the stream scene is active. The lobby must
+poll before checking stream readiness: waiting for stream rendering to collect
+the first frames would prevent the scene from ever becoming ready.
 
 ## Memory and synchronization
 
