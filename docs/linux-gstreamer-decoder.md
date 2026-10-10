@@ -46,6 +46,35 @@ default) and `unorm` are also accepted. This changes only the GStreamer backend;
 other decoders and the shared reprojection shader are unchanged. Corrected
 color appearance was verified in the Orange Pi configuration described above.
 
+## Brief blackout comparison
+
+The Orange Pi log's Monado revision `f2222d155` matches the local Monado source.
+In that source, `oxr_session_frame_begin` discards the preceding begun frame when
+it was not ended. `multi_compositor_discard_frame` also clears the **delivered**
+layer slot, and `transfer_layers_locked` omits clients without an active delivered
+slot. WiVRn normally leaves a repeated video frame begun but unended, expecting
+the runtime to keep time-warping the preceding image. These two behaviors can
+remove the displayed content until a new frame is delivered. This is a concrete
+candidate for recurring blackouts, not yet a headset-verified cause.
+
+Set `WIVRN_STREAM_DISCARD_FRAMES=0` to disable only that repeated-frame rendering
+shortcut. WiVRn then samples its retained decoded images and submits the projection
+layer again, using the existing GPU fence and FOREIGN ownership barriers. This
+does not disable Monado time warp or change decoding, color conversion, frame
+selection, or menu controls. It increases rendering/submission work on repeats.
+Unset the variable (or use `1`) for the existing behavior; it never enables
+discarding on a headset whose traits already prohibit it.
+
+For either comparison, `WIVRN_STREAM_PROFILE=1` reports every five seconds:
+`rendered` counts completed `render_end` calls, `discarded` counts repeated-frame
+shortcuts (no `xrEndFrame`), and `empty` counts explicit empty submissions
+(`shouldRender` false, missing stereo frames, or stream shutdown). These are
+application decisions, not KMS scanout measurements. Reports are disabled by
+default. Test both modes with the same VR application and hidden menu for at
+least 60 seconds after startup. If disabling discard eliminates blackouts while
+`discarded=0` and `empty=0`, that supports this cause. If they persist, continue
+investigating decoded pixels, DMA-BUF sampling, and compositor presentation.
+
 ## Build and select
 
 Use a separate build directory; preserve the working software-decoder build.

@@ -33,6 +33,7 @@
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
 #include "xr/space.h"
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -87,6 +88,11 @@ private:
 	std::atomic<XrDuration> display_time_phase = 0;
 	std::atomic<XrDuration> display_time_period = 0;
 	XrTime last_display_time = 0;
+	bool submit_repeated_frames = false;
+	bool presentation_profile = false;
+	std::chrono::steady_clock::time_point presentation_report_started;
+	std::array<uint64_t, 3> presentation_counts{}; // rendered, discarded, empty
+	void record_presentation(size_t outcome);
 	std::atomic<XrDuration> real_display_period = 0;
 	std::optional<std::thread> tracking_thread;
 

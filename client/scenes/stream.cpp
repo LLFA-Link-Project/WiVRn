@@ -40,8 +40,10 @@
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <ranges>
+#include <string_view>
 #include <thread>
 #include <vulkan/vulkan_raii.hpp>
 
@@ -202,6 +204,16 @@ scenes::stream::stream(std::string server_name, scene & parent_scene) :
         scene_impl<stream>(supported_color_formats, supported_depth_formats, parent_scene),
         apps{*this, std::move(server_name)}
 {
+	// Opt-in comparison for runtimes which retire the displayed layer on discard.
+	if (const char * value = std::getenv("WIVRN_STREAM_DISCARD_FRAMES"))
+		submit_repeated_frames = std::string_view(value) == "0";
+	if (const char * value = std::getenv("WIVRN_STREAM_PROFILE"))
+		presentation_profile = std::string_view(value) == "1";
+	presentation_report_started = std::chrono::steady_clock::now();
+	if (submit_repeated_frames or presentation_profile)
+		spdlog::info("Stream presentation: discard_repeated_frames={} profile={} runtime={}",
+		             application::get_hmd_traits().discard_frame and not submit_repeated_frames,
+		             presentation_profile, instance.get_runtime_name());
 	auto views = system.view_configuration_views(viewconfig);
 	width = views[0].recommendedImageRectWidth;
 	height = views[0].recommendedImageRectHeight;
@@ -877,6 +889,21 @@ void scenes::stream::poll_decoder_frames()
 #endif
 }
 
+void scenes::stream::record_presentation(size_t outcome)
+{
+	if (not presentation_profile)
+		return;
+	++presentation_counts[outcome];
+	auto now = std::chrono::steady_clock::now();
+	if (now - presentation_report_started < std::chrono::seconds(5))
+		return;
+	spdlog::info("Stream presentation: seconds={:.3f} rendered={} discarded={} empty={}",
+	             std::chrono::duration<double>(now - presentation_report_started).count(),
+	             presentation_counts[0], presentation_counts[1], presentation_counts[2]);
+	presentation_counts.fill(0);
+	presentation_report_started = now;
+}
+
 void scenes::stream::render(const XrFrameState & frame_state)
 {
 	if (state_ == state::shutdown)
@@ -894,6 +921,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// TODO: stop/restart video stream
 		session.begin_frame();
 		session.end_frame(frame_state.predictedDisplayTime, {});
+		record_presentation(2);
 		return;
 	}
 
@@ -1064,7 +1092,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	}
 
 	// Allow the headset to time warp if we are redisplaying a frame
-	if ((not application::get_hmd_traits().discard_frame) or
+	if (submit_repeated_frames or (not application::get_hmd_traits().discard_frame) or
 	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
 	    is_gui_interactable())
 	{
@@ -1249,6 +1277,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		try
 		{
 			render_end();
+			record_presentation(0);
 		}
 		catch (std::system_error & e)
 		{
@@ -1257,6 +1286,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			else
 				throw;
 		}
+	}
+	else
+	{
+		// No xrEndFrame: the next xrBeginFrame discards this begun frame.
+		record_presentation(1);
 	}
 
 	// Network operations may be blocking, do them once everything was submitted
