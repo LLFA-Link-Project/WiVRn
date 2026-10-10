@@ -23,6 +23,7 @@
 #include "constants.h"
 #include "image_loader.h"
 #include "openxr/openxr.h"
+#include "render/pointer_intersection.h"
 #include "ui_theme.h"
 #include "utils/mapped_file.h"
 #include "utils/ranges.h"
@@ -35,8 +36,12 @@
 #include <algorithm>
 #include <backends/imgui_impl_vulkan.h>
 #include <boost/locale.hpp>
+#include <cfloat>
 #include <cmath>
 #include <cstddef>
+#ifndef __ANDROID__
+#include <linux/input-event-codes.h>
+#endif
 #include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <imgui.h>
@@ -224,38 +229,15 @@ std::vector<std::pair<ImVec2, float>> imgui_context::ray_plane_intersection(cons
 		if (i.space != xr::spaces::world or i.tooltip_viewport)
 			continue;
 
-		auto M = glm::transpose(glm::mat3_cast(i.orientation)); // world-to-plane transform
-
-		glm::quat q = (in.source == ImGuiMouseSource_VRHandTracking) ? i.orientation : in.aim_orientation;
-		glm::vec3 controller_direction = -glm::column(glm::mat3_cast(q), 2); // The aim direction is -Z
-
-		// Compute all vectors in the reference frame of the GUI plane
-		glm::vec3 ray_start = M * (in.aim_position - i.position);
-		glm::vec3 ray_dir = M * controller_direction;
-
-		if (ray_dir.z < -0.0001f)
+		const glm::quat q = (in.source == ImGuiMouseSource_VRHandTracking) ? i.orientation : in.aim_orientation;
+		const glm::vec3 direction = -glm::column(glm::mat3_cast(q), 2);
+		if (auto hit = wivrn::intersect_ui_panel(in.aim_position, direction, i.position, i.orientation, i.size, in.source == ImGuiMouseSource_VRHandTracking ? constants::gui::fingertip_distance_touching_thd_lo : 0))
 		{
-			glm::vec2 coord;
-
-			// ray_start + distance × ray_dir ∈ imgui plane
-			// => ray_start.z + distance × ray_dir.z = 0
-			float distance = -ray_start.z / ray_dir.z;
-
+			const auto [coord, distance] = *hit;
 			if (distance < constants::gui::min_controller_distance and in.source == ImGuiMouseSource_VRController)
 				continue;
-
 			if (distance < constants::gui::fingertip_distance_touching_thd_lo and in.source == ImGuiMouseSource_VRHandTracking)
 				continue;
-
-			coord.x = ray_start.x + distance * ray_dir.x;
-			coord.y = ray_start.y + distance * ray_dir.y;
-
-			// Convert from mesh coordinates to imgui coordinates
-			coord = coord / i.size;
-
-			if (fabs(coord.x) > 0.5 or fabs(coord.y) > 0.5)
-				continue;
-
 			intersections.emplace_back(ImVec2(
 			                                   (0.5 + coord.x) * i.vp_size.x + i.vp_origin.x,
 			                                   (0.5 - coord.y) * i.vp_size.y + i.vp_origin.y),
@@ -778,39 +760,105 @@ void imgui_context::new_frame(XrTime display_time)
 		io.DeltaTime = std::clamp((display_time - last_display_time) * 1e-9f, 0.001f, 0.0166f);
 	last_display_time = display_time;
 
+	local_pin_keys.clear();
 	// Uses the window list from last frame
 	auto new_states = read_controllers_state(display_time);
 
-	// Set the currently active controller
+	// Controllers/hands retain hover priority. Space can explicitly take over
+	// for head gaze, but never interrupts a controller/hand drag.
 	size_t new_focused_controller = choose_focused_controller(new_states);
-
-	bool focused_change = new_focused_controller != focused_controller && focused_controller != (size_t)-1;
-
-	// Set the source for the following events
-	if (focused_controller != (size_t)-1)
-		io.AddMouseSourceEvent(new_states[focused_controller].source);
-
-	if (new_focused_controller != (size_t)-1)
+	if (new_focused_controller >= new_states.size() or not new_states[new_focused_controller].pointer_position)
+		new_focused_controller = (size_t)-1;
+	const bool controller_down = std::ranges::any_of(new_states, [](const auto & state) {
+		return state.trigger_clicked or state.fingertip_touching;
+	});
+	const bool local_focused = application::get_session_state() == XR_SESSION_STATE_FOCUSED;
+	gaze_state = {};
+	bool gaze_used = gaze_click.pressed();
+	const bool was_gaze_active = gaze_active;
+	if (head_gaze_enabled)
 	{
-		auto scroll = new_states[new_focused_controller].scroll_value;
-
-		button_pressed = new_states[new_focused_controller].trigger_clicked;
-		fingertip_touching = new_states[new_focused_controller].fingertip_touching;
-
-		// Focused controller changed: end the current click for this frame
-		io.AddMouseButtonEvent(0, (button_pressed or fingertip_touching) and not focused_change);
-
-		if (auto position = new_states[new_focused_controller].pointer_position)
+		const auto * modal = ImGui::GetTopMostAndVisiblePopupModal();
+		const ImGuiID modal_id = modal ? modal->ID : 0;
+		if (modal_id != local_modal or not local_focused)
+			suspend_local_input();
+		local_modal = modal_id;
+		if (local_focused)
 		{
-			io.AddMousePosEvent(position->x, position->y);
-
-			if (glm::length(scroll) > constants::gui::scroll_value_thd)
+			if (auto pose = application::locate_controller(application::space(xr::spaces::view), world, display_time))
 			{
-				io.MouseWheel = scroll.y;
-				io.MouseWheelH = scroll.x;
+				gaze_state.aim_position = pose->first;
+				gaze_state.aim_orientation = pose->second;
+				gaze_state.pointer_position = compute_pointer_position(gaze_state).first;
 			}
 		}
+		if (not gaze_state.pointer_position or io.WantTextInput)
+			gaze_click.cancel();
+#ifndef __ANDROID__
+		if (local_focused)
+		{
+			if (not local_keyboard)
+				local_keyboard = std::make_unique<wivrn::local_keyboard>();
+			const auto events = local_keyboard->poll();
+			if (std::ranges::any_of(events, [](const auto & event) { return event.code == wivrn::local_keyboard::input_lost; }))
+			{
+				// Do not replay a queued press after unplug/SYN_DROPPED.
+				suspend_local_input();
+				gaze_used = false;
+			}
+			else
+				for (auto event: events)
+					keyboard_events.push_back(event);
+			while (not keyboard_events.empty())
+			{
+				const auto event = keyboard_events.front();
+				keyboard_events.pop_front();
+				keyboard_ui.event(event.code, event.value, io, io.WantTextInput);
+				if (event.value == 1 and not io.WantTextInput and local_modal)
+					if (auto digit = wivrn::keyboard_ui::pin_key(event.code))
+						local_pin_keys.push_back(*digit);
+				if (event.code == KEY_SPACE and event.value != 2)
+				{
+					const bool before = gaze_click.pressed();
+					gaze_click.key(event.value == 1, gaze_state.pointer_position.has_value() and not io.WantTextInput and not controller_down);
+					if (before or gaze_click.pressed())
+					{
+						gaze_used = true;
+						// Deliver at most one Space edge per frame, including a
+						// complete tap received between two rendered frames.
+						break;
+					}
+				}
+			}
+		}
+#endif
 	}
+	gaze_active = head_gaze_enabled and local_focused and
+	              (gaze_used or gaze_click.pressed() or new_focused_controller == (size_t)-1);
+	if (gaze_active and controller_down)
+		controller_click_suppressed = true;
+	if (not controller_down)
+		controller_click_suppressed = false;
+	const bool focused_change = (was_gaze_active != gaze_active) or (new_focused_controller != focused_controller and focused_controller != (size_t)-1) or
+	                            (gaze_active and controller_down);
+	const controller_state * pointer = gaze_active ? &gaze_state : (new_focused_controller != (size_t)-1 ? &new_states[new_focused_controller] : nullptr);
+	button_pressed = gaze_active ? gaze_click.pressed() : (pointer and pointer->trigger_clicked);
+	fingertip_touching = not gaze_active and pointer and pointer->fingertip_touching;
+	if (not gaze_active and controller_click_suppressed)
+		button_pressed = fingertip_touching = false;
+	if (head_gaze_enabled and not local_focused)
+	{
+		pointer = nullptr;
+		button_pressed = fingertip_touching = false;
+	}
+	io.AddMouseSourceEvent(pointer ? pointer->source : ImGuiMouseSource_Mouse);
+	if (pointer and pointer->pointer_position)
+		io.AddMousePosEvent(pointer->pointer_position->x, pointer->pointer_position->y);
+	else
+		io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+	io.AddMouseButtonEvent(0, (button_pressed or fingertip_touching) and (gaze_active or not focused_change));
+	if (pointer and pointer->pointer_position and glm::length(pointer->scroll_value) > constants::gui::scroll_value_thd)
+		io.AddMouseWheelEvent(pointer->scroll_value.x, pointer->scroll_value.y);
 
 	focused_controller = new_focused_controller;
 	for (auto && [controller, next_state]: std::views::zip(controllers, new_states))
@@ -845,7 +893,7 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 	if (hovered_item != hovered_item_prev && hovered_item != 0)
 	{
 		size_t controller = get_focused_controller();
-		if (auto haptic_output = controllers[controller].first.haptic_output; haptic_output != XR_NULL_HANDLE)
+		if (auto haptic_output = not gaze_active and controller < controllers.size() ? controllers[controller].first.haptic_output : XR_NULL_HANDLE; haptic_output != XR_NULL_HANDLE)
 			application::haptic_start(haptic_output, XR_NULL_PATH, 10'000'000, 1000, 1);
 	}
 
@@ -854,9 +902,14 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 	ImGui::SetCurrentContext(context);
 	ImPlot::SetCurrentContext(plot_context);
 
-	for (auto & controller: controllers)
+	std::vector<const controller_state *> pointers;
+	for (const auto & controller: controllers)
+		pointers.push_back(&controller.second);
+	if (gaze_active)
+		pointers.push_back(&gaze_state);
+	for (const auto * pointer: pointers)
 	{
-		if (auto position = controller.second.pointer_position)
+		if (auto position = pointer->pointer_position)
 		{
 			// Clip in the right plane
 			ImVec2 clip_rect_min(0, 0);
@@ -921,7 +974,8 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 
 			float alpha = std::clamp<float>(1 - distance / constants::gui::pointer_fading_distance, 0, 1);
 
-			if (focused_controller != (size_t)-1 and &controller == &controllers[focused_controller])
+			if ((gaze_active and pointer == &gaze_state) or
+			    (not gaze_active and focused_controller < controllers.size() and pointer == &controllers[focused_controller].second))
 				alpha *= constants::gui::pointer_alpha;
 			else
 				alpha *= constants::gui::pointer_alpha_disabled;
@@ -1416,4 +1470,31 @@ void CenterTextHV(const std::string & text)
 		ImGui::Text("%s", i.c_str());
 	}
 	ImGui::PopStyleVar();
+}
+
+void imgui_context::set_head_gaze_enabled(bool enabled)
+{
+	suspend_local_input();
+	head_gaze_enabled = enabled;
+}
+
+void imgui_context::suspend_local_input()
+{
+	ImGui::SetCurrentContext(context);
+	io.ClearEventsQueue();
+	io.ClearInputKeys();
+	io.ClearInputMouse();
+	ImGui::ClearActiveID();
+	if (gaze_active or gaze_click.pressed())
+		io.AddMouseButtonEvent(0, false);
+	io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+	gaze_click = {};
+	gaze_active = false;
+	gaze_state = {};
+	local_pin_keys.clear();
+#ifndef __ANDROID__
+	keyboard_ui.reset(io);
+	keyboard_events.clear();
+	local_keyboard.reset();
+#endif
 }

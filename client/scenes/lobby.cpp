@@ -935,6 +935,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	if (not frame_state.shouldRender)
 	{
+		imgui_ctx->suspend_local_input();
 		session.begin_frame();
 		session.end_frame(frame_state.predictedDisplayTime, {});
 		return;
@@ -967,6 +968,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		if (not invalid_views_reported)
 			spdlog::warn("Lobby: skipping rendering until view poses are valid (xrLocateViews flags={:#x})", flags);
 		invalid_views_reported = true;
+		imgui_ctx->suspend_local_input();
 		session.end_frame(frame_state.predictedDisplayTime, {});
 		return;
 	}
@@ -1320,6 +1322,10 @@ void scenes::lobby::on_focused()
 	// A valid initial UI placement is needed before the first head location.
 	// Once located, check_recenter_gui replaces it with a head-relative placement.
 	move_gui({0, 0, 0}, {0, -0.1, -constants::lobby::initial_gui_distance});
+#ifndef __ANDROID__
+	const char * head_gaze = std::getenv("WIVRN_HEAD_GAZE");
+	imgui_ctx->set_head_gaze_enabled(not head_gaze or std::string_view(head_gaze) != "0");
+#endif
 
 	auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
 	auto tm = std::localtime(&t);
@@ -1419,6 +1425,8 @@ void scenes::lobby::on_xr_event(const xr::event & event)
 		case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
 			if (event.state_changed.state == XR_SESSION_STATE_FOCUSED)
 				autoconnect_enabled = true;
+			else if (imgui_ctx)
+				imgui_ctx->suspend_local_input();
 			recenter_gui = true;
 			break;
 		case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:

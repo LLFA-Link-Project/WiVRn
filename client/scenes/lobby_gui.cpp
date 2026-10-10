@@ -151,6 +151,14 @@ void scenes::lobby::gui_enter_pin(locked_notifiable<pin_request_data> & pin_requ
 {
 	namespace ui = wivrn::ui;
 	const int pin_size = 6;
+	// Physical key presses retain their arrival order, including backspace.
+	for (int digit: imgui_ctx->pin_keys())
+	{
+		if (digit < 0 and not pin_buffer.empty())
+			pin_buffer.pop_back();
+		else if (digit >= 0 and pin_buffer.size() < pin_size)
+			pin_buffer += char('0' + digit);
+	}
 
 	const ImGuiStyle & style = ImGui::GetStyle();
 	const auto & t = ui::current();
@@ -1046,6 +1054,11 @@ libcurl::curl_handle * scenes::lobby::try_get_download_handle(const std::string 
 
 std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTime predicted_display_time)
 {
+	if (local_input_tab != current_tab)
+	{
+		imgui_ctx->suspend_local_input();
+		local_input_tab = current_tab;
+	}
 	imgui_ctx->new_frame(predicted_display_time);
 	update_transfers();
 	update_file_picker();

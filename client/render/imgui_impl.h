@@ -19,6 +19,12 @@
 #pragma once
 
 #include "image_loader.h"
+#include "render/head_gaze_input.h"
+#ifndef __ANDROID__
+#include "linux/keyboard_ui.h"
+#include "linux/local_keyboard.h"
+#include <deque>
+#endif
 #include "render/growable_descriptor_pool.h"
 #include "utils/cache.h"
 #include "utils/mapped_file.h"
@@ -190,6 +196,18 @@ private:
 	size_t focused_controller = (size_t)-1;
 	XrTime last_display_time = 0;
 	bool controllers_enabled = true;
+	bool head_gaze_enabled = false;
+	bool gaze_active = false;
+	bool controller_click_suppressed = false;
+	controller_state gaze_state;
+	wivrn::head_gaze_click gaze_click;
+	ImGuiID local_modal = 0;
+	std::vector<int> local_pin_keys;
+#ifndef __ANDROID__
+	std::unique_ptr<wivrn::local_keyboard> local_keyboard;
+	wivrn::keyboard_ui keyboard_ui;
+	std::deque<wivrn::local_keyboard::key_event> keyboard_events;
+#endif
 
 	bool button_pressed = false;
 	bool fingertip_touching = false;
@@ -235,6 +253,12 @@ public:
 	viewport & layer(ImVec2 position);
 
 	void new_frame(XrTime display_time);
+	void set_head_gaze_enabled(bool enabled);
+	void suspend_local_input();
+	std::span<const int> pin_keys() const
+	{
+		return local_pin_keys;
+	}
 	std::vector<std::pair<int, XrCompositionLayerQuad>> end_frame();
 
 	size_t get_focused_controller() const
