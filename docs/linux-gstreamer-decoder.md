@@ -5,8 +5,13 @@ converter's AR24 DMA-BUF output into Vulkan. It uses the installed GStreamer
 V4L2 devices, with no Rockchip device paths or driver names compiled in.
 Orange Pi 5 startup logs verify H.264 decoding, RGA AR24 DMA-BUF output, and
 PanVK import and headset display in the explicit converter input copy mode.
-Color fidelity, latency, brief blackouts, and sustained stability remain under
-investigation; this is not yet a fully validated hardware path.
+The user also confirmed correct headset colors after the single sRGB conversion
+fix (commit `2189ec84`). The accompanying Orange Pi log verified H.264 8-bit,
+1280x1280 per eye, MMAP converter input, AR24 DMA-BUF output, UNORM sampling with
+shader conversion, and the `1:3:7:1` colorimetry override. Stable output intervals
+were approximately 59 fps. This does not verify other codecs, other colorimetry
+settings, end-to-end latency, brief blackouts, or long-term stability; this is
+not yet a fully validated hardware path.
 
 For timing diagnostics, set `WIVRN_GSTREAMER_PROFILE=1`. Every five seconds of
 output, each decoder reports output FPS, access-unit submission to frame-ready
@@ -39,7 +44,7 @@ The `RGB sampling` startup log records this choice. For a comparison with the
 previous import behavior, set `WIVRN_GSTREAMER_RGB_FORMAT=srgb`; `auto` (the
 default) and `unorm` are also accepted. This changes only the GStreamer backend;
 other decoders and the shared reprojection shader are unchanged. Corrected
-color appearance still requires headset verification.
+color appearance was verified in the Orange Pi configuration described above.
 
 ## Build and select
 
