@@ -2,11 +2,28 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #pragma once
+#include <gst/video/video-color.h>
+#include <gst/gst.h>
 #include <stdexcept>
 #include <string_view>
 
 namespace wivrn::gstreamer
 {
+inline void set_converter_colorimetry(GstCaps * caps, const char * value)
+{
+	if (!value || !*value)
+		return;
+	// Explicit metadata override for streams whose decoder omits colorimetry.
+	// This does not convert pixels or change their packing.
+	GstVideoColorimetry color{};
+	if (!gst_video_colorimetry_from_string(&color, value) ||
+	    color.range == GST_VIDEO_COLOR_RANGE_UNKNOWN || color.matrix == GST_VIDEO_COLOR_MATRIX_UNKNOWN ||
+	    color.transfer == GST_VIDEO_TRANSFER_UNKNOWN || color.primaries == GST_VIDEO_COLOR_PRIMARIES_UNKNOWN)
+		throw std::runtime_error("WIVRN_GSTREAMER_COLORIMETRY must specify a complete GStreamer colorimetry");
+	if (color.matrix == GST_VIDEO_COLOR_MATRIX_RGB)
+		throw std::runtime_error("NV12 converter input requires a YUV color matrix");
+	gst_caps_set_simple(caps, "colorimetry", G_TYPE_STRING, value, nullptr);
+}
 inline const char * converter_input_caps(bool copy)
 {
 	// MMAP input advertises regular raw video caps, not memory:DMABuf.

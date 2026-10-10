@@ -4,8 +4,23 @@ This optional backend accepts WiVRn H.264/HEVC/AV1 access units and imports the
 converter's AR24 DMA-BUF output into Vulkan. It uses the installed GStreamer
 V4L2 devices, with no Rockchip device paths or driver names compiled in.
 Orange Pi 5 startup logs verify H.264 decoding, RGA AR24 DMA-BUF output, and
-PanVK import in the explicit converter input copy mode. Actual headset display
-and latency are **not yet verified**.
+PanVK import and headset display in the explicit converter input copy mode.
+Color fidelity, latency, brief blackouts, and sustained stability remain under
+investigation; this is not yet a fully validated hardware path.
+
+For timing diagnostics, set `WIVRN_GSTREAMER_PROFILE=1`. Every five seconds of
+output, each decoder reports output FPS, access-unit submission to frame-ready
+age (including buffering, decoding, conversion, and import), producer fence wait,
+import/enqueue time, and queue occupancy/drop counts. These are CPU wall-clock
+measurements, not GPU execution times. An inactive stream produces no report.
+
+`WIVRN_GSTREAMER_COLORIMETRY` explicitly constrains the converter's NV12 input
+color metadata for comparison when the decoder omits it. The default leaves
+negotiation unchanged. For full-range BT.709 matrix, sRGB transfer, BT.709
+primaries (matching the local x264 encoder), use `1:3:7:1`. This only specifies
+metadata: it cannot repair an incorrect buffer layout or force a driver to
+implement unsupported color conversions. RGB and incomplete colorimetry are
+rejected. Do not use this override for a stream with different color properties.
 
 ## Build and select
 

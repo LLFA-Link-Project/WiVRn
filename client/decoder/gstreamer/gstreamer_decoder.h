@@ -20,6 +20,7 @@ class decoder : public wivrn::decoder
 	{
 		from_headset::feedback feedback;
 		to_headset::video_stream_data_shard::view_info_t view_info;
+		std::chrono::steady_clock::time_point submitted;
 	};
 	vk::raii::Device & device;
 	vk::raii::PhysicalDevice & physical_device;

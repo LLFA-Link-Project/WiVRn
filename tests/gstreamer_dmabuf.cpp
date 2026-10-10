@@ -122,6 +122,34 @@ int main()
 	try
 	{
 		gst_init(nullptr, nullptr);
+		{
+			auto caps = gst_caps_from_string(wivrn::gstreamer::converter_input_caps(true));
+			wivrn::gstreamer::set_converter_colorimetry(caps, nullptr);
+			require(!gst_structure_has_field(gst_caps_get_structure(caps, 0), "colorimetry"), "default colorimetry must remain negotiated");
+			wivrn::gstreamer::set_converter_colorimetry(caps, "1:3:7:1");
+			GstVideoInfo info{};
+			gst_caps_set_simple(caps, "width", G_TYPE_INT, 32, "height", G_TYPE_INT, 16, nullptr);
+			require(gst_video_info_from_caps(&info, caps), "NV12 colorimetry caps parse");
+			require(info.colorimetry.range == GST_VIDEO_COLOR_RANGE_0_255 &&
+			                info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT709 &&
+			                info.colorimetry.transfer == GST_VIDEO_TRANSFER_SRGB &&
+			                info.colorimetry.primaries == GST_VIDEO_COLOR_PRIMARIES_BT709,
+			        "full-range BT709 matrix and sRGB transfer retained");
+			for (auto value: {"invalid", "sRGB", "0:3:7:1"})
+			{
+				bool rejected = false;
+				try
+				{
+					wivrn::gstreamer::set_converter_colorimetry(caps, value);
+				}
+				catch (const std::runtime_error &)
+				{
+					rejected = true;
+				}
+				require(rejected, "invalid, RGB, or incomplete NV12 colorimetry rejected");
+			}
+			gst_caps_unref(caps);
+		}
 		test_nv12_copy();
 		require(!wivrn::gstreamer::converter_input_copy(nullptr) && !wivrn::gstreamer::converter_input_copy("dmabuf"), "strict converter import default");
 		require(wivrn::gstreamer::converter_input_copy("copy"), "explicit NV12 copy fallback");

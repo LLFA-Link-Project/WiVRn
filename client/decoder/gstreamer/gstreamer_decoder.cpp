@@ -345,6 +345,15 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		if (auto path = std::getenv("WIVRN_GSTREAMER_CONVERTER_DEVICE"); path && *path)
 			g_object_set(converter, "device", path, nullptr);
 		auto decoded = gst_caps_from_string(converter_input_caps(copy_input));
+		try
+		{
+			set_converter_colorimetry(decoded, std::getenv("WIVRN_GSTREAMER_COLORIMETRY"));
+		}
+		catch (...)
+		{
+			gst_caps_unref(decoded);
+			throw;
+		}
 		auto output = gst_caps_from_string("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=AR24");
 		g_object_set(decoded_caps, "caps", decoded, nullptr);
 		g_object_set(output_caps, "caps", output, nullptr);
@@ -463,7 +472,7 @@ void decoder::frame_completed(const from_headset::feedback & feedback,
 		// Parsers can suppress corrupt frames. Bound metadata even in that case.
 		while (pending.size() >= 32)
 			pending.erase(pending.begin());
-		pending.emplace(timestamp, metadata{feedback, view_info});
+		pending.emplace(timestamp, metadata{feedback, view_info, now});
 	}
 	packet.clear();
 	if (gst_app_src_push_buffer(source, buffer) != GST_FLOW_OK)
@@ -474,6 +483,11 @@ void decoder::receive(std::stop_token stop)
 {
 	bool logged_import = false;
 	bool logged_missing_pts = false;
+	const bool profile = std::getenv("WIVRN_GSTREAMER_PROFILE") && !strcmp(std::getenv("WIVRN_GSTREAMER_PROFILE"), "1");
+	auto report_started = std::chrono::steady_clock::now();
+	uint64_t output_count = 0, ready_dropped = 0;
+	double age_sum = 0, age_max = 0, fence_sum = 0, import_sum = 0;
+	auto milliseconds = [](auto elapsed) { return std::chrono::duration<double, std::milli>(elapsed).count(); };
 	try
 	{
 		while (!stop.stop_requested())
@@ -511,7 +525,9 @@ void decoder::receive(std::stop_token stop)
 				pending.erase(it);
 			}
 			auto dma = describe_dmabuf(sample);
+			auto fence_started = std::chrono::steady_clock::now();
 			wait_producer(dma.fd, stop);
+			auto import_started = std::chrono::steady_clock::now();
 			try
 			{
 				import_image(*frame, dma, device, physical_device);
@@ -541,8 +557,37 @@ void decoder::receive(std::stop_token stop)
 			{
 				std::lock_guard lock(mutex);
 				while (ready.size() >= 2)
+				{
 					ready.pop_front();
+					++ready_dropped;
+				}
 				ready.push_back(std::make_shared<frame_handle>(frame, dma, meta.feedback, meta.view_info));
+			}
+			if (profile)
+			{
+				auto completed = std::chrono::steady_clock::now();
+				auto age = milliseconds(completed - meta.submitted);
+				++output_count;
+				age_sum += age;
+				age_max = std::max(age_max, age);
+				fence_sum += milliseconds(import_started - fence_started);
+				import_sum += milliseconds(completed - import_started);
+				if (completed - report_started >= std::chrono::seconds(5))
+				{
+					size_t metadata_count, ready_count;
+					{
+						std::lock_guard lock(mutex);
+						metadata_count = pending.size();
+						ready_count = ready.size();
+					}
+					spdlog::info("GStreamer profile: stream={} frame={} output_fps={:.2f} input_to_ready_ms[mean/max]={:.2f}/{:.2f} producer_wait_ms={:.3f} import_and_enqueue_ms={:.3f} encoded_queue={} pending={} ready={} ready_dropped={}",
+					             meta.feedback.stream_index, meta.feedback.frame_index, output_count * 1000. / milliseconds(completed - report_started),
+					             age_sum / output_count, age_max, fence_sum / output_count, import_sum / output_count,
+					             gst_app_src_get_current_level_buffers(source), metadata_count, ready_count, ready_dropped);
+					report_started = completed;
+					output_count = ready_dropped = 0;
+					age_sum = age_max = fence_sum = import_sum = 0;
+				}
 			}
 		}
 	}
