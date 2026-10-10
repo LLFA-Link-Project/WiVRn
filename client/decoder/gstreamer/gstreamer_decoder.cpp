@@ -143,10 +143,18 @@ void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::De
 		throw std::runtime_error("DMA-BUF dimensions exceed Vulkan import limits");
 	// Modifier plane count must also match the one-plane AR24 allocation.
 	vk::StructureChain format_properties{vk::FormatProperties2{}, vk::DrmFormatModifierPropertiesListEXT{}};
-	physical.getFormatProperties2(format, &format_properties.get());
+	// Older Vulkan-Hpp RAII wrappers expose only the value-returning overload.
+	// Call the core API through the RAII dispatcher to preserve our populated pNext
+	// chain during both passes of the modifier-list query.
+	auto query_format_properties = [&] {
+		physical.getDispatcher()->vkGetPhysicalDeviceFormatProperties2(
+		        static_cast<VkPhysicalDevice>(*physical), static_cast<VkFormat>(format),
+		        reinterpret_cast<VkFormatProperties2 *>(&format_properties.get()));
+	};
+	query_format_properties();
 	std::vector<vk::DrmFormatModifierPropertiesEXT> modifiers(format_properties.get<vk::DrmFormatModifierPropertiesListEXT>().drmFormatModifierCount);
 	format_properties.get<vk::DrmFormatModifierPropertiesListEXT>().pDrmFormatModifierProperties = modifiers.data();
-	physical.getFormatProperties2(format, &format_properties.get());
+	query_format_properties();
 	auto modifier = std::ranges::find(modifiers, dma.modifier, &vk::DrmFormatModifierPropertiesEXT::drmFormatModifier);
 	if (modifier == modifiers.end() || modifier->drmFormatModifierPlaneCount != 1 ||
 	    !(modifier->drmFormatModifierTilingFeatures & vk::FormatFeatureFlagBits::eSampledImageFilterLinear))
