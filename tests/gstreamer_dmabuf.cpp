@@ -11,6 +11,8 @@
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/video/gstvideometa.h>
+#include <gst/video/video-frame.h>
+#include <gst/video/video-info-dma.h>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -21,6 +23,49 @@ void require(bool result, const char * message)
 {
 	if (!result)
 		throw std::runtime_error(message);
+}
+void test_nv12_copy()
+{
+	// Exercise the GstVideoFrame path used by v4l2convert's MMAP input pool.
+	// One source DMA-BUF, two destination memories, and different padded strides.
+	// memfd establishes layout/copy correctness, not hardware DMA capability.
+	int fd = memfd_create("wivrn-nv12-copy", MFD_CLOEXEC);
+	require(fd >= 0 && !ftruncate(fd, 1600), "NV12 source fd");
+	auto allocator = gst_dmabuf_allocator_new();
+	auto source = gst_buffer_new();
+	gst_buffer_append_memory(source, gst_dmabuf_allocator_alloc(allocator, fd, 1600));
+	gst_object_unref(allocator);
+	gsize source_offsets[GST_VIDEO_MAX_PLANES] = {64, 1088};
+	gint source_strides[GST_VIDEO_MAX_PLANES] = {64, 64};
+	gst_buffer_add_video_meta_full(source, GST_VIDEO_FRAME_FLAG_NONE, GST_VIDEO_FORMAT_NV12, 32, 16, 2, source_offsets, source_strides);
+	auto destination = gst_buffer_new();
+	gst_buffer_append_memory(destination, gst_allocator_alloc(nullptr, 768, nullptr));
+	gst_buffer_append_memory(destination, gst_allocator_alloc(nullptr, 384, nullptr));
+	gsize destination_offsets[GST_VIDEO_MAX_PLANES] = {0, 768};
+	gint destination_strides[GST_VIDEO_MAX_PLANES] = {48, 48};
+	gst_buffer_add_video_meta_full(destination, GST_VIDEO_FRAME_FLAG_NONE, GST_VIDEO_FORMAT_NV12, 32, 16, 2, destination_offsets, destination_strides);
+	auto caps = gst_caps_from_string("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=32,height=16,framerate=60/1");
+	GstVideoInfoDmaDrm info;
+	gst_video_info_dma_drm_init(&info);
+	require(gst_video_info_dma_drm_from_caps(&info, caps), "linear NV12 copy caps");
+	GstVideoFrame input{}, output{};
+	require(gst_video_frame_map(&input, &info.vinfo, source, GST_MAP_WRITE), "map padded single DMA-BUF NV12");
+	require(gst_video_frame_map(&output, &info.vinfo, destination, GST_MAP_WRITE), "map separate destination planes");
+	for (int plane = 0; plane < 2; ++plane)
+		for (int row = 0; row < (plane ? 8 : 16); ++row)
+			for (int column = 0; column < 32; ++column)
+				static_cast<uint8_t *>(GST_VIDEO_FRAME_PLANE_DATA(&input, plane))[row * GST_VIDEO_FRAME_PLANE_STRIDE(&input, plane) + column] = plane * 100 + row + column;
+	require(gst_video_frame_copy(&output, &input), "NV12 copy between memory layouts");
+	for (int plane = 0; plane < 2; ++plane)
+		for (int row = 0; row < (plane ? 8 : 16); ++row)
+			for (int column = 0; column < 32; ++column)
+				require(static_cast<uint8_t *>(GST_VIDEO_FRAME_PLANE_DATA(&output, plane))[row * GST_VIDEO_FRAME_PLANE_STRIDE(&output, plane) + column] == plane * 100 + row + column, "NV12 Y/UV content and strides");
+	gst_video_frame_unmap(&output);
+	gst_video_frame_unmap(&input);
+	gst_buffer_unref(destination);
+	gst_buffer_unref(source);
+	gst_caps_unref(caps);
+	require(fcntl(fd, F_GETFD) == -1, "NV12 copy releases source fd");
 }
 void test_parser(const char * parser, const char * input_caps, std::span<const uint8_t> data)
 {
@@ -69,6 +114,7 @@ int main()
 	try
 	{
 		gst_init(nullptr, nullptr);
+		test_nv12_copy();
 		require(!wivrn::gstreamer::converter_input_copy(nullptr) && !wivrn::gstreamer::converter_input_copy("dmabuf"), "strict converter import default");
 		require(wivrn::gstreamer::converter_input_copy("copy"), "explicit NV12 copy fallback");
 		bool invalid_input_mode = false;

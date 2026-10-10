@@ -188,6 +188,11 @@ by GstDmaBufAllocator to test descriptor extraction and FD lifetime; this **does
 not** establish that the FD is importable by Vulkan. It checks padded offsets,
 strides, shared-memory offsets, LINEAR and non-LINEAR metadata, rejection of invalid strides and P010, PTS/frame
 identity through appsrc/appsink, H.264 SPS/PPS/IDR, HEVC VPS/SPS/PPS and AV1 sequence-header parsing with PTS preservation, EOS, and pipeline shutdown.
+The explicit converter copy path is also checked with GStreamer's actual
+`gst_video_frame_map`/`gst_video_frame_copy`: padded NV12 in one memfd-backed
+DMA-BUF is copied into two destination memories with different strides. Every
+Y/UV pixel and source FD release are verified. This tests memory-layout handling;
+it does not run a V4L2 pool, RGA, hardware fences, or Vulkan.
 
 On Orange Pi, first verify plugin registration, select H.264 on the WiVRn server,
 and run with `WIVRN_DECODER=gstreamer GST_DEBUG=2`. Confirm the decoder startup log,
