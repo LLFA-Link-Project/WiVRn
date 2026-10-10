@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "decoder/gstreamer/dmabuf.h"
+#include "decoder/gstreamer/converter_input.h"
+#include "decoder/gstreamer/pipeline_diagnostics.h"
 #include <array>
 #include <drm_fourcc.h>
 #include <fcntl.h>
@@ -67,6 +69,27 @@ int main()
 	try
 	{
 		gst_init(nullptr, nullptr);
+		require(!wivrn::gstreamer::converter_input_copy(nullptr) && !wivrn::gstreamer::converter_input_copy("dmabuf"), "strict converter import default");
+		require(wivrn::gstreamer::converter_input_copy("copy"), "explicit NV12 copy fallback");
+		bool invalid_input_mode = false;
+		try
+		{
+			wivrn::gstreamer::converter_input_copy("auto");
+		}
+		catch (const std::runtime_error &)
+		{
+			invalid_input_mode = true;
+		}
+		require(invalid_input_mode, "unknown modes must not silently enable CPU copies");
+		// Preserve the downstream allocation error instead of only appsrc's flow error.
+		auto emitter = gst_element_factory_make("identity", "converter-test");
+		auto error = g_error_new_literal(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_NO_SPACE_LEFT, "capture allocation failed");
+		auto diagnostic = gst_message_new_error(GST_OBJECT(emitter), error, "test allocation detail");
+		auto message_text = wivrn::gstreamer::describe_bus_message(diagnostic);
+		require(message_text.find("converter-test") != std::string::npos && message_text.find("capture allocation failed") != std::string::npos && message_text.find("gst-resource-error-quark") != std::string::npos && message_text.find("test allocation detail") != std::string::npos, "downstream diagnostic source, error domain and details");
+		gst_message_unref(diagnostic);
+		g_error_free(error);
+		gst_object_unref(emitter);
 		// memfd is only a stand-in for descriptor extraction; this does not test GPU import.
 		int fd = memfd_create("wivrn-layout-test", MFD_CLOEXEC);
 		require(fd >= 0 && !ftruncate(fd, 8192), "memfd");

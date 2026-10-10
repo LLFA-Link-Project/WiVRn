@@ -3,6 +3,7 @@
  */
 #pragma once
 #include "decoder/decoder.h"
+#include <chrono>
 #include <deque>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -36,6 +37,7 @@ class decoder : public wivrn::decoder
 	video_codec input_codec = h264;
 	uint64_t frame_index = UINT64_MAX;
 	GstClockTime timestamp = 0, duration;
+	std::chrono::steady_clock::time_point input_started{};
 	void receive(std::stop_token stop);
 	void check_failure();
 

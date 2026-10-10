@@ -70,10 +70,46 @@ appsrc -> codec parser -> codec V4L2 Stateless decoder
 ```
 
 Decoder-to-converter DMA-BUF caps and explicit converter import/export modes
-prevent an automatic system-memory conversion path. There is no `videoconvert`, pixel `gst_buffer_map`, staging image, or CPU decoded
-pixel copy in this backend. Encoded input is copied into a GstBuffer. The
+prevent an automatic system-memory conversion path. In the default strict import
+mode there is no `videoconvert`, pixel `gst_buffer_map`, staging image, or CPU
+decoded pixel copy in this backend. Encoded input is copied into a GstBuffer. The
 converter writes a new RGB allocation; consequently the entire decode/conversion
 pipeline is not claimed to involve zero hardware copies.
+
+### Explicit converter input copy fallback
+
+The Orange Pi startup log showed RGA negotiating `NM12` with two V4L2 memory
+planes while rkvdec supplied one DMA-BUF containing both NV12 image planes.
+GStreamer 1.26's importer rejected this with `Got 1 dmabuf but needed 2`, before
+any AR24 sample or Vulkan import. Its importer requires the GstMemory count to
+match the V4L2 memory-plane count. This is distinct from the image-plane count.
+Simply duplicating the fd is unsafe: the mainline RGA buffer mapping does not
+apply each plane's `data_offset` to its MMU descriptors.
+
+An explicit comparison/workaround is available:
+
+```bash
+WIVRN_DECODER=gstreamer WIVRN_GSTREAMER_CONVERTER_INPUT=copy \
+GST_DEBUG_NO_COLOR=1 GST_DEBUG='2,v4l2*:6,h264parse:5' \
+XR_RUNTIME_JSON=/home/reina/monado/build/openxr_monado-dev.json \
+./build-client-gstreamer/bin/wivrn > /tmp/wivrn-gst-copy.log 2>&1
+```
+
+`copy` selects the converter's MMAP input pool. GStreamer may map and copy the
+decoded NV12 pixels into that pool; RGA still converts NV12 to AR24, and AR24
+output still requires DMA-BUF export and Vulkan import. This is **not** a
+zero-copy decoder-to-RGA path and its hardware operation/performance remain
+unverified. The default/unset value and `dmabuf` keep strict DMA-BUF import;
+there is no silent copy fallback. Unknown values are rejected. Hardware-driver
+or GStreamer negotiation/import support for contiguous NV12 is still needed to
+make the strict path work on this device. Other layouts/devices may already work.
+
+Startup logs now include each stage's negotiated caps and first buffer, the
+converter input mode, and bus warnings/errors with their emitting element.
+These distinguish decoding, conversion, PTS matching and Vulkan import failures.
+
+Sources: [GStreamer 1.26.2 DMA-BUF importer](https://github.com/GStreamer/gstreamer/blob/1.26.2/subprojects/gst-plugins-good/sys/v4l2/gstv4l2allocator.c),
+[mainline Linux 6.18 RGA buffer mapping](https://github.com/torvalds/linux/blob/v6.18/drivers/media/platform/rockchip/rga/rga-buf.c).
 
 `GstVideoInfoDmaDrm` reads the negotiated fourcc/modifier, and `GstVideoMeta`
 provides the actual width, height, plane offset and stride. Memory suballocation
@@ -117,7 +153,8 @@ the change substantially. The renderer's external ownership handling is reused.
 
 ## Bounds and failures
 
-Appsrc input is limited to eight queued access units; individual units are limited
+Appsrc input is limited to 32 queued access units during the first two seconds
+after input begins (media-engine pool allocation), then eight; individual units are limited
 to 32 MiB. A stalled encoded queue ends the session rather than discarding reference
 pictures. Appsink retains two samples and drops older decoded output; the worker's
 ready queue also retains at most two frames. Pending metadata retains 32 entries.

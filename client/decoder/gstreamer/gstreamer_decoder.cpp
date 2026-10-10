@@ -4,6 +4,8 @@
 #include "gstreamer_decoder.h"
 #include "application.h"
 #include "dmabuf.h"
+#include "converter_input.h"
+#include "pipeline_diagnostics.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -148,8 +150,7 @@ void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::De
 	// chain during both passes of the modifier-list query.
 	auto query_format_properties = [&] {
 		physical.getDispatcher()->vkGetPhysicalDeviceFormatProperties2(
-		        static_cast<VkPhysicalDevice>(*physical), static_cast<VkFormat>(format),
-		        reinterpret_cast<VkFormatProperties2 *>(&format_properties.get()));
+		        static_cast<VkPhysicalDevice>(*physical), static_cast<VkFormat>(format), reinterpret_cast<VkFormatProperties2 *>(&format_properties.get()));
 	};
 	query_format_properties();
 	std::vector<vk::DrmFormatModifierPropertiesEXT> modifiers(format_properties.get<vk::DrmFormatModifierPropertiesListEXT>().drmFormatModifierCount);
@@ -188,6 +189,65 @@ void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::De
 	frame.view = vk::raii::ImageView(device, vk::ImageViewCreateInfo{.image = *frame.image, .viewType = vk::ImageViewType::e2D, .format = format, .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}});
 	// DMA-BUF external access implies GENERAL. The renderer acquires from FOREIGN;
 	// an UNDEFINED transition here would discard the already decoded contents.
+}
+
+// Log every diagnostic at emission time, including warnings which a filtered
+// bus pop would discard and subsequent errors hidden by the first exception.
+GstBusSyncReply log_bus_message(GstBus *, GstMessage * message, gpointer data)
+{
+	try
+	{
+		auto index = GPOINTER_TO_UINT(data);
+		if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
+			spdlog::error("GStreamer stream {}: {}", index, describe_bus_message(message));
+		else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_WARNING)
+			spdlog::warn("GStreamer stream {}: {}", index, describe_bus_message(message));
+	}
+	catch (...)
+	{} // C callbacks must not propagate C++ exceptions.
+	return GST_BUS_PASS;
+}
+
+struct stage_probe
+{
+	guint stream;
+	const char * stage;
+	bool saw_buffer = false;
+};
+GstPadProbeReturn log_stage(GstPad *, GstPadProbeInfo * info, gpointer data)
+{
+	auto & stage = *static_cast<stage_probe *>(data);
+	try
+	{
+		if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM)
+		{
+			auto event = GST_PAD_PROBE_INFO_EVENT(info);
+			if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS)
+			{
+				GstCaps * caps = nullptr;
+				gst_event_parse_caps(event, &caps);
+				auto text = gst_caps_to_string(caps);
+				std::string value = text ? text : "unknown caps";
+				g_free(text);
+				spdlog::info("GStreamer stream {} {} caps: {}", stage.stream, stage.stage, value);
+			}
+		}
+		if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) && !stage.saw_buffer)
+		{
+			stage.saw_buffer = true;
+			auto buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+			spdlog::info("GStreamer stream {} {} first buffer: bytes={}, memories={}, pts={}", stage.stream, stage.stage, gst_buffer_get_size(buffer), gst_buffer_n_memory(buffer), GST_BUFFER_PTS(buffer));
+		}
+	}
+	catch (...)
+	{}
+	return GST_PAD_PROBE_OK;
+}
+void observe_stage(GstElement * element, guint index, const char * stage)
+{
+	auto pad = gst_element_get_static_pad(element, "src");
+	gst_pad_add_probe(pad, GstPadProbeType(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM), log_stage, new stage_probe{index, stage}, [](gpointer data) { delete static_cast<stage_probe *>(data); });
+	gst_object_unref(pad);
 }
 
 gboolean propose_allocation(GstAppSink *, GstQuery * query, gpointer)
@@ -276,8 +336,12 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 
 	try
 	{
-		// GstV4l2IOMode: DMABUF_IMPORT = 5, DMABUF = 4.
-		g_object_set(converter, "output-io-mode", 5, "capture-io-mode", 4, nullptr);
+		// The strict import path cannot bridge one-memory NV12 to an NM12
+		// importer in GStreamer 1.26. MMAP explicitly allows an NV12 CPU copy
+		// into the converter's pool; conversion and RGB export remain hardware.
+		const bool copy_input = converter_input_copy(std::getenv("WIVRN_GSTREAMER_CONVERTER_INPUT"));
+		// GstV4l2IOMode: MMAP = 2, DMABUF_IMPORT = 5, DMABUF = 4.
+		g_object_set(converter, "output-io-mode", copy_input ? 2 : 5, "capture-io-mode", 4, nullptr);
 		if (auto path = std::getenv("WIVRN_GSTREAMER_CONVERTER_DEVICE"); path && *path)
 			g_object_set(converter, "device", path, nullptr);
 		auto decoded = gst_caps_from_string("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12");
@@ -289,16 +353,21 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		if (!gst_element_link_many(GST_ELEMENT(source), parser, hardware, decoded_caps, converter, output_caps, GST_ELEMENT(sink), nullptr))
 			throw std::runtime_error("Cannot link GStreamer 8-bit DMA-BUF pipeline");
 		bus = gst_element_get_bus(pipeline);
+		gst_bus_set_sync_handler(bus, log_bus_message, GUINT_TO_POINTER(index), nullptr);
+		observe_stage(parser, index, "parsed");
+		observe_stage(hardware, index, "decoded");
+		observe_stage(converter, index, "converted");
 		auto caps = gst_caps_from_string(entry.caps);
 		gst_app_src_set_caps(source, caps);
 		gst_caps_unref(caps);
-		g_object_set(source, "format", GST_FORMAT_TIME, "is-live", TRUE, "block", FALSE, "max-buffers", guint64(8), "max-bytes", guint64(32 * 1024 * 1024), nullptr);
+		g_object_set(source, "format", GST_FORMAT_TIME, "is-live", TRUE, "block", FALSE, "max-buffers", guint64(32), "max-bytes", guint64(32 * 1024 * 1024), nullptr);
 		g_object_set(sink, "sync", FALSE, "async", FALSE, "max-buffers", guint(2), "drop", TRUE, "enable-last-sample", FALSE, "emit-signals", TRUE, "wait-on-eos", FALSE, nullptr);
 		g_signal_connect(sink, "propose-allocation", G_CALLBACK(propose_allocation), nullptr);
 		if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
 			throw std::runtime_error("Cannot start GStreamer V4L2 Stateless pipeline");
 		worker = std::jthread([this](std::stop_token stop) { receive(stop); });
 		spdlog::info("GStreamer V4L2 Stateless stream {}: {} -> v4l2convert -> AR24 DMA-BUF", index, entry.name);
+		spdlog::info("GStreamer stream {} converter input: {}", index, copy_input ? "MMAP (CPU NV12 copy enabled; RGA color conversion)" : "DMA-BUF import (no CPU pixel copy)");
 	}
 	catch (...)
 	{
@@ -370,7 +439,14 @@ void decoder::frame_completed(const from_headset::feedback & feedback,
 	// WiVRn encoders emit start-code-prefixed NAL units, not length-prefixed AVC.
 	if (input_codec != av1 && (packet.size() < 4 || packet[0] || packet[1] || (packet[2] != 1 && (packet[2] || packet[3] != 1))))
 		throw std::runtime_error("GStreamer expects Annex B access units");
-	if (gst_app_src_get_current_level_buffers(source) >= 8 ||
+	// Pool allocation starts on the first access unit, rather than PLAYING.
+	// Allow bounded startup buffering so 8 frames at 60 Hz (133 ms) do not
+	// terminate the session before the media engines have allocated their pools.
+	auto now = std::chrono::steady_clock::now();
+	if (input_started == std::chrono::steady_clock::time_point{})
+		input_started = now;
+	const guint64 queue_limit = now - input_started < std::chrono::seconds(2) ? 32 : 8;
+	if (gst_app_src_get_current_level_buffers(source) >= queue_limit ||
 	    gst_app_src_get_current_level_bytes(source) > 32 * 1024 * 1024 - packet.size())
 		throw std::runtime_error("GStreamer encoded queue stalled; reconnect instead of dropping reference pictures");
 	auto buffer = gst_buffer_new_allocate(nullptr, packet.size(), nullptr);
@@ -397,6 +473,7 @@ void decoder::frame_completed(const from_headset::feedback & feedback,
 void decoder::receive(std::stop_token stop)
 {
 	bool logged_import = false;
+	bool logged_missing_pts = false;
 	try
 	{
 		while (!stop.stop_requested())
@@ -407,12 +484,7 @@ void decoder::receive(std::stop_token stop)
 				std::string reason = "unexpected EOS";
 				if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
 				{
-					GError * error = nullptr;
-					gchar * debug = nullptr;
-					gst_message_parse_error(message, &error, &debug);
-					reason = std::string(error->message) + (debug ? std::string(" (") + debug + ")" : "");
-					g_clear_error(&error);
-					g_free(debug);
+					reason = describe_bus_message(message);
 				}
 				gst_message_unref(message);
 				throw std::runtime_error("GStreamer: " + reason);
@@ -427,7 +499,14 @@ void decoder::receive(std::stop_token stop)
 				std::lock_guard lock(mutex);
 				auto it = pending.find(GST_BUFFER_PTS(gst_sample_get_buffer(sample)));
 				if (it == pending.end())
+				{
+					if (!logged_missing_pts)
+					{
+						spdlog::warn("GStreamer output has no matching input PTS: pts={}, pending={}; discarding frame", GST_BUFFER_PTS(gst_sample_get_buffer(sample)), pending.size());
+						logged_missing_pts = true;
+					}
 					continue; // stale/missing metadata must never be guessed
+				}
 				meta = it->second;
 				pending.erase(it);
 			}
