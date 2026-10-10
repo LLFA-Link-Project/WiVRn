@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 #include <vulkan/vulkan_raii.hpp>
 
 namespace scenes
@@ -48,7 +49,7 @@ public:
 		vk::ImageLayout & current_layout;
 		vk::Semaphore semaphore = nullptr;
 		uint64_t * semaphore_val = nullptr;
-#if WIVRN_USE_V4L2
+#if WIVRN_USE_V4L2 || (WIVRN_USE_GSTREAMER && !defined(__ANDROID__))
 		// DMA-buf images from V4L2 require queue-family ownership
 		// transfers between Vulkan and external engine
 		uint32_t foreign_queue_family = vk::QueueFamilyIgnored;
@@ -70,6 +71,9 @@ public:
 	virtual void frame_completed(
 	        const from_headset::feedback & feedback,
 	        const to_headset::video_stream_data_shard::view_info_t & view_info) = 0;
+
+	// Asynchronous backends publish on the render thread, never while tearing down a worker.
+	virtual std::vector<std::shared_ptr<blit_handle>> drain_frames() { return {}; }
 
 	virtual vk::Sampler sampler() = 0;
 

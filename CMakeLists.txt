@@ -60,6 +60,10 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" AND NOT ANDROID)
 endif()
 option(WIVRN_USE_V4L2 "Enable V4L2 hardware video decoder" ${_WIVRN_USE_V4L2_DEFAULT})
 unset(_WIVRN_USE_V4L2_DEFAULT)
+option(WIVRN_USE_GSTREAMER "Enable Linux GStreamer V4L2 Stateless DMA-BUF decoder" OFF)
+if(WIVRN_USE_GSTREAMER AND NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "WIVRN_USE_GSTREAMER requires Linux")
+endif()
 
 if(WIVRN_OPTIMIZE_SHADERS AND WIVRN_DEBUG_SHADERS)
     message(FATAL_ERROR "WIVRN_OPTIMIZE_SHADERS and WIVRN_DEBUG_SHADERS are incompatible")
@@ -207,8 +211,13 @@ if (WIVRN_BUILD_CLIENT)
 endif()
 
 if (WIVRN_BUILD_CLIENT AND NOT ANDROID)
-    if(NOT WIVRN_USE_V4L2)
+    if(NOT WIVRN_USE_V4L2 OR WIVRN_USE_GSTREAMER)
         pkg_check_modules(LIBAV_CLIENT REQUIRED IMPORTED_TARGET libavcodec libavutil libswscale)
+    endif()
+    if(WIVRN_USE_GSTREAMER)
+        pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
+            gstreamer-1.0>=1.26 gstreamer-app-1.0>=1.26
+            gstreamer-video-1.0>=1.26 gstreamer-allocators-1.0>=1.26 libdrm)
     endif()
     find_package(Fontconfig REQUIRED)
 

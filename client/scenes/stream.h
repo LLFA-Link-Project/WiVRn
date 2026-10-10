@@ -271,6 +271,8 @@ public:
 	std::optional<std::string> pop_stream_error();
 
 private:
+	// Caller holds decoder_mutex. Used for render-thread decoder delivery.
+	void push_blit_handle_locked(wivrn::shard_accumulator *, std::shared_ptr<wivrn::shard_accumulator::blit_handle>);
 	void process_packets();
 	void tracking();
 	void read_actions();

@@ -114,10 +114,16 @@ else()
         file(GLOB CLIENT_V4L2_SOURCE CONFIGURE_DEPENDS
             "decoder/v4l2/*.cpp")
         list(APPEND PLATFORM_SOURCE ${CLIENT_V4L2_SOURCE})
-    else()
+    endif()
+    if(NOT WIVRN_USE_V4L2 OR WIVRN_USE_GSTREAMER)
         target_link_libraries(wivrn PkgConfig::LIBAV_CLIENT)
-        file(GLOB PLATFORM_SOURCE CONFIGURE_DEPENDS
+        file(GLOB CLIENT_FFMPEG_SOURCE CONFIGURE_DEPENDS
             "decoder/ffmpeg/*.cpp")
+        list(APPEND PLATFORM_SOURCE ${CLIENT_FFMPEG_SOURCE})
+    endif()
+    if(WIVRN_USE_GSTREAMER)
+        target_sources(wivrn PRIVATE decoder/gstreamer/gstreamer_decoder.cpp decoder/gstreamer/dmabuf.cpp)
+        target_link_libraries(wivrn PkgConfig::GSTREAMER)
     endif()
 
     file(GLOB CLIENT_LINUX_SOURCE CONFIGURE_DEPENDS
@@ -366,4 +372,11 @@ if(WIVRN_BUILD_TEST AND NOT ANDROID)
     target_compile_options(wivrn-client-gaze-test PRIVATE -O2 -ffast-math)
     target_link_libraries(wivrn-client-gaze-test PRIVATE wivrn-imgui glm::glm wivrn-external)
     add_test(NAME wivrn-client-gaze COMMAND wivrn-client-gaze-test)
+endif()
+
+if(WIVRN_BUILD_TEST AND WIVRN_USE_GSTREAMER AND NOT ANDROID)
+    add_executable(wivrn-gstreamer-dmabuf-test ../tests/gstreamer_dmabuf.cpp decoder/gstreamer/dmabuf.cpp)
+    target_include_directories(wivrn-gstreamer-dmabuf-test PRIVATE .)
+    target_link_libraries(wivrn-gstreamer-dmabuf-test PRIVATE PkgConfig::GSTREAMER)
+    add_test(NAME wivrn-gstreamer-dmabuf COMMAND wivrn-gstreamer-dmabuf-test)
 endif()

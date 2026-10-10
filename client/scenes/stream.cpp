@@ -618,16 +618,33 @@ scenes::stream::~stream()
 
 	if (network_thread.joinable())
 		network_thread.join();
+#if WIVRN_USE_GSTREAMER && !defined(__ANDROID__)
+	// Imported samples and decoder samplers must outlive the final graphics submission.
+	try
+	{
+		auto queue = application::get_queue().lock();
+		queue->waitIdle();
+	}
+	catch (const std::exception & e)
+	{
+		spdlog::warn("Waiting for stream graphics during teardown: {}", e.what());
+	}
+#endif
 }
 
 void scenes::stream::push_blit_handle(shard_accumulator * decoder, std::shared_ptr<shard_accumulator::blit_handle> handle)
+{
+	std::shared_lock lock(decoder_mutex);
+	push_blit_handle_locked(decoder, std::move(handle));
+}
+
+void scenes::stream::push_blit_handle_locked(shard_accumulator * decoder, std::shared_ptr<shard_accumulator::blit_handle> handle)
 {
 	assert(handle);
 	if (!application::is_visible())
 		return;
 
 	{
-		std::shared_lock lock(decoder_mutex);
 		std::unique_lock frame_lock(frames_mutex);
 		auto stream = handle->feedback.stream_index;
 		if (stream < decoders.size())
@@ -848,6 +865,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	last_display_time = frame_state.predictedDisplayTime;
 
 	std::shared_lock lock(decoder_mutex);
+#if WIVRN_USE_GSTREAMER && !defined(__ANDROID__)
+	try
+	{
+		for (auto & item: decoders)
+			if (item.decoder)
+				for (auto & handle: item.decoder->drain_frames())
+					push_blit_handle_locked(item.decoder.get(), std::move(handle));
+	}
+	catch (const std::exception & e)
+	{
+		spdlog::error("Decoder failed: {}", e.what());
+		auto errors = stream_error_queue.lock();
+		errors->emplace(e.what());
+		exit();
+	}
+#endif
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
 	{
 		// TODO: stop/restart video stream
@@ -936,7 +969,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		use_alpha = blit_handle->view_info.alpha;
 
-#if WIVRN_USE_V4L2
+#if WIVRN_USE_V4L2 || (WIVRN_USE_GSTREAMER && !defined(__ANDROID__))
 		if (blit_handle->foreign_queue_family != vk::QueueFamilyIgnored)
 		{
 			// decoder completed its write before handing us this image
@@ -1096,7 +1129,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		                      {bias, bias, bias, 0.},
 		                      image_index);
 
-#if WIVRN_USE_V4L2
+#if WIVRN_USE_V4L2 || (WIVRN_USE_GSTREAMER && !defined(__ANDROID__))
 		// the blit handles keep CAPTURE buffers alive until this cmd buffer's fence has completed
 		inplace_vector<vk::ImageMemoryBarrier, decoder_count> foreign_release_barriers;
 		for (const auto & handle: current_blit_handles)
@@ -1295,6 +1328,17 @@ void scenes::stream::setup(const to_headset::video_stream_description & descript
 	spdlog::info("Creating decoders, size {}x{}", description.width, description.height);
 	video_stream_description = description;
 
+#if WIVRN_USE_GSTREAMER && !defined(__ANDROID__)
+	// A new stream description destroys samplers referenced by in-flight rendering.
+	// Quiesce the queue before replacing decoders, including on resolution changes.
+	{
+		auto queue = application::get_queue().lock();
+		queue->waitIdle();
+	}
+	current_blit_handles.fill(nullptr);
+	for (auto & item: decoders)
+		item.latest_frames.fill(nullptr); // Release old handles while their decoder still exists.
+#endif
 	for (const auto & [stream_index, item]: utils::enumerate(decoders))
 	{
 		item = accumulator_images{

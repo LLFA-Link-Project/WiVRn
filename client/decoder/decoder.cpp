@@ -20,10 +20,34 @@
 
 #ifdef __ANDROID__
 #include "decoder/android/android_decoder.h"
-#elif WIVRN_USE_V4L2
-#include "decoder/v4l2/v4l2_decoder.h"
 #else
+#if WIVRN_USE_V4L2
+#include "decoder/v4l2/v4l2_decoder.h"
+#endif
+#if !WIVRN_USE_V4L2 || WIVRN_USE_GSTREAMER
 #include "decoder/ffmpeg/ffmpeg_decoder.h"
+#endif
+#if WIVRN_USE_GSTREAMER
+#include "decoder/gstreamer/gstreamer_decoder.h"
+#endif
+#endif
+#include <algorithm>
+#include <cstdlib>
+#include <spdlog/spdlog.h>
+#include <string_view>
+
+#ifndef __ANDROID__
+namespace
+{
+std::string_view selected_backend()
+{
+	const char * value = std::getenv("WIVRN_DECODER");
+	std::string_view selected = value ? value : "auto";
+	if (selected != "auto" && selected != "gstreamer" && selected != "v4l2" && selected != "ffmpeg")
+		throw std::runtime_error("WIVRN_DECODER must be auto, gstreamer, v4l2, or ffmpeg");
+	return selected;
+}
+} // namespace
 #endif
 #include "decoder/raw_decoder.h"
 
@@ -51,12 +75,45 @@ std::shared_ptr<wivrn::decoder> wivrn::decoder::make(
 			        stream_index,
 			        scene,
 			        acc);
-#elif WIVRN_USE_V4L2
-			return std::make_shared<wivrn::v4l2::decoder>(
-			        device, phys_dev, vk_queue_family_index, description, stream_index, scene, acc);
 #else
-			return std::make_shared<wivrn::ffmpeg::decoder>(
-			        device, phys_dev, description, stream_index, scene, acc);
+		{
+			auto selected = selected_backend();
+#if WIVRN_USE_GSTREAMER
+			if (selected == "auto" || selected == "gstreamer")
+			{
+				try
+				{
+					return std::make_shared<wivrn::gstreamer::decoder>(device, phys_dev, description, stream_index, scene, acc);
+				}
+				catch (const std::exception & e)
+				{
+					if (selected == "gstreamer")
+						throw;
+					spdlog::warn("GStreamer unavailable: {}; trying another decoder", e.what());
+				}
+			}
+#endif
+#if WIVRN_USE_V4L2
+			if (selected == "auto" || selected == "v4l2")
+			{
+				try
+				{
+					return std::make_shared<wivrn::v4l2::decoder>(device, phys_dev, vk_queue_family_index, description, stream_index, scene, acc);
+				}
+				catch (const std::exception & e)
+				{
+					if (selected == "v4l2" || !WIVRN_USE_GSTREAMER)
+						throw;
+					spdlog::warn("Iris unavailable: {}; trying software decoder", e.what());
+				}
+			}
+#endif
+#if !WIVRN_USE_V4L2 || WIVRN_USE_GSTREAMER
+			if (selected == "auto" || selected == "ffmpeg")
+				return std::make_shared<wivrn::ffmpeg::decoder>(device, phys_dev, description, stream_index, scene, acc);
+#endif
+			throw std::runtime_error("Requested decoder backend is not compiled into this client");
+		}
 #endif
 		case raw:
 			return std::make_shared<wivrn::raw_decoder>(
@@ -76,10 +133,24 @@ static std::vector<wivrn::video_codec_capability> supported_codecs_()
 	std::vector<wivrn::video_codec> codecs;
 #ifdef __ANDROID__
 	wivrn::android::decoder::supported_codecs(codecs);
-#elif WIVRN_USE_V4L2
-	wivrn::v4l2::decoder::supported_codecs(codecs);
 #else
-	wivrn::ffmpeg::decoder::supported_codecs(codecs);
+	auto selected = selected_backend();
+#if WIVRN_USE_GSTREAMER
+	if (selected == "gstreamer" || selected == "auto")
+		wivrn::gstreamer::decoder::supported_codecs(codecs);
+#endif
+#if WIVRN_USE_V4L2
+	if (selected == "v4l2" || selected == "auto")
+		wivrn::v4l2::decoder::supported_codecs(codecs);
+#endif
+#if !WIVRN_USE_V4L2 || WIVRN_USE_GSTREAMER
+	if (selected == "ffmpeg" || selected == "auto")
+		wivrn::ffmpeg::decoder::supported_codecs(codecs);
+#endif
+	if (codecs.empty() && selected != "auto")
+		spdlog::warn("Requested decoder backend {} has no supported compressed codecs on this device", selected);
+	std::ranges::sort(codecs);
+	codecs.erase(std::unique(codecs.begin(), codecs.end()), codecs.end());
 #endif
 	codecs.push_back(wivrn::video_codec::raw);
 
@@ -100,24 +171,21 @@ bool wivrn::decoder::supports_10bit(wivrn::video_codec codec)
 {
 #ifdef __ANDROID__
 	return codec == wivrn::video_codec::h265 or codec == wivrn::video_codec::av1;
-#elif WIVRN_USE_V4L2
-	switch (codec)
-	{
-		case wivrn::video_codec::h265: {
-			static const bool supported = wivrn::v4l2::decoder::supports_10bit(codec);
-			return supported;
-		}
-		case wivrn::video_codec::av1: {
-			static const bool supported = wivrn::v4l2::decoder::supports_10bit(codec);
-			return supported;
-		}
-		case wivrn::video_codec::h264:
-		case wivrn::video_codec::raw:
-			return false;
-	}
-	__builtin_unreachable();
 #else
-	// ffmpeg
-	return codec == wivrn::video_codec::h265 or codec == wivrn::video_codec::av1;
+	auto selected = selected_backend();
+#if WIVRN_USE_GSTREAMER
+	// AR24 is an 8-bit output. Auto may select it, so advertise conservatively.
+	if (selected == "gstreamer" || selected == "auto")
+		return false;
+#endif
+#if WIVRN_USE_V4L2
+	if (selected == "v4l2" || selected == "auto")
+		return wivrn::v4l2::decoder::supports_10bit(codec);
+#endif
+#if !WIVRN_USE_V4L2 || WIVRN_USE_GSTREAMER
+	if (selected == "ffmpeg" || selected == "auto")
+		return codec == wivrn::video_codec::h265 || codec == wivrn::video_codec::av1;
+#endif
+	return false;
 #endif
 }

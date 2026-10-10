@@ -101,6 +101,7 @@ public:
 	}
 
 	using blit_handle = decoder::blit_handle;
+	std::vector<std::shared_ptr<blit_handle>> drain_frames() { return decoder_->drain_frames(); }
 
 private:
 	void try_submit_frame(std::optional<uint16_t> shard_idx);
