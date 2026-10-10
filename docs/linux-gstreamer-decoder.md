@@ -95,8 +95,13 @@ XR_RUNTIME_JSON=/home/reina/monado/build/openxr_monado-dev.json \
 ./build-client-gstreamer/bin/wivrn > /tmp/wivrn-gst-copy.log 2>&1
 ```
 
-`copy` selects the converter's MMAP input pool. GStreamer may map and copy the
-decoded NV12 pixels into that pool; RGA still converts NV12 to AR24, and AR24
+`copy` selects the converter's MMAP input pool and negotiates ordinary
+`video/x-raw,format=NV12` on decoder output. GStreamer 1.26 does not advertise
+`memory:DMABuf` input caps for explicit MMAP mode; forcing DMA_DRM there causes
+`not-negotiated` before decoding, as observed in `4def2bfd` on Orange Pi.
+The decoder's raw NV12 buffers may be mapped or copied; no DMA-BUF-only contract
+is imposed on this explicit fallback. GStreamer copies the decoded NV12 pixels
+into the converter pool; RGA still converts NV12 to AR24, and AR24
 output still requires DMA-BUF export and Vulkan import. This is **not** a
 zero-copy decoder-to-RGA path and its hardware operation/performance remain
 unverified. The default/unset value and `dmabuf` keep strict DMA-BUF import;

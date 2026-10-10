@@ -7,6 +7,11 @@
 
 namespace wivrn::gstreamer
 {
+inline const char * converter_input_caps(bool copy)
+{
+	// MMAP input advertises regular raw video caps, not memory:DMABuf.
+	return copy ? "video/x-raw,format=NV12" : "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12";
+}
 inline bool converter_input_copy(const char * value)
 {
 	if (!value || std::string_view(value) == "dmabuf")

@@ -344,7 +344,7 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		g_object_set(converter, "output-io-mode", copy_input ? 2 : 5, "capture-io-mode", 4, nullptr);
 		if (auto path = std::getenv("WIVRN_GSTREAMER_CONVERTER_DEVICE"); path && *path)
 			g_object_set(converter, "device", path, nullptr);
-		auto decoded = gst_caps_from_string("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12");
+		auto decoded = gst_caps_from_string(converter_input_caps(copy_input));
 		auto output = gst_caps_from_string("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=AR24");
 		g_object_set(decoded_caps, "caps", decoded, nullptr);
 		g_object_set(output_caps, "caps", output, nullptr);
