@@ -10,7 +10,7 @@ fix (commit `2189ec84`). The accompanying Orange Pi log verified H.264 8-bit,
 1280x1280 per eye, MMAP converter input, AR24 DMA-BUF output, UNORM sampling with
 shader conversion, and the `1:3:7:1` colorimetry override. Stable output intervals
 were approximately 59 fps. This does not verify other codecs, other colorimetry
-settings, end-to-end latency, brief blackouts, or long-term stability; this is
+settings, end-to-end latency, or long-term stability; this is
 not yet a fully validated hardware path.
 
 For timing diagnostics, set `WIVRN_GSTREAMER_PROFILE=1`. Every five seconds of
@@ -54,16 +54,25 @@ it was not ended. `multi_compositor_discard_frame` also clears the **delivered**
 layer slot, and `transfer_layers_locked` omits clients without an active delivered
 slot. WiVRn normally leaves a repeated video frame begun but unended, expecting
 the runtime to keep time-warping the preceding image. These two behaviors can
-remove the displayed content until a new frame is delivered. This is a concrete
-candidate for recurring blackouts, not yet a headset-verified cause.
+remove the displayed content until a new frame is delivered. In the Orange Pi
+A/B test of commit `a61293ff`, the user reported that disabling this shortcut
+completely eliminated recurring brief blackouts. Both logs had no decoder errors
+or network-thread exceptions; decoded output remained approximately 59 fps.
+The normal path repeatedly recorded discarded frames (26--36 in the final
+five-second intervals), while the no-discard path recorded `discarded=0` and
+`empty=0`. This verifies the workaround for that configuration, not all runtimes.
 
 Set `WIVRN_STREAM_DISCARD_FRAMES=0` to disable only that repeated-frame rendering
 shortcut. WiVRn then samples its retained decoded images and submits the projection
 layer again, using the existing GPU fence and FOREIGN ownership barriers. This
 does not disable Monado time warp or change decoding, color conversion, frame
 selection, or menu controls. It increases rendering/submission work on repeats.
-Unset the variable (or use `1`) for the existing behavior; it never enables
-discarding on a headset whose traits already prohibit it.
+Linux clients now disable this shortcut by default when the OpenXR runtime name
+starts with `Monado`. Other runtimes and Android retain their previous default.
+Use `WIVRN_STREAM_DISCARD_FRAMES=1` to compare the original behavior; it never
+enables discarding on a headset whose traits already prohibit it. Unsetting the
+variable selects the runtime-specific default. Color and decoder settings from
+the successful test are unchanged.
 
 For either comparison, `WIVRN_STREAM_PROFILE=1` reports every five seconds:
 `rendered` counts completed `render_end` calls, `discarded` counts repeated-frame

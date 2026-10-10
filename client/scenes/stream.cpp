@@ -204,13 +204,18 @@ scenes::stream::stream(std::string server_name, scene & parent_scene) :
         scene_impl<stream>(supported_color_formats, supported_depth_formats, parent_scene),
         apps{*this, std::move(server_name)}
 {
-	// Opt-in comparison for runtimes which retire the displayed layer on discard.
+	// Monado retires its delivered layers when a begun frame is discarded.
+	// Keep submitting retained video images so repeats do not blank the headset.
+#ifndef __ANDROID__
+	submit_repeated_frames = instance.get_runtime_name().starts_with("Monado");
+#endif
+	// Keep the original path available for runtime comparisons.
 	if (const char * value = std::getenv("WIVRN_STREAM_DISCARD_FRAMES"))
 		submit_repeated_frames = std::string_view(value) == "0";
 	if (const char * value = std::getenv("WIVRN_STREAM_PROFILE"))
 		presentation_profile = std::string_view(value) == "1";
 	presentation_report_started = std::chrono::steady_clock::now();
-	if (submit_repeated_frames or presentation_profile)
+	if (submit_repeated_frames or presentation_profile or std::getenv("WIVRN_STREAM_DISCARD_FRAMES"))
 		spdlog::info("Stream presentation: discard_repeated_frames={} profile={} runtime={}",
 		             application::get_hmd_traits().discard_frame and not submit_repeated_frames,
 		             presentation_profile, instance.get_runtime_name());
