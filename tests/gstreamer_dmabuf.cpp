@@ -25,6 +25,57 @@ void require(bool result, const char * message)
 	if (!result)
 		throw std::runtime_error(message);
 }
+void test_nv12_import()
+{
+	int fd = memfd_create("wivrn-nv12-import", MFD_CLOEXEC);
+	require(fd >= 0 && !ftruncate(fd, 1600), "NV12 import fixture fd");
+	auto allocator = gst_dmabuf_allocator_new();
+	auto buffer = gst_buffer_new();
+	gst_buffer_append_memory(buffer, gst_dmabuf_allocator_alloc(allocator, fd, 1600));
+	gst_object_unref(allocator);
+	gsize offsets[GST_VIDEO_MAX_PLANES] = {64, 1088};
+	gint strides[GST_VIDEO_MAX_PLANES] = {64, 64};
+	auto meta = gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE, GST_VIDEO_FORMAT_NV12, 32, 16, 2, offsets, strides);
+	auto caps = gst_caps_from_string("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=32,height=16,colorimetry=1:3:7:1,chroma-site=mpeg2");
+	auto sample = gst_sample_new(buffer, caps, nullptr, nullptr);
+	auto layout = wivrn::gstreamer::describe_dmabuf(sample, true);
+	require(layout.fd == fd && layout.plane_count == 2 && layout.fourcc == DRM_FORMAT_NV12 && layout.modifier == DRM_FORMAT_MOD_LINEAR && layout.offsets[0] == 64 && layout.offsets[1] == 1088 && layout.strides[1] == 64, "single-fd NV12 actual Y/UV offsets and strides");
+	auto rejected = [&] {
+		try { wivrn::gstreamer::describe_dmabuf(sample, true); }
+		catch (const std::runtime_error &) { return true; }
+		return false;
+	};
+	meta->offset[1] = 1408;
+	require(rejected(), "NV12 UV plane beyond allocation rejected");
+	meta->offset[1] = 512;
+	require(rejected(), "NV12 overlapping linear planes rejected");
+	meta->offset[1] = 1088;
+	meta->stride[1] = 31;
+	require(rejected(), "NV12 short UV stride rejected");
+	meta->stride[1] = 64;
+	meta->format = GST_VIDEO_FORMAT_P010_10LE;
+	require(rejected(), "10-bit VideoMeta cannot masquerade as 8-bit NV12");
+	meta->format = GST_VIDEO_FORMAT_NV12;
+	GstVideoInfoDmaDrm info;
+	gst_video_info_dma_drm_init(&info);
+	require(gst_video_info_dma_drm_from_caps(&info, caps), "NV12 color and chroma metadata");
+	auto features = vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eMidpointChromaSamples | vk::FormatFeatureFlagBits::eCositedChromaSamples;
+	auto conversion = wivrn::gstreamer::nv12_conversion_info(info.vinfo, features);
+	require(conversion.ycbcrModel == vk::SamplerYcbcrModelConversion::eYcbcr709 && conversion.ycbcrRange == vk::SamplerYcbcrRange::eItuFull && conversion.xChromaOffset == vk::ChromaLocation::eCositedEven && conversion.yChromaOffset == vk::ChromaLocation::eMidpoint && conversion.chromaFilter == vk::Filter::eNearest, "NV12 full-range BT709 and MPEG2 sampling");
+	features |= vk::FormatFeatureFlagBits::eSampledImageFilterLinear | vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter;
+	info.vinfo.colorimetry.range = GST_VIDEO_COLOR_RANGE_16_235;
+	conversion = wivrn::gstreamer::nv12_conversion_info(info.vinfo, features);
+	require(conversion.ycbcrRange == vk::SamplerYcbcrRange::eItuNarrow && conversion.chromaFilter == vk::Filter::eLinear, "NV12 limited-range and supported linear filtering");
+	info.vinfo.chroma_site = GST_VIDEO_CHROMA_SITE_UNKNOWN;
+	bool unknown_rejected = false;
+	try { wivrn::gstreamer::nv12_conversion_info(info.vinfo, features); }
+	catch (const std::runtime_error &) { unknown_rejected = true; }
+	require(unknown_rejected, "unknown chroma metadata must not be guessed");
+	gst_sample_unref(sample);
+	gst_caps_unref(caps);
+	gst_buffer_unref(buffer);
+	require(fcntl(fd, F_GETFD) == -1, "NV12 import fixture releases its borrowed fd");
+}
 void test_nv12_copy()
 {
 	// Exercise the GstVideoFrame path used by v4l2convert's MMAP input pool.
@@ -166,6 +217,7 @@ int main()
 			gst_caps_unref(caps);
 		}
 		test_nv12_copy();
+		test_nv12_import();
 		require(!wivrn::gstreamer::converter_input_copy(nullptr) && !wivrn::gstreamer::converter_input_copy("dmabuf"), "strict converter import default");
 		require(wivrn::gstreamer::converter_input_copy("copy"), "explicit NV12 copy fallback");
 		bool invalid_input_mode = false;

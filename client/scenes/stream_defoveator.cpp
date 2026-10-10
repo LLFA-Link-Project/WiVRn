@@ -235,7 +235,8 @@ stream_defoveator::stream_defoveator(
 
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = view_count * 4,
+	        // Multi-planar YCbCr samplers can consume three descriptors each.
+	        .descriptorCount = view_count * 4 * 3,
 	};
 
 	ds_pool = device.createDescriptorPool(vk::DescriptorPoolCreateInfo{

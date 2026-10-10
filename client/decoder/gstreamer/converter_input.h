@@ -2,13 +2,21 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #pragma once
-#include <gst/video/video-color.h>
 #include <gst/gst.h>
+#include <gst/video/video-color.h>
 #include <stdexcept>
 #include <string_view>
 
 namespace wivrn::gstreamer
 {
+inline bool direct_nv12_output(const char * value)
+{
+	if (!value || std::string_view(value) == "ar24")
+		return false;
+	if (std::string_view(value) == "nv12")
+		return true;
+	throw std::runtime_error("WIVRN_GSTREAMER_OUTPUT must be ar24 or nv12");
+}
 inline void set_converter_colorimetry(GstCaps * caps, const char * value)
 {
 	if (!value || !*value)

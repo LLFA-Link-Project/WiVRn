@@ -144,7 +144,63 @@ the first frames would prevent the scene from ever becoming ready.
 
 ## Memory and synchronization
 
-The pipeline is:
+### Direct NV12 DMA-BUF sampling (experimental)
+
+Set `WIVRN_GSTREAMER_OUTPUT=nv12` to use
+`appsrc -> parser -> V4L2 Stateless decoder -> NV12 DMA-BUF -> appsink -> Vulkan`.
+This bypasses `v4l2convert` entirely, including its NV12 MMAP input copy and AR24
+allocation. It does not require the converter factory or use the converter-input
+mode/device settings. The existing AR24 path remains the default (`ar24`).
+This is the next hardware test path, not yet verified on Orange Pi/PanVK.
+The `13` startup log still showed the strict RGA import failing immediately after
+its first single-memory NV12 input buffer, before any converted buffer/import.
+
+The importer accepts 8-bit NV12 with both image planes in the same DMA-BUF fd,
+using `GstVideoMeta` Y/UV offsets and strides rather than deriving UV from visible
+height. It validates linear plane bounds and overlap, rejects P010/mismatched
+metadata and separate-fd planes, and retains the negotiated modifier. Initial
+caps request the linear NV12 layout demonstrated in the Orange Pi decoder logs;
+Vulkan must still report support for that exact format/modifier and two modifier
+planes. No unsupported modifier is relabelled as linear.
+
+Vulkan imports this buffer as `G8B8R8_2PLANE_420_UNORM`. Runtime queries check
+external-memory import, plane count, sampled-image/chroma-location features and
+combined sampler descriptor count. The sampler is initialized from the first
+sample's color/chroma metadata, before publishing any handles. It converts YUV
+to nonlinear RGB; the existing reprojection shader then decodes sRGB once.
+This initial path requires the shader's sRGB conversion, sRGB transfer and BT.709
+primaries, a BT.709/BT.601 matrix, explicit full/limited range, and a known
+`mpeg2`, `jpeg`, or `cosited` chroma location. Unsupported/unknown metadata causes
+a reported stream failure instead of guessing. As with the earlier color
+override, `WIVRN_GSTREAMER_CHROMA_SITE=mpeg2` explicitly supplies missing metadata
+for this WiVRn H.264 test; it must agree with the sender. Supported linear chroma
+and image filtering are used together, otherwise both use nearest filtering.
+Changing conversion parameters midstream requires reconnecting so immutable
+samplers are not replaced during rendering.
+
+The same producer-fence wait, FOREIGN ownership barriers, graphics fence and
+GstSample retention apply. Each imported image also retains its conversion object.
+No decoded pixel mapping/copy, GPU-to-CPU readback, or staging upload is added by
+this path. Encoded input still has a CPU copy, CPU fence waits remain, and GPU
+reprojection still writes the OpenXR swapchain. This is not a claim of zero
+copies throughout the entire display system or of decoder/plugin internals
+verified on hardware.
+
+After rebuilding the separate GStreamer directory, test on Orange Pi with this
+single-line command (keep the known-good AR24/copy build available):
+
+```bash
+WIVRN_DECODER=gstreamer WIVRN_GSTREAMER_OUTPUT=nv12 WIVRN_GSTREAMER_COLORIMETRY=1:3:7:1 WIVRN_GSTREAMER_CHROMA_SITE=mpeg2 WIVRN_GSTREAMER_PROFILE=1 WIVRN_STREAM_PROFILE=1 GST_DEBUG_NO_COLOR=1 GST_DEBUG='2,v4l2*:4' XR_RUNTIME_JSON=/home/reina/monado/build/openxr_monado-dev.json ./build-client-gstreamer/bin/wivrn > /tmp/wivrn-gst-nv12-direct.log 2>&1
+```
+
+Confirm `GStreamer DMA-BUF imported: NV12`, actual plane layout and YCbCr sampler
+parameters, then headset colors, no blackouts, tracking and reconnection. An
+unsupported import prints dimensions/modifier and the Vulkan error; no silent
+copy fallback is performed. Local tests cover padded single-fd NV12 metadata,
+allocation bounds/overlap, 10-bit rejection, FD lifetime, quantization/chroma
+mapping and filter selection; they do not emulate a real DMA-BUF GPU import.
+
+The default AR24 pipeline is:
 
 ```
 appsrc -> codec parser -> codec V4L2 Stateless decoder
@@ -187,8 +243,8 @@ The decoder's raw NV12 buffers may be mapped or copied; no DMA-BUF-only contract
 is imposed on this explicit fallback. GStreamer copies the decoded NV12 pixels
 into the converter pool; RGA still converts NV12 to AR24, and AR24
 output still requires DMA-BUF export and Vulkan import. This is **not** a
-zero-copy decoder-to-RGA path and its hardware operation/performance remain
-unverified. The default/unset value and `dmabuf` keep strict DMA-BUF import;
+zero-copy decoder-to-RGA path. Headset display and colors have been verified on
+Orange Pi in this copy mode. The default/unset value and `dmabuf` keep strict DMA-BUF import;
 there is no silent copy fallback. Unknown values are rejected. Hardware-driver
 or GStreamer negotiation/import support for contiguous NV12 is still needed to
 make the strict path work on this device. Other layouts/devices may already work.

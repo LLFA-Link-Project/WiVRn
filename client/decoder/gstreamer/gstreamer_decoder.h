@@ -24,7 +24,10 @@ class decoder : public wivrn::decoder
 	};
 	vk::raii::Device & device;
 	vk::raii::PhysicalDevice & physical_device;
+	std::shared_ptr<vk::raii::SamplerYcbcrConversion> ycbcr_conversion;
 	vk::raii::Sampler rgb_sampler = nullptr;
+	bool nv12_output = false;
+	std::string nv12_color_signature;
 	vk::Format imported_format = vk::Format::eUndefined;
 	GstElement * pipeline = nullptr;
 	GstAppSrc * source = nullptr; // borrowed from pipeline

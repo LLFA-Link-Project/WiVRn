@@ -90,6 +90,7 @@ struct imported_frame
 {
 	// Declaration order matters: destroy view, image, memory, then sample.
 	std::unique_ptr<GstSample, decltype(&gst_sample_unref)> sample;
+	std::shared_ptr<vk::raii::SamplerYcbcrConversion> conversion;
 	vk::raii::DeviceMemory memory = nullptr;
 	vk::raii::Image image = nullptr;
 	vk::raii::ImageView view = nullptr;
@@ -131,16 +132,18 @@ void wait_producer(int fd, std::stop_token stop)
 	throw std::runtime_error("GStreamer decoder stopped");
 }
 
-void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::Device & device, vk::raii::PhysicalDevice & physical, vk::Format format)
+vk::FormatFeatureFlags import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::Device & device, vk::raii::PhysicalDevice & physical, vk::Format format)
 {
 	vk::StructureChain query{
 	        vk::PhysicalDeviceImageFormatInfo2{.format = format, .type = vk::ImageType::e2D, .tiling = vk::ImageTiling::eDrmFormatModifierEXT, .usage = vk::ImageUsageFlagBits::eSampled},
 	        vk::PhysicalDeviceImageDrmFormatModifierInfoEXT{.drmFormatModifier = dma.modifier,
 		                                                .sharingMode = vk::SharingMode::eExclusive},
 	        vk::PhysicalDeviceExternalImageFormatInfo{.handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT}};
-	auto properties = physical.getImageFormatProperties2<vk::ImageFormatProperties2, vk::ExternalImageFormatProperties>(query.get());
+	auto properties = physical.getImageFormatProperties2<vk::ImageFormatProperties2, vk::ExternalImageFormatProperties, vk::SamplerYcbcrConversionImageFormatProperties>(query.get());
 	if (!(properties.get<vk::ExternalImageFormatProperties>().externalMemoryProperties.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eImportable))
-		throw std::runtime_error("Vulkan cannot import AR24 with negotiated DRM modifier");
+		throw std::runtime_error("Vulkan cannot import the negotiated DMA-BUF format/modifier");
+	if (dma.plane_count == 2 && properties.get<vk::SamplerYcbcrConversionImageFormatProperties>().combinedImageSamplerDescriptorCount > 3)
+		throw std::runtime_error("NV12 needs more than the renderer's three descriptors per sampler");
 	auto limits = properties.get<vk::ImageFormatProperties2>().imageFormatProperties;
 	if (dma.width > limits.maxExtent.width || dma.height > limits.maxExtent.height)
 		throw std::runtime_error("DMA-BUF dimensions exceed Vulkan import limits");
@@ -158,16 +161,19 @@ void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::De
 	format_properties.get<vk::DrmFormatModifierPropertiesListEXT>().pDrmFormatModifierProperties = modifiers.data();
 	query_format_properties();
 	auto modifier = std::ranges::find(modifiers, dma.modifier, &vk::DrmFormatModifierPropertiesEXT::drmFormatModifier);
-	if (modifier == modifiers.end() || modifier->drmFormatModifierPlaneCount != 1 ||
-	    !(modifier->drmFormatModifierTilingFeatures & vk::FormatFeatureFlagBits::eSampledImageFilterLinear))
-		throw std::runtime_error("AR24 modifier requires unsupported plane layout or filtering");
-	vk::SubresourceLayout plane{.offset = dma.offset, .rowPitch = dma.stride};
+	if (modifier == modifiers.end() || modifier->drmFormatModifierPlaneCount != dma.plane_count ||
+	    !(modifier->drmFormatModifierTilingFeatures & vk::FormatFeatureFlagBits::eSampledImage) ||
+	    (dma.plane_count == 1 && !(modifier->drmFormatModifierTilingFeatures & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)))
+		throw std::runtime_error("DMA-BUF modifier requires unsupported plane layout or sampling");
+	std::array<vk::SubresourceLayout, 2> planes{};
+	for (uint32_t i = 0; i < dma.plane_count; ++i)
+		planes[i] = vk::SubresourceLayout{.offset = dma.offsets[i], .rowPitch = dma.strides[i]};
 	vk::StructureChain image_info{
 	        vk::ImageCreateInfo{.imageType = vk::ImageType::e2D, .format = format, .extent = {dma.width, dma.height, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = vk::SampleCountFlagBits::e1, .tiling = vk::ImageTiling::eDrmFormatModifierEXT, .usage = vk::ImageUsageFlagBits::eSampled, .sharingMode = vk::SharingMode::eExclusive, .initialLayout = vk::ImageLayout::eUndefined},
 	        vk::ExternalMemoryImageCreateInfo{.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT},
 	        vk::ImageDrmFormatModifierExplicitCreateInfoEXT{.drmFormatModifier = dma.modifier,
-		                                                .drmFormatModifierPlaneCount = 1,
-		                                                .pPlaneLayouts = &plane}};
+		                                                .drmFormatModifierPlaneCount = dma.plane_count,
+		                                                .pPlaneLayouts = planes.data()}};
 	frame.image = vk::raii::Image(device, image_info.get());
 	auto requirements = device.getImageMemoryRequirements2<vk::MemoryRequirements2, vk::MemoryDedicatedRequirements>({.image = *frame.image});
 	owned_fd fd{fcntl(dma.fd, F_DUPFD_CLOEXEC, 0)};
@@ -187,9 +193,19 @@ void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::De
 	frame.memory = vk::raii::DeviceMemory(device, allocation.get());
 	fd.fd = -1; // Vulkan consumed the duplicate on successful allocation.
 	frame.image.bindMemory(*frame.memory, 0);
-	frame.view = vk::raii::ImageView(device, vk::ImageViewCreateInfo{.image = *frame.image, .viewType = vk::ImageViewType::e2D, .format = format, .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}});
 	// DMA-BUF external access implies GENERAL. The renderer acquires from FOREIGN;
 	// an UNDEFINED transition here would discard the already decoded contents.
+	return modifier->drmFormatModifierTilingFeatures;
+}
+
+void create_view(imported_frame & frame, vk::raii::Device & device, vk::Format format)
+{
+	vk::StructureChain info{
+	        vk::ImageViewCreateInfo{.image = *frame.image, .viewType = vk::ImageViewType::e2D, .format = format, .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}},
+	        vk::SamplerYcbcrConversionInfo{.conversion = frame.conversion ? **frame.conversion : vk::SamplerYcbcrConversion{}}};
+	if (!frame.conversion)
+		info.unlink<vk::SamplerYcbcrConversionInfo>();
+	frame.view = vk::raii::ImageView(device, info.get());
 }
 
 // Log every diagnostic at emission time, including warnings which a filtered
@@ -266,16 +282,18 @@ gboolean propose_allocation(GstAppSink *, GstQuery * query, gpointer)
 
 void decoder::supported_codecs(std::vector<video_codec> & codecs)
 {
+	bool direct_output = false;
 	try
 	{
 		initialize();
+		direct_output = direct_nv12_output(std::getenv("WIVRN_GSTREAMER_OUTPUT"));
 	}
 	catch (const std::exception & e)
 	{
 		spdlog::warn("GStreamer capability discovery failed: {}", e.what());
 		return; // Auto selection can still advertise its software backend.
 	}
-	if (!factory_available("v4l2convert") || !factory_available("appsrc") || !factory_available("appsink"))
+	if ((!direct_output && !factory_available("v4l2convert")) || !factory_available("appsrc") || !factory_available("appsink"))
 		return;
 	// Capability discovery runs after application's Vulkan device initialization.
 	// Do not advertise a hardware path if its mandatory import extensions are absent.
@@ -291,8 +309,11 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
         device(device), physical_device(physical), duration(GstClockTime(GST_SECOND / std::max(1.f, description.frame_rate)))
 {
 	initialize();
+	nv12_output = direct_nv12_output(std::getenv("WIVRN_GSTREAMER_OUTPUT"));
+	if (nv12_output && !application::get_hmd_traits().needs_srgb_conversion)
+		throw std::runtime_error("NV12 direct import requires the existing sRGB reprojection conversion");
 	profile_enabled = std::getenv("WIVRN_GSTREAMER_PROFILE") && !strcmp(std::getenv("WIVRN_GSTREAMER_PROFILE"), "1");
-	imported_format = rgb_import_format(application::get_hmd_traits().needs_srgb_conversion, std::getenv("WIVRN_GSTREAMER_RGB_FORMAT"));
+	imported_format = nv12_output ? vk::Format::eG8B8R82Plane420Unorm : rgb_import_format(application::get_hmd_traits().needs_srgb_conversion, std::getenv("WIVRN_GSTREAMER_RGB_FORMAT"));
 	for (auto extension: {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME})
 		if (std::ranges::none_of(application::get_vk_device_extensions(), [extension](auto name) { return !strcmp(name, extension); }))
 			throw std::runtime_error(std::string("GStreamer DMA-BUF needs enabled Vulkan extension ") + extension);
@@ -302,7 +323,8 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 	supported_codecs(supported);
 	if (std::ranges::find(supported, codec) == supported.end())
 		throw std::runtime_error("GStreamer V4L2 Stateless decoder/parser or v4l2convert unavailable for requested codec");
-	rgb_sampler = vk::raii::Sampler(device, vk::SamplerCreateInfo{.magFilter = vk::Filter::eLinear, .minFilter = vk::Filter::eLinear, .mipmapMode = vk::SamplerMipmapMode::eNearest, .addressModeU = vk::SamplerAddressMode::eClampToEdge, .addressModeV = vk::SamplerAddressMode::eClampToEdge, .addressModeW = vk::SamplerAddressMode::eClampToEdge, .maxLod = VK_LOD_CLAMP_NONE});
+	if (!nv12_output)
+		rgb_sampler = vk::raii::Sampler(device, vk::SamplerCreateInfo{.magFilter = vk::Filter::eLinear, .minFilter = vk::Filter::eLinear, .mipmapMode = vk::SamplerMipmapMode::eNearest, .addressModeU = vk::SamplerAddressMode::eClampToEdge, .addressModeV = vk::SamplerAddressMode::eClampToEdge, .addressModeW = vk::SamplerAddressMode::eClampToEdge, .maxLod = VK_LOD_CLAMP_NONE});
 	const auto & entry = *std::ranges::find(codec_descriptions, codec, &codec_description::codec);
 	// Construct-only device properties must be set when creating the element.
 	// With no overrides, the dynamically registered factory selects its device.
@@ -324,33 +346,43 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 	pipeline = gst_pipeline_new(nullptr);
 	auto parser = gst_element_factory_make(entry.parser, nullptr);
 	auto decoded_caps = gst_element_factory_make("capsfilter", nullptr);
-	auto converter = gst_element_factory_make("v4l2convert", nullptr);
-	auto output_caps = gst_element_factory_make("capsfilter", nullptr);
+	auto converter = nv12_output ? nullptr : gst_element_factory_make("v4l2convert", nullptr);
+	auto output_caps = nv12_output ? nullptr : gst_element_factory_make("capsfilter", nullptr);
 	source = GST_APP_SRC(gst_element_factory_make("appsrc", nullptr));
 	sink = GST_APP_SINK(gst_element_factory_make("appsink", nullptr));
-	if (!pipeline || !parser || !decoded_caps || !converter || !output_caps || !source || !sink)
+	if (!pipeline || !parser || !decoded_caps || (!nv12_output && (!converter || !output_caps)) || !source || !sink)
 	{
 		for (auto element: {hardware, parser, decoded_caps, converter, output_caps, GST_ELEMENT(source), GST_ELEMENT(sink), pipeline})
 			if (element)
 				gst_object_unref(element);
 		throw std::runtime_error("Cannot construct GStreamer pipeline elements");
 	}
-	gst_bin_add_many(GST_BIN(pipeline), GST_ELEMENT(source), parser, hardware, decoded_caps, converter, output_caps, GST_ELEMENT(sink), nullptr);
+	for (auto element: {GST_ELEMENT(source), parser, hardware, decoded_caps, converter, output_caps, GST_ELEMENT(sink)})
+		if (element)
+			gst_bin_add(GST_BIN(pipeline), element);
 
 	try
 	{
 		// The strict import path cannot bridge one-memory NV12 to an NM12
 		// importer in GStreamer 1.26. MMAP explicitly allows an NV12 CPU copy
 		// into the converter's pool; conversion and RGB export remain hardware.
-		const bool copy_input = converter_input_copy(std::getenv("WIVRN_GSTREAMER_CONVERTER_INPUT"));
+		const bool copy_input = !nv12_output && converter_input_copy(std::getenv("WIVRN_GSTREAMER_CONVERTER_INPUT"));
 		// GstV4l2IOMode: MMAP = 2, DMABUF_IMPORT = 5, DMABUF = 4.
-		g_object_set(converter, "output-io-mode", copy_input ? 2 : 5, "capture-io-mode", 4, nullptr);
-		if (auto path = std::getenv("WIVRN_GSTREAMER_CONVERTER_DEVICE"); path && *path)
+		if (converter)
+			g_object_set(converter, "output-io-mode", copy_input ? 2 : 5, "capture-io-mode", 4, nullptr);
+		if (auto path = std::getenv("WIVRN_GSTREAMER_CONVERTER_DEVICE"); converter && path && *path)
 			g_object_set(converter, "device", path, nullptr);
 		auto decoded = gst_caps_from_string(converter_input_caps(copy_input));
 		try
 		{
 			set_converter_colorimetry(decoded, std::getenv("WIVRN_GSTREAMER_COLORIMETRY"));
+			if (auto site = std::getenv("WIVRN_GSTREAMER_CHROMA_SITE"); nv12_output && site && *site)
+			{
+				auto parsed = gst_video_chroma_site_from_string(site);
+				if (parsed != GST_VIDEO_CHROMA_SITE_JPEG && parsed != GST_VIDEO_CHROMA_SITE_MPEG2 && parsed != GST_VIDEO_CHROMA_SITE_COSITED)
+					throw std::runtime_error("WIVRN_GSTREAMER_CHROMA_SITE must be jpeg, mpeg2 or cosited");
+				gst_caps_set_simple(decoded, "chroma-site", G_TYPE_STRING, site, nullptr);
+			}
 		}
 		catch (...)
 		{
@@ -359,10 +391,12 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		}
 		auto output = gst_caps_from_string("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=AR24");
 		g_object_set(decoded_caps, "caps", decoded, nullptr);
-		g_object_set(output_caps, "caps", output, nullptr);
+		if (output_caps)
+			g_object_set(output_caps, "caps", output, nullptr);
 		gst_caps_unref(decoded);
 		gst_caps_unref(output);
-		if (!gst_element_link_many(GST_ELEMENT(source), parser, hardware, decoded_caps, converter, output_caps, GST_ELEMENT(sink), nullptr))
+		if (!gst_element_link_many(GST_ELEMENT(source), parser, hardware, decoded_caps, nullptr) ||
+		    !(nv12_output ? gst_element_link(decoded_caps, GST_ELEMENT(sink)) : gst_element_link_many(decoded_caps, converter, output_caps, GST_ELEMENT(sink), nullptr)))
 			throw std::runtime_error("Cannot link GStreamer 8-bit DMA-BUF pipeline");
 		bus = gst_element_get_bus(pipeline);
 		gst_bus_set_sync_handler(bus, log_bus_message, GUINT_TO_POINTER(index), nullptr);
@@ -370,8 +404,9 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		observe_stage(hardware, index, "decoded");
 		// The hardware src caps precede the optional colorimetry constraint.
 		// This pad reports the actual negotiated input passed to v4l2convert.
-		observe_stage(decoded_caps, index, "converter-input");
-		observe_stage(converter, index, "converted");
+		observe_stage(decoded_caps, index, nv12_output ? "vulkan-input" : "converter-input");
+		if (converter)
+			observe_stage(converter, index, "converted");
 		auto caps = gst_caps_from_string(entry.caps);
 		gst_app_src_set_caps(source, caps);
 		gst_caps_unref(caps);
@@ -381,8 +416,9 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
 			throw std::runtime_error("Cannot start GStreamer V4L2 Stateless pipeline");
 		worker = std::jthread([this](std::stop_token stop) { receive(stop); });
-		spdlog::info("GStreamer V4L2 Stateless stream {}: {} -> v4l2convert -> AR24 DMA-BUF", index, entry.name);
-		spdlog::info("GStreamer stream {} converter input: {}", index, copy_input ? "MMAP (CPU NV12 copy enabled; RGA color conversion)" : "DMA-BUF import (no CPU pixel copy)");
+		spdlog::info("GStreamer V4L2 Stateless stream {}: {} -> {}", index, entry.name, nv12_output ? "NV12 DMA-BUF -> Vulkan YCbCr (no RGA or CPU pixel copy)" : "v4l2convert -> AR24 DMA-BUF");
+		if (!nv12_output)
+			spdlog::info("GStreamer stream {} converter input: {}", index, copy_input ? "MMAP (CPU NV12 copy enabled; RGA color conversion)" : "DMA-BUF import (no CPU pixel copy)");
 		spdlog::info("GStreamer stream {} RGB sampling: format={}, shader_srgb_conversion={}", index, vk::to_string(imported_format), application::get_hmd_traits().needs_srgb_conversion);
 	}
 	catch (...)
@@ -549,17 +585,42 @@ void decoder::receive(std::stop_token stop)
 				meta = it->second;
 				pending.erase(it);
 			}
-			auto dma = describe_dmabuf(sample);
+			auto dma = describe_dmabuf(sample, nv12_output);
 			auto fence_started = std::chrono::steady_clock::now();
 			wait_producer(dma.fd, stop);
 			auto import_started = std::chrono::steady_clock::now();
 			try
 			{
-				import_image(*frame, dma, device, physical_device, imported_format);
+				auto features = import_image(*frame, dma, device, physical_device, imported_format);
+				if (nv12_output)
+				{
+					GstVideoInfoDmaDrm info;
+					gst_video_info_dma_drm_init(&info);
+					if (!gst_video_info_dma_drm_from_caps(&info, gst_sample_get_caps(sample)))
+						throw std::runtime_error("Cannot read NV12 color/chroma metadata");
+					auto conversion_info = nv12_conversion_info(info.vinfo, features);
+					auto signature = fmt::format("{}:{}:{}:{}:{}", int(conversion_info.ycbcrModel), int(conversion_info.ycbcrRange), int(conversion_info.xChromaOffset), int(conversion_info.yChromaOffset), int(conversion_info.chromaFilter));
+					if (!ycbcr_conversion)
+					{
+						ycbcr_conversion = std::make_shared<vk::raii::SamplerYcbcrConversion>(device, conversion_info);
+						vk::StructureChain sampler_info{
+						        vk::SamplerCreateInfo{.magFilter = conversion_info.chromaFilter, .minFilter = conversion_info.chromaFilter, .mipmapMode = vk::SamplerMipmapMode::eNearest, .addressModeU = vk::SamplerAddressMode::eClampToEdge, .addressModeV = vk::SamplerAddressMode::eClampToEdge, .addressModeW = vk::SamplerAddressMode::eClampToEdge},
+						        vk::SamplerYcbcrConversionInfo{.conversion = **ycbcr_conversion}};
+						// Initialized once, before publishing any ready handles under mutex.
+						rgb_sampler = vk::raii::Sampler(device, sampler_info.get());
+						nv12_color_signature = signature;
+						spdlog::info("GStreamer NV12 sampling: model={} range={} chroma={}/{} filter={}", vk::to_string(conversion_info.ycbcrModel), vk::to_string(conversion_info.ycbcrRange), vk::to_string(conversion_info.xChromaOffset), vk::to_string(conversion_info.yChromaOffset), vk::to_string(conversion_info.chromaFilter));
+					}
+					else if (signature != nv12_color_signature)
+						throw std::runtime_error("NV12 color/chroma capabilities changed; reconnect to rebuild immutable samplers");
+					frame->conversion = ycbcr_conversion;
+				}
+				create_view(*frame, device, imported_format);
 			}
 			catch (const std::exception & e)
 			{
-				throw std::runtime_error(fmt::format("AR24 {}x{}, modifier {:#x}, offset {}, stride {}: {}",
+				throw std::runtime_error(fmt::format("{} {}x{}, modifier {:#x}, offset {}, stride {}: {}",
+				                                     nv12_output ? "NV12" : "AR24",
 				                                     dma.width,
 				                                     dma.height,
 				                                     dma.modifier,
@@ -569,7 +630,8 @@ void decoder::receive(std::stop_token stop)
 			}
 			if (!logged_import)
 			{
-				spdlog::info("GStreamer DMA-BUF imported: AR24 {}x{}, modifier {:#x}, offset {}, stride {}, stream {}, frame {}",
+				spdlog::info("GStreamer DMA-BUF imported: {} {}x{}, modifier {:#x}, offset {}, stride {}, stream {}, frame {}",
+				             nv12_output ? "NV12" : "AR24",
 				             dma.width,
 				             dma.height,
 				             dma.modifier,
@@ -577,6 +639,8 @@ void decoder::receive(std::stop_token stop)
 				             dma.stride,
 				             meta.feedback.stream_index,
 				             meta.feedback.frame_index);
+				if (nv12_output)
+					spdlog::info("GStreamer NV12 planes: Y offset={} stride={}, UV offset={} stride={} (same DMA-BUF fd)", dma.offsets[0], dma.strides[0], dma.offsets[1], dma.strides[1]);
 				logged_import = true;
 			}
 			{
