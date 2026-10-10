@@ -39,6 +39,10 @@ class decoder : public wivrn::decoder
 	uint64_t frame_index = UINT64_MAX;
 	GstClockTime timestamp = 0, duration;
 	std::chrono::steady_clock::time_point input_started{};
+	bool profile_enabled = false;
+	std::chrono::steady_clock::time_point delivery_started{};
+	uint64_t delivery_count = 0;
+	double delivery_age_sum = 0, delivery_age_max = 0;
 	void receive(std::stop_token stop);
 	void check_failure();
 

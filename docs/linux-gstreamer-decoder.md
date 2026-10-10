@@ -12,7 +12,15 @@ For timing diagnostics, set `WIVRN_GSTREAMER_PROFILE=1`. Every five seconds of
 output, each decoder reports output FPS, access-unit submission to frame-ready
 age (including buffering, decoding, conversion, and import), producer fence wait,
 import/enqueue time, and queue occupancy/drop counts. These are CPU wall-clock
-measurements, not GPU execution times. An inactive stream produces no report.
+measurements, not GPU execution times. Reporting starts at the first output so
+connection/setup waiting does not skew the initial FPS. An inactive stream
+produces no report; a later interval containing an application switch can still
+have low output FPS.
+
+`GStreamer delivery` reports frames collected by the render thread and time spent
+in the decoded ready queue. This is not headset presentation FPS or total
+motion-to-photon latency. `converter-input caps` reports negotiated caps after the
+optional colorimetry constraint; `decoded caps` is recorded before that filter.
 
 `WIVRN_GSTREAMER_COLORIMETRY` explicitly constrains the converter's NV12 input
 color metadata for comparison when the decoder omits it. The default leaves

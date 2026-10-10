@@ -98,6 +98,7 @@ struct imported_frame
 struct frame_handle : wivrn::decoder::blit_handle
 {
 	std::shared_ptr<imported_frame> storage;
+	std::chrono::steady_clock::time_point ready_at = std::chrono::steady_clock::now();
 	frame_handle(std::shared_ptr<imported_frame> frame, const dmabuf_frame & dma, const from_headset::feedback & feedback, const to_headset::video_stream_data_shard::view_info_t & view_info) :
 	        blit_handle{.feedback = feedback, .view_info = view_info, .image_view = *frame->view, .image = *frame->image, .extent = {dma.width, dma.height}, .current_layout = frame->layout, .foreign_queue_family = VK_QUEUE_FAMILY_FOREIGN_EXT}, storage(std::move(frame)) {}
 };
@@ -290,6 +291,7 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
         device(device), physical_device(physical), duration(GstClockTime(GST_SECOND / std::max(1.f, description.frame_rate)))
 {
 	initialize();
+	profile_enabled = std::getenv("WIVRN_GSTREAMER_PROFILE") && !strcmp(std::getenv("WIVRN_GSTREAMER_PROFILE"), "1");
 	for (auto extension: {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME})
 		if (std::ranges::none_of(application::get_vk_device_extensions(), [extension](auto name) { return !strcmp(name, extension); }))
 			throw std::runtime_error(std::string("GStreamer DMA-BUF needs enabled Vulkan extension ") + extension);
@@ -365,6 +367,9 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		gst_bus_set_sync_handler(bus, log_bus_message, GUINT_TO_POINTER(index), nullptr);
 		observe_stage(parser, index, "parsed");
 		observe_stage(hardware, index, "decoded");
+		// The hardware src caps precede the optional colorimetry constraint.
+		// This pad reports the actual negotiated input passed to v4l2convert.
+		observe_stage(decoded_caps, index, "converter-input");
 		observe_stage(converter, index, "converted");
 		auto caps = gst_caps_from_string(entry.caps);
 		gst_app_src_set_caps(source, caps);
@@ -410,6 +415,25 @@ std::vector<std::shared_ptr<wivrn::decoder::blit_handle>> decoder::drain_frames(
 	std::vector<std::shared_ptr<blit_handle>> frames;
 	while (!ready.empty())
 	{
+		if (profile_enabled)
+		{
+			auto now = std::chrono::steady_clock::now();
+			if (delivery_started == std::chrono::steady_clock::time_point{})
+				delivery_started = now;
+			auto age = std::chrono::duration<double, std::milli>(now - static_cast<frame_handle *>(ready.front().get())->ready_at).count();
+			++delivery_count;
+			delivery_age_sum += age;
+			delivery_age_max = std::max(delivery_age_max, age);
+			if (now - delivery_started >= std::chrono::seconds(5))
+			{
+				spdlog::info("GStreamer delivery: stream={} frame={} delivered_fps={:.2f} ready_to_render_thread_ms[mean/max]={:.2f}/{:.2f}",
+				             ready.front()->feedback.stream_index, ready.front()->feedback.frame_index,
+				             delivery_count / std::chrono::duration<double>(now - delivery_started).count(), delivery_age_sum / delivery_count, delivery_age_max);
+				delivery_started = now;
+				delivery_count = 0;
+				delivery_age_sum = delivery_age_max = 0;
+			}
+		}
 		frames.push_back(std::move(ready.front()));
 		ready.pop_front();
 	}
@@ -483,8 +507,7 @@ void decoder::receive(std::stop_token stop)
 {
 	bool logged_import = false;
 	bool logged_missing_pts = false;
-	const bool profile = std::getenv("WIVRN_GSTREAMER_PROFILE") && !strcmp(std::getenv("WIVRN_GSTREAMER_PROFILE"), "1");
-	auto report_started = std::chrono::steady_clock::now();
+	auto report_started = std::chrono::steady_clock::time_point{};
 	uint64_t output_count = 0, ready_dropped = 0;
 	double age_sum = 0, age_max = 0, fence_sum = 0, import_sum = 0;
 	auto milliseconds = [](auto elapsed) { return std::chrono::duration<double, std::milli>(elapsed).count(); };
@@ -563,9 +586,11 @@ void decoder::receive(std::stop_token stop)
 				}
 				ready.push_back(std::make_shared<frame_handle>(frame, dma, meta.feedback, meta.view_info));
 			}
-			if (profile)
+			if (profile_enabled)
 			{
 				auto completed = std::chrono::steady_clock::now();
+				if (report_started == std::chrono::steady_clock::time_point{})
+					report_started = completed;
 				auto age = milliseconds(completed - meta.submitted);
 				++output_count;
 				age_sum += age;
