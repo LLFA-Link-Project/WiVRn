@@ -18,6 +18,7 @@
  */
 
 #include "lobby.h"
+#include "xr/pose.h"
 
 #include "application.h"
 #include "configuration.h"
@@ -958,6 +959,19 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	// assert(views.size() == swapchains_lobby.size());
 	assert(views.size() == 2); // FIXME
 
+	// VALID and TRACKED are distinct: inferred 3DoF positions and last-known
+	// poses may be valid even when tracking is unavailable. Never read a pose
+	// component whose validity bit is clear.
+	if (not xr::valid_views(flags, views))
+	{
+		if (not invalid_views_reported)
+			spdlog::warn("Lobby: skipping rendering until view poses are valid (xrLocateViews flags={:#x})", flags);
+		invalid_views_reported = true;
+		session.end_frame(frame_state.predictedDisplayTime, {});
+		return;
+	}
+	invalid_views_reported = false;
+
 	bool hide_left_controller = false;
 	bool hide_right_controller = false;
 
@@ -1302,6 +1316,10 @@ void scenes::lobby::on_focused()
 	        std::move(swapchain_imgui),
 	        vps,
 	        image_cache);
+
+	// A valid initial UI placement is needed before the first head location.
+	// Once located, check_recenter_gui replaces it with a head-relative placement.
+	move_gui({0, 0, 0}, {0, -0.1, -constants::lobby::initial_gui_distance});
 
 	auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
 	auto tm = std::localtime(&t);

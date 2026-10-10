@@ -30,6 +30,7 @@
 #include "vulkan/vulkan_enums.hpp"
 #include "vulkan/vulkan_handles.hpp"
 #include "vulkan/vulkan_to_string.hpp"
+#include "xr/pose.h"
 #include "xr/space.h"
 #include <algorithm>
 #include <backends/imgui_impl_vulkan.h>
@@ -1007,6 +1008,23 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 
 	for (auto & i: layers_)
 	{
+		const XrPosef pose{
+		        .orientation = {i.orientation.x, i.orientation.y, i.orientation.z, i.orientation.w},
+		        .position = {i.position.x, i.position.y, i.position.z},
+		};
+		if (not xr::valid_pose(pose))
+		{
+			if (not invalid_pose_reported)
+				spdlog::warn("Skipping invalid ImGui quad pose: space={}, z_index={}, orientation=({}, {}, {}, {})",
+				             int(i.space),
+				             i.z_index,
+				             i.orientation.x,
+				             i.orientation.y,
+				             i.orientation.z,
+				             i.orientation.w);
+			invalid_pose_reported = true;
+			continue;
+		}
 		bool visible = false;
 
 		ImRect layer_rect(

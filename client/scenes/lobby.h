@@ -75,6 +75,7 @@ class lobby : public scene_impl<lobby>
 	std::future<file_picker_result> lobby_file_picker_future;
 
 	std::optional<imgui_context> imgui_ctx;
+	bool invalid_views_reported = false;
 
 	std::optional<xr::hand_tracker> left_hand;
 	std::optional<xr::hand_tracker> right_hand;

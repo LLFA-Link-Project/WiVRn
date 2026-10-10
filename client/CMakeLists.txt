@@ -352,3 +352,12 @@ if(NOT ANDROID)
 
     install(DIRECTORY "${ASSETS_DIR}" DESTINATION ${CMAKE_INSTALL_DATADIR}/wivrn)
 endif()
+
+if(WIVRN_BUILD_TEST AND NOT ANDROID)
+    add_executable(wivrn-client-pose-test ../tests/client_pose.cpp)
+    target_include_directories(wivrn-client-pose-test PRIVATE .)
+    target_compile_definitions(wivrn-client-pose-test PRIVATE XR_USE_GRAPHICS_API_VULKAN GLM_ENABLE_EXPERIMENTAL)
+    target_compile_options(wivrn-client-pose-test PRIVATE -O2 -ffast-math)
+    target_link_libraries(wivrn-client-pose-test PRIVATE wivrn-common wivrn-imgui glm::glm ktx spdlog::spdlog)
+    add_test(NAME wivrn-client-pose COMMAND wivrn-client-pose-test)
+endif()

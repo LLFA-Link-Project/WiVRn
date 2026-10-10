@@ -1035,8 +1035,27 @@ void application::initialize_vulkan()
 	        .pQueuePriorities = &queuePriority,
 	};
 
+	const auto supported_features = vk_physical_device.getFeatures2<
+	        vk::PhysicalDeviceFeatures2,
+	        vk::PhysicalDeviceSamplerYcbcrConversionFeaturesKHR,
+	        vk::PhysicalDeviceMultiviewFeaturesKHR>();
+	if (not supported_features.get<vk::PhysicalDeviceSamplerYcbcrConversionFeaturesKHR>().samplerYcbcrConversion)
+		throw std::runtime_error("Vulkan device lacks required samplerYcbcrConversion feature");
+	if (not supported_features.get<vk::PhysicalDeviceMultiviewFeaturesKHR>().multiview)
+		throw std::runtime_error("Vulkan device lacks required multiview feature");
+
+	// Only the HTC ray workaround uses gl_ClipDistance. Other devices clip in
+	// the fragment shader and do not need this optional feature.
+	const bool needs_clip_distance = std::ranges::any_of(runtime_hmd_traits.override_shader, [](const auto & shader) {
+		return shader.second == "ray_htc.vert" or shader.second == "ray_skinned_htc.vert";
+	});
+	if (needs_clip_distance and not supported_features.get<vk::PhysicalDeviceFeatures2>().features.shaderClipDistance)
+		throw std::runtime_error("HTC ray workaround requires Vulkan shaderClipDistance feature");
+	spdlog::info("Vulkan shaderClipDistance: supported={}, enabled={}",
+	             bool(supported_features.get<vk::PhysicalDeviceFeatures2>().features.shaderClipDistance),
+	             needs_clip_distance);
 	vk::PhysicalDeviceFeatures device_features{
-	        .shaderClipDistance = true,
+	        .shaderClipDistance = needs_clip_distance,
 	};
 
 	vk::StructureChain device_create_info{

@@ -32,6 +32,7 @@
 #include "wifi_lock.h"
 #include "xr/actionset.h"
 #include "xr/instance.h"
+#include "xr/pose.h"
 #include "xr/session.h"
 #include "xr/swapchain.h"
 #include "xr/system.h"
@@ -254,10 +255,11 @@ public:
 		assert(space != XR_NULL_HANDLE);
 		assert(reference != XR_NULL_HANDLE);
 
-		xrLocateSpace(space, reference, time, &location);
+		if (XR_FAILED(xrLocateSpace(space, reference, time, &location)))
+			return {};
 
 		auto req_flags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
-		if ((location.locationFlags & req_flags) != req_flags)
+		if ((location.locationFlags & req_flags) != req_flags or not xr::valid_pose(location.pose))
 			return {};
 
 		glm::vec3 position{

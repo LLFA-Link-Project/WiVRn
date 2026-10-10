@@ -127,8 +127,8 @@ public:
 	{
 		// Position of this viewport in the world
 		xr::spaces space; // Must be world to allow the cursor to work
-		glm::vec3 position;
-		glm::quat orientation;
+		glm::vec3 position = {0, 0, 0};
+		glm::quat orientation = {1, 0, 0, 0};
 		glm::vec2 size;
 
 		// Position of this viewport in the swapchain image
@@ -161,6 +161,7 @@ private:
 	vk::raii::Pipeline pipeline = nullptr;
 	vk::raii::RenderPass renderpass;
 
+	bool invalid_pose_reported = false;
 	std::vector<imgui_frame> frames;
 	imgui_frame & get_frame(vk::Image destination);
 
