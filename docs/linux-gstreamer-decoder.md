@@ -1,7 +1,7 @@
 # Linux GStreamer V4L2 Stateless decoder
 
 This optional backend accepts WiVRn H.264/HEVC/AV1 access units and imports the
-converter's AR24 DMA-BUF output into Vulkan. It uses the installed GStreamer
+converter's AR24 DMA-BUF output, or decoder NV12 DMA-BUF output directly, into Vulkan. It uses the installed GStreamer
 V4L2 devices, with no Rockchip device paths or driver names compiled in.
 Orange Pi 5 startup logs verify H.264 decoding, RGA AR24 DMA-BUF output, and
 PanVK import and headset display in the explicit converter input copy mode.
@@ -11,7 +11,9 @@ fix (commit `2189ec84`). The accompanying Orange Pi log verified H.264 8-bit,
 shader conversion, and the `1:3:7:1` colorimetry override. Stable output intervals
 were approximately 59 fps. This does not verify other codecs, other colorimetry
 settings, end-to-end latency, or long-term stability; this is
-not yet a fully validated hardware path.
+not yet a fully validated hardware path. The later Orange Pi `14` test verifies
+direct H.264 NV12 import and headset display with commit `811b84ca`, bypassing
+RGA and the explicit decoded-pixel CPU copy; details and timing limits follow below.
 
 For timing diagnostics, set `WIVRN_GSTREAMER_PROFILE=1`. Every five seconds of
 output, each decoder reports output FPS, access-unit submission to frame-ready
@@ -151,7 +153,21 @@ Set `WIVRN_GSTREAMER_OUTPUT=nv12` to use
 This bypasses `v4l2convert` entirely, including its NV12 MMAP input copy and AR24
 allocation. It does not require the converter factory or use the converter-input
 mode/device settings. The existing AR24 path remains the default (`ar24`).
-This is the next hardware test path, not yet verified on Orange Pi/PanVK.
+The Orange Pi/PanVK `14/wivrn-gst-nv12-direct.log` hardware test (commit
+`811b84ca`, 2026-10-10) verifies this path for H.264 8-bit, 1280x1280 per eye;
+the user reported normal headset display. Both eye streams imported NV12 with
+modifier `0x0`, Y offset 0, UV offset 1638400 and strides 1280 in the same fd.
+The sampler used BT.709 full range, CositedEven/Midpoint chroma and linear filtering.
+Over roughly 75 seconds of continuous output after startup, reported decoder
+output was 58.7–60.4 fps and mean input-to-ready time was 2.76–2.94 ms.
+Producer fence waits averaged 0.027–0.033 ms and import/enqueue 0.272–0.331 ms
+in the active output intervals. No GStreamer decoder/import error or network-thread
+exception was recorded. Every presentation interval reported discarded=0 and empty=0.
+However, successful application frame submissions were about 31–34 per second,
+while delivery to the render thread was about 53–59 fps. Decoder output FPS does
+not establish 60 fps rendering or scanout, and input-to-ready timing excludes
+network reception, rendering and display latency. Sustained operation, reconnects,
+other codecs and independent color/chroma verification still need hardware tests.
 The `13` startup log still showed the strict RGA import failing immediately after
 its first single-memory NV12 input buffer, before any converted buffer/import.
 
@@ -345,11 +361,12 @@ actual caps with `GST_DEBUG=GST_CAPS:5`, and successful displayed frames. Compar
 against `WIVRN_DECODER=ffmpeg` using identical resolution/server settings. Then
 exercise disconnect/reconnect, changed resolution, and a sustained stream while
 checking FD counts, memory, frame feedback and visual correctness/3DoF tracking.
-Producer-fence support, PanVK modifier import, converter buffer-pool sizing, color
-conversion, throughput and end-to-end latency all still require this real device.
+The `14` test confirms producer-fence handling and PanVK import for the logged
+NV12 layout, with the throughput reported above. Other modifiers, converter
+buffer-pool sizing, long-term stability and end-to-end latency need further device tests.
 
-NV12 direct import, 10-bit output, import caching, and
-hot fallback after asynchronous failure are not implemented. HEVC and AV1 use the same
+10-bit output, import caching, and hot fallback after asynchronous failure are
+not implemented. HEVC and AV1 use the same
 output path but are untested on hardware, including their server bitstream framing. Automatic selection conservatively
 advertises 8-bit output; explicit FFmpeg preserves its existing 10-bit capability.
 
