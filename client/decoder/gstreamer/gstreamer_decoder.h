@@ -25,6 +25,7 @@ class decoder : public wivrn::decoder
 	vk::raii::Device & device;
 	vk::raii::PhysicalDevice & physical_device;
 	vk::raii::Sampler rgb_sampler = nullptr;
+	vk::Format imported_format = vk::Format::eUndefined;
 	GstElement * pipeline = nullptr;
 	GstAppSrc * source = nullptr; // borrowed from pipeline
 	GstAppSink * sink = nullptr;

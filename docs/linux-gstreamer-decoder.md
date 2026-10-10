@@ -30,6 +30,17 @@ metadata: it cannot repair an incorrect buffer layout or force a driver to
 implement unsupported color conversions. RGB and incomplete colorimetry are
 rejected. Do not use this override for a stream with different color properties.
 
+AR24 import selects `B8G8R8A8Unorm` when the existing reprojection shader performs
+sRGB-to-linear conversion, and `B8G8R8A8Srgb` otherwise. Importing an sRGB texture
+and then applying that shader conversion would convert twice and darken the
+image. The DRM fourcc, byte order, and producer buffers are unchanged. Runtime
+modifier/import/filter capability checks apply to the selected Vulkan format.
+The `RGB sampling` startup log records this choice. For a comparison with the
+previous import behavior, set `WIVRN_GSTREAMER_RGB_FORMAT=srgb`; `auto` (the
+default) and `unorm` are also accepted. This changes only the GStreamer backend;
+other decoders and the shared reprojection shader are unchanged. Corrected
+color appearance still requires headset verification.
+
 ## Build and select
 
 Use a separate build directory; preserve the working software-decoder build.

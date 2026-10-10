@@ -3,6 +3,7 @@
  */
 #include "decoder/gstreamer/dmabuf.h"
 #include "decoder/gstreamer/converter_input.h"
+#include "decoder/gstreamer/color_sampling.h"
 #include "decoder/gstreamer/pipeline_diagnostics.h"
 #include <array>
 #include <drm_fourcc.h>
@@ -122,6 +123,20 @@ int main()
 	try
 	{
 		gst_init(nullptr, nullptr);
+		require(wivrn::gstreamer::rgb_import_format(true, nullptr) == vk::Format::eB8G8R8A8Unorm, "shader conversion requires unorm RGB input");
+		require(wivrn::gstreamer::rgb_import_format(false, "auto") == vk::Format::eB8G8R8A8Srgb, "texture sampling converts when shader does not");
+		require(wivrn::gstreamer::rgb_import_format(true, "srgb") == vk::Format::eB8G8R8A8Srgb, "legacy sampling override");
+		require(wivrn::gstreamer::rgb_import_format(false, "unorm") == vk::Format::eB8G8R8A8Unorm, "unorm sampling override");
+		bool invalid_rgb_format = false;
+		try
+		{
+			wivrn::gstreamer::rgb_import_format(true, "rgb");
+		}
+		catch (const std::runtime_error &)
+		{
+			invalid_rgb_format = true;
+		}
+		require(invalid_rgb_format, "invalid RGB import format rejected");
 		{
 			auto caps = gst_caps_from_string(wivrn::gstreamer::converter_input_caps(true));
 			wivrn::gstreamer::set_converter_colorimetry(caps, nullptr);

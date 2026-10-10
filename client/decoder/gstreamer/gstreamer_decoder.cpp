@@ -5,6 +5,7 @@
 #include "application.h"
 #include "dmabuf.h"
 #include "converter_input.h"
+#include "color_sampling.h"
 #include "pipeline_diagnostics.h"
 #include <algorithm>
 #include <chrono>
@@ -130,9 +131,8 @@ void wait_producer(int fd, std::stop_token stop)
 	throw std::runtime_error("GStreamer decoder stopped");
 }
 
-void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::Device & device, vk::raii::PhysicalDevice & physical)
+void import_image(imported_frame & frame, const dmabuf_frame & dma, vk::raii::Device & device, vk::raii::PhysicalDevice & physical, vk::Format format)
 {
-	constexpr auto format = vk::Format::eB8G8R8A8Srgb;
 	vk::StructureChain query{
 	        vk::PhysicalDeviceImageFormatInfo2{.format = format, .type = vk::ImageType::e2D, .tiling = vk::ImageTiling::eDrmFormatModifierEXT, .usage = vk::ImageUsageFlagBits::eSampled},
 	        vk::PhysicalDeviceImageDrmFormatModifierInfoEXT{.drmFormatModifier = dma.modifier,
@@ -292,6 +292,7 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 {
 	initialize();
 	profile_enabled = std::getenv("WIVRN_GSTREAMER_PROFILE") && !strcmp(std::getenv("WIVRN_GSTREAMER_PROFILE"), "1");
+	imported_format = rgb_import_format(application::get_hmd_traits().needs_srgb_conversion, std::getenv("WIVRN_GSTREAMER_RGB_FORMAT"));
 	for (auto extension: {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME})
 		if (std::ranges::none_of(application::get_vk_device_extensions(), [extension](auto name) { return !strcmp(name, extension); }))
 			throw std::runtime_error(std::string("GStreamer DMA-BUF needs enabled Vulkan extension ") + extension);
@@ -382,6 +383,7 @@ decoder::decoder(vk::raii::Device & device, vk::raii::PhysicalDevice & physical,
 		worker = std::jthread([this](std::stop_token stop) { receive(stop); });
 		spdlog::info("GStreamer V4L2 Stateless stream {}: {} -> v4l2convert -> AR24 DMA-BUF", index, entry.name);
 		spdlog::info("GStreamer stream {} converter input: {}", index, copy_input ? "MMAP (CPU NV12 copy enabled; RGA color conversion)" : "DMA-BUF import (no CPU pixel copy)");
+		spdlog::info("GStreamer stream {} RGB sampling: format={}, shader_srgb_conversion={}", index, vk::to_string(imported_format), application::get_hmd_traits().needs_srgb_conversion);
 	}
 	catch (...)
 	{
@@ -553,7 +555,7 @@ void decoder::receive(std::stop_token stop)
 			auto import_started = std::chrono::steady_clock::now();
 			try
 			{
-				import_image(*frame, dma, device, physical_device);
+				import_image(*frame, dma, device, physical_device, imported_format);
 			}
 			catch (const std::exception & e)
 			{
