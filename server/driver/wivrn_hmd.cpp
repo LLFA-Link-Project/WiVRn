@@ -129,6 +129,29 @@ wivrn_hmd::wivrn_hmd(wivrn::wivrn_session * cnx,
 	hmd->views[1].rot = u_device_rotation_ident;
 }
 
+void wivrn_hmd::set_external_head(xrt_device & device, xrt_input_name input,
+                                  external_head::latest_pose_fn query, const xrt_pose & source_from_head)
+{
+	lighthouse_head.emplace(device, input, query, source_from_head);
+	// Share the actual Lighthouse origin with controllers and trackers. Keep our own display.
+	static_cast<xrt_device &>(*this).tracking_origin = lighthouse_head->origin();
+}
+
+xrt_space_relation wivrn_hmd::external_pose(int64_t target_ns, int64_t now_ns)
+{
+	auto relation = lighthouse_head->get_pose(target_ns, now_ns);
+	int tracked = (relation.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+	if (external_tracking_state.exchange(tracked) != tracked)
+	{
+		if (tracked)
+			U_LOG_I("External HMD Lighthouse 6DoF tracking acquired: position=(%.3f, %.3f, %.3f)",
+			        relation.pose.position.x, relation.pose.position.y, relation.pose.position.z);
+		else
+			U_LOG_W("External HMD Lighthouse tracking unavailable or stale; head relation invalid");
+	}
+	return relation;
+}
+
 xrt_result_t wivrn_hmd::update_inputs()
 {
 	if (not supported.presence)
@@ -152,7 +175,7 @@ xrt_result_t wivrn_hmd::get_tracked_pose(xrt_input_name name, int64_t at_timesta
 	auto now = os_monotonic_get_ns();
 	auto target_ns = std::min(now + max_extrapolation_ns, at_timestamp_ns);
 	auto [production_timestamp, view] = views.get_at(target_ns);
-	*res = view.relation;
+	*res = lighthouse_head ? external_pose(target_ns, now) : view.relation;
 	cnx->add_tracking_request(device_id::HEAD, at_timestamp_ns, production_timestamp, now);
 	return XRT_SUCCESS;
 }
@@ -196,7 +219,8 @@ xrt_result_t wivrn_hmd::get_view_poses(const xrt_vec3 * default_eye_relation,
 		flags &= ~XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
 
 	view.relation.relation_flags = (xrt_space_relation_flags)flags;
-	*out_head_relation = view.relation;
+	// Client 3DoF flags describe its IMU, not our independent 6DoF Lighthouse source.
+	*out_head_relation = lighthouse_head ? external_pose(target_ns, now) : view.relation;
 
 	assert((out_head_relation->relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) == 0 or math_quat_ensure_normalized(&out_head_relation->pose.orientation));
 

@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sun, 11 Oct 2026 12:00:00 +0900
+Subject: [PATCH] d/steamvr_lh: support selected tracking-only HMD and observation timestamps
+
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -775,9 +775,17 @@
+ 	return XRT_SUCCESS;
+ }
+ 
++bool
++Device::get_latest_pose(int64_t *out_timestamp_ns, xrt_space_relation *out_relation)
++{
++	std::lock_guard<std::mutex> lock(pose_history_mutex);
++	return m_relation_history_get_latest(relation_hist, out_timestamp_ns, out_relation);
++}
++
+ void
+ Device::get_pose(uint64_t at_timestamp_ns, xrt_space_relation *out_relation)
+ {
++	std::lock_guard<std::mutex> lock(pose_history_mutex);
+ 	static const int64_t max_extrapolation_ns = []() -> int64_t {
+ 		int64_t raw = debug_get_num_option_lh_max_extrapolation_ms();
+ 		if (raw == -1) {
+@@ -1152,9 +1160,10 @@
+ void
+ Device::update_pose(const vr::DriverPose_t &newPose) const
+ {
++	std::lock_guard<std::mutex> lock(pose_history_mutex);
+ 	xrt_space_relation relation = {};
+ 
+-	if (newPose.poseIsValid) {
++	if (newPose.poseIsValid && newPose.deviceIsConnected) {
+ 		// The pose is known to be valid but that alone is not enough to say whether the data comes from
+ 		// inference or if it represents actively tracked position and orientation data. Furthermore we avoid
+ 		// assumptions regarding the validity of time-derivatives until we know that they're based on tracked
+@@ -1214,7 +1223,14 @@
+ 	math_quat_rotate_vec3(&chaperone.orientation, &relation.linear_velocity, &relation.linear_velocity);
+ 	math_quat_rotate_vec3(&chaperone.orientation, &relation.angular_velocity, &relation.angular_velocity);
+ 
+-	const uint64_t ts = chrono_timestamp_ns() + static_cast<uint64_t>(newPose.poseTimeOffset * 1000000.0);
++	// OpenVR poseTimeOffset is seconds, and may be negative. History uses nanoseconds.
++	if (!std::isfinite(newPose.poseTimeOffset) || std::abs(newPose.poseTimeOffset) > 1.0) {
++		return;
++	}
++	const int64_t ts = chrono_timestamp_ns() + static_cast<int64_t>(newPose.poseTimeOffset * 1e9);
++	if (ts <= 0) {
++		return;
++	}
+ 
+ 	m_relation_history_push(relation_hist, &relation, ts);
+ }
+@@ -1246,6 +1262,9 @@
+ void
+ HmdDevice::set_nominal_frame_interval(uint64_t interval_ns)
+ {
++	if (tracking_only) {
++		return;
++	}
+ 	auto set = [this, interval_ns] { hmd_parts->base.screens[0].nominal_frame_interval_ns = interval_ns; };
+ 
+ 	if (hmd_parts) {
+diff --git a/src/xrt/drivers/steamvr_lh/device.hpp b/src/xrt/drivers/steamvr_lh/device.hpp
+--- a/src/xrt/drivers/steamvr_lh/device.hpp
++++ b/src/xrt/drivers/steamvr_lh/device.hpp
+@@ -79,6 +79,9 @@
+ 
+ 	void
+ 	update_pose(const vr::DriverPose_t &newPose) const;
++
++	bool
++	get_latest_pose(int64_t *out_timestamp_ns, xrt_space_relation *out_relation);
+ 
+ 	//! Helper to use the @ref m_relation_history member.
+ 	void
+@@ -131,6 +134,7 @@
+ 	handle_property_write(const vr::PropertyWrite_t &prop);
+ 
+ private:
++	mutable std::mutex pose_history_mutex;
+ 	vr::ITrackedDeviceServerDriver *driver;
+ 
+ 	void
+@@ -153,6 +157,7 @@
+ class HmdDevice : public Device
+ {
+ public:
++	bool tracking_only{false};
+ 	VIVE_VARIANT variant{VIVE_UNKNOWN};
+ 	xrt_pose eye[2] = {XRT_POSE_IDENTITY, XRT_POSE_IDENTITY};
+ 	float ipd{0.063}; // meters
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+@@ -28,6 +28,7 @@
+ #include "device.hpp"
+ 
+ #include <cstring>
++#include <cstdlib>
+ #include <dlfcn.h>
+ #include <memory>
+ #include <cmath>
+@@ -235,12 +236,24 @@
+ bool
+ Context::setup_hmd(const char *serial, vr::ITrackedDeviceServerDriver *driver)
+ {
++	const char *tracking_serial = std::getenv("LH_TRACKING_ONLY_HMD_SERIAL");
++	const bool tracking_only = tracking_serial && *tracking_serial;
++	if (tracking_only && std::strcmp(tracking_serial, "*") != 0 && std::strcmp(serial, tracking_serial) != 0) {
++		CTX_WARN("Ignoring HMD %s: tracking-only serial %s was selected", serial, tracking_serial);
++		return false;
++	}
+ 	auto *hmd = new HmdDevice(DeviceBuilder{this->shared_from_this(), driver, serial, STEAM_INSTALL_DIR});
++	hmd->tracking_only = tracking_only;
+ 
+ 	{
+ 		// Publish the device before activating it: the driver writes its properties and creates its
+ 		// input components from within Activate, and those callbacks have to be able to find it.
+ 		std::lock_guard lk(this->devices_mut);
++		if (this->hmd) {
++			delete hmd;
++			CTX_ERR("A lighthouse HMD is already registered");
++			return false;
++		}
+ 		this->hmd = hmd;
+ 	}
+ 
+@@ -258,6 +271,21 @@
+ 	// us (WritePropertyBatch, TrackedDevicePoseUpdated, ...) from its own threads while holding them.
+ 	vr::EVRInitError err = driver->Activate(0);
+ 	VERIFY(err == vr::VRInitError_None, std::to_string(err).c_str());
++
++	if (tracking_only) {
++		// WiVRn supplies the display. A tracking-only module need not expose a display component.
++		hmd->device_type = XRT_DEVICE_TYPE_GENERIC_TRACKER;
++		hmd->supported.hand_tracking = false;
++		hmd->supported.compositor_info = false;
++		hmd->supported.brightness_control = false;
++		hmd->xrt_device::get_view_poses = nullptr;
++		hmd->xrt_device::compute_distortion = nullptr;
++		hmd->xrt_device::get_compositor_info = nullptr;
++		hmd->xrt_device::get_brightness = nullptr;
++		hmd->xrt_device::set_brightness = nullptr;
++		CTX_INFO("Activated tracking-only lighthouse HMD: %s", serial);
++		return true;
++	}
+ 
+ 	auto *display = static_cast<vr::IVRDisplayComponent *>(driver->GetComponent(vr::IVRDisplayComponent_Version));
+ 	VERIFY(display, "IVRDisplayComponent is null");
+@@ -1097,3 +1125,11 @@
+ 
+ 	return xrt_result::XRT_SUCCESS;
+ }
++
++// Only devices returned by steamvr_lh_create_devices may be passed here.
++extern "C" bool
++steamvr_lh_get_latest_pose(struct xrt_device *xdev, int64_t *out_timestamp_ns,
++                          struct xrt_space_relation *out_relation)
++{
++	return static_cast<Device *>(xdev)->get_latest_pose(out_timestamp_ns, out_relation);
++}
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+@@ -8,6 +8,8 @@
+  */
+ 
+ #include <xrt/xrt_results.h>
++#include <stdbool.h>
++#include <stdint.h>
+ 
+ #pragma once
+ 
+@@ -37,6 +39,16 @@
+ steamvr_lh_create_devices(struct xrt_prober *xp, struct xrt_system_devices *xsysd);
+ 
+ 
++struct xrt_device;
++struct xrt_space_relation;
++
++/* Query an observation timestamp, not the requested prediction time.
++ * xdev must have been returned by steamvr_lh_create_devices.
++ */
++bool
++steamvr_lh_get_latest_pose(struct xrt_device *xdev, int64_t *out_timestamp_ns,
++                          struct xrt_space_relation *out_relation);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.43.0

@@ -27,8 +27,11 @@
 #include <inplace_vector.hpp>
 
 #include "view_list.h"
+#include "external_head.h"
 
 #include <array>
+#include <atomic>
+#include <optional>
 #include <cstdint>
 
 namespace wivrn
@@ -54,6 +57,9 @@ class wivrn_hmd : public xrt_device
 	};
 
 	view_list views;
+	std::optional<external_head> lighthouse_head;
+	std::atomic<int> external_tracking_state{-1};
+	xrt_space_relation external_pose(int64_t target_ns, int64_t now_ns);
 	thread_safe<from_headset::battery> battery{};
 
 	thread_safe<wivrn_hmd_presence_data> presence;
@@ -69,6 +75,12 @@ public:
 	          const from_headset::headset_info_packet & info);
 
 	void set_foveated_size(uint32_t width, uint32_t height);
+	void set_external_head(xrt_device & device, xrt_input_name input,
+	                       external_head::latest_pose_fn query, const xrt_pose & source_from_head);
+	bool has_external_head() const
+	{
+		return lighthouse_head.has_value();
+	}
 
 	xrt_result_t update_inputs();
 	xrt_result_t get_tracked_pose(xrt_input_name name, int64_t at_timestamp_ns, xrt_space_relation *);

@@ -63,6 +63,7 @@
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 #include "steamvr_lh_interface.h"
+#include <cstdio>
 #endif
 
 #if WIVRN_FEATURE_SOLARXR
@@ -139,7 +140,18 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 
-	auto use_steamvr_lh = conf.use_steamvr_lh || std::getenv("WIVRN_USE_STEAMVR_LH");
+	const char *external_serial = std::getenv("WIVRN_EXTERNAL_HMD_SERIAL");
+	if (external_serial and not *external_serial)
+		external_serial = nullptr;
+	const char *external_mode = std::getenv("WIVRN_EXTERNAL_HMD");
+	const bool external_auto = external_mode and std::string_view(external_mode) == "auto" and not external_serial;
+	if (external_mode and *external_mode and std::string_view(external_mode) != "auto")
+		throw std::runtime_error("WIVRN_EXTERNAL_HMD only accepts auto; use WIVRN_EXTERNAL_HMD_SERIAL for explicit selection");
+	auto use_steamvr_lh = conf.use_steamvr_lh || std::getenv("WIVRN_USE_STEAMVR_LH") || external_serial || external_auto;
+	if (external_serial)
+		setenv("LH_TRACKING_ONLY_HMD_SERIAL", external_serial, true);
+	else if (external_auto)
+		setenv("LH_TRACKING_ONLY_HMD_SERIAL", "*", true);
 
 	if (use_steamvr_lh)
 	{
@@ -150,47 +162,87 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 			setenv("LH_MAX_EXTRAPOLATION_MS", std::format("{}", *conf.lh_max_extrapolation).c_str(), true);
 
 		U_LOG_W("=====================");
-		U_LOG_W("Disregard lighthousedb / chaperone related error messages from the lighthouse driver. These are irrelevant in case of WiVRn.");
+		if (external_serial or external_auto)
+			U_LOG_I("External HMD uses the Lighthouse tracking space shared with Lighthouse controllers and trackers.");
+		else
+			U_LOG_W("Disregard lighthousedb / chaperone related error messages from the lighthouse driver. These are irrelevant in case of WiVRn.");
 		U_LOG_W("If getting a SIGSEGV right after this, you are likely using an unsupported SteamVR version!");
 		U_LOG_W("=====================");
 		int original_count = static_xdev_count;
-		if (steamvr_lh_create_devices(nullptr, this) == XRT_SUCCESS)
+		try
 		{
-			for (int i = original_count; i < static_xdev_count; i++)
+			if (steamvr_lh_create_devices(nullptr, this) == XRT_SUCCESS)
 			{
-				auto lhdev = static_xdevs[i];
-				switch (lhdev->device_type)
+				for (int i = original_count; i < static_xdev_count; i++)
 				{
-					case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
-						roles.left = i;
-						static_roles.hand_tracking.unobstructed.left = nullptr;
-						static_roles.hand_tracking.conforming.left = lhdev;
-						break;
-					case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER:
-						roles.right = i;
-						static_roles.hand_tracking.unobstructed.right = nullptr;
-						static_roles.hand_tracking.conforming.right = lhdev;
-						break;
-					case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
-						if (roles.left == left_controller_index)
+					auto lhdev = static_xdevs[i];
+					U_LOG_I("Lighthouse device: serial=%s name=%s", lhdev->serial, lhdev->str);
+					if ((external_serial and std::string_view(lhdev->serial) == external_serial) or
+				        (external_auto and not hmd.has_external_head() and
+				         external_head::pose_input(*lhdev) == XRT_INPUT_GENERIC_HEAD_POSE))
+					{
+						auto input = external_head::pose_input(*lhdev);
+						if (not input or not lhdev->tracking_origin or not lhdev->get_tracked_pose)
+							throw std::runtime_error("Selected external HMD has no usable head/tracker pose");
+						xrt_pose mount = XRT_POSE_IDENTITY;
+						if (const char *value = std::getenv("WIVRN_EXTERNAL_HMD_POSE_OFFSET"))
 						{
+							int consumed = 0;
+							if (std::sscanf(value, "%f,%f,%f,%f,%f,%f,%f%n", &mount.position.x, &mount.position.y,
+							                &mount.position.z, &mount.orientation.x, &mount.orientation.y,
+							                &mount.orientation.z, &mount.orientation.w, &consumed) != 7 or
+							    value[consumed] != '\0' or not external_head::valid_pose(mount))
+								throw std::runtime_error("Invalid WIVRN_EXTERNAL_HMD_POSE_OFFSET; expected x,y,z,qx,qy,qz,qw (metres, unit quaternion)");
+						}
+						hmd.set_external_head(*lhdev, *input, steamvr_lh_get_latest_pose, mount);
+						U_LOG_I("WiVRn HMD tracking: Lighthouse serial=%s; client display retained", lhdev->serial);
+					}
+					switch (lhdev->device_type)
+					{
+						case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
 							roles.left = i;
 							static_roles.hand_tracking.unobstructed.left = nullptr;
 							static_roles.hand_tracking.conforming.left = lhdev;
-						}
-						else if (roles.right == right_controller_index)
-						{
+							break;
+						case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER:
 							roles.right = i;
 							static_roles.hand_tracking.unobstructed.right = nullptr;
 							static_roles.hand_tracking.conforming.right = lhdev;
-						}
-						break;
-					default:
-						break;
+							break;
+						case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
+							if (roles.left == left_controller_index)
+							{
+								roles.left = i;
+								static_roles.hand_tracking.unobstructed.left = nullptr;
+								static_roles.hand_tracking.conforming.left = lhdev;
+							}
+							else if (roles.right == right_controller_index)
+							{
+								roles.right = i;
+								static_roles.hand_tracking.unobstructed.right = nullptr;
+								static_roles.hand_tracking.conforming.right = lhdev;
+							}
+							break;
+						default:
+							break;
+					}
 				}
 			}
+			if ((external_serial or external_auto) and not hmd.has_external_head())
+				throw std::runtime_error(std::format("Requested Lighthouse HMD {} was not discovered; check USB/IP and LH_DISCOVER_WAIT_MS", external_serial ? external_serial : "auto"));
+		}
+		catch (...)
+		{
+			// A throwing constructor does not run the session destructor.
+			for (int i = original_count; i < static_xdev_count; ++i)
+				xrt_device_destroy(&static_xdevs[i]);
+			static_xdev_count = original_count;
+			throw;
 		}
 	}
+#else
+	if (std::getenv("WIVRN_EXTERNAL_HMD_SERIAL") or std::getenv("WIVRN_EXTERNAL_HMD"))
+		throw std::runtime_error("External HMD requires WIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON");
 #endif
 	if (get_info().eye_gaze || is_forced_extension("EXT_eye_gaze_interaction"))
 	{
