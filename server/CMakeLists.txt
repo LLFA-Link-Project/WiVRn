@@ -288,6 +288,11 @@ if (WIVRN_BUILD_SERVER)
 endif()
 
 if (WIVRN_BUILD_SERVER_LIBRARY)
+	# Applications load these libraries from the generated development manifest.
+	# Keep them in sync even when only the server target is requested.
+	if (TARGET wivrn-server)
+		add_dependencies(wivrn-server ${RUNTIME_TARGET} monado)
+	endif()
 	set_target_properties(${RUNTIME_TARGET} PROPERTIES EXCLUDE_FROM_ALL FALSE)
 	set_target_properties(monado PROPERTIES EXCLUDE_FROM_ALL FALSE)
 

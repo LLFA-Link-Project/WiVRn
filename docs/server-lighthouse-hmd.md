@@ -18,12 +18,14 @@ WiVRnの表示用HMDを保持したまま、PC側のSteamVR Lighthouseドライ�
 PC側でUSB/IP接続を済ませ、SteamVRのLighthouseドライバを利用できる状態にする。クライアントの既存ビルドを変更する必要はない。以下はすべて一行のコマンド。
 
 ```bash
-cmake -S . -B build-server-lighthouse -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWIVRN_BUILD_CLIENT=OFF -DWIVRN_BUILD_SERVER=ON -DWIVRN_BUILD_DASHBOARD=OFF -DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON -DWIVRN_BUILD_TEST=ON
+cmake -S . -B build-server-lighthouse -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWIVRN_BUILD_CLIENT=OFF -DWIVRN_BUILD_SERVER=ON -DWIVRN_BUILD_SERVER_LIBRARY=ON -DWIVRN_BUILD_DASHBOARD=OFF -DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON -DWIVRN_BUILD_TEST=ON
 cmake --build build-server-lighthouse --target wivrn-server wivrn-external-head-test wivrn-lighthouse-driver-test --parallel 4
 ctest --test-dir build-server-lighthouse --output-on-failure -R 'wivrn-(external-head|lighthouse-driver)'
 WIVRN_EXTERNAL_HMD_SERIAL=LHR-CEC1027F ./build-server-lighthouse/server/wivrn-server > /tmp/wivrn-lighthouse-arpara.log 2>&1
 WIVRN_EXTERNAL_HMD=auto ./build-server-lighthouse/server/wivrn-server > /tmp/wivrn-lighthouse-auto.log 2>&1
 ```
+
+`WIVRN_BUILD_SERVER_LIBRARY=ON` では、`wivrn-server` ターゲットと一緒にOpenXR／libmonadoライブラリも更新する。古いライブラリが残ると、アプリ側のランタイム初期化やサーバーとのIPC接続に失敗する可能性がある。
 
 最後の二行は別々の起動方法。一度に両方を実行しない。既存のWiVRnサーバーを停止してから実行する。必要なら `STEAMVR_PATH` でSteamVRのインストール先を指定する。デバイスの検出待ちは既存の `LH_DISCOVER_WAIT_MS` を利用する。
 
