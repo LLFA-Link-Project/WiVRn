@@ -1,0 +1,2 @@
+{"schema_version":1,"device_id":"synthetic-tracker","sequence":0,"capture_time_ns":34783819751639,"capture_clock":"CLOCK_MONOTONIC","event":"device_announced","device_class":3}
+{"schema_version":1,"device_id":"synthetic-tracker","sequence":1,"capture_time_ns":34783819765285,"capture_clock":"CLOCK_MONOTONIC","event":"driver_state_changed","device_is_connected":true,"pose_is_valid":true,"tracking_result":200}

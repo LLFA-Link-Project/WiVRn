@@ -96,21 +96,14 @@ class FileTests(unittest.TestCase):
             self.assertFalse((dest/'usb.pcap.gz').exists())
             self.assertFalse(r.read(dest/'manifest.json')['usb_replay_available'])
 
-    def test_capture_command_passive(self):
-        cmd = r.usb_command('/bin/survive-cli', Path('/tmp/session'))
-        self.assertIn('--usbmon-only-record', cmd)
-        self.assertIn('--usbmon', cmd)
-        self.assertNotIn('--htcvive', cmd)
-
-    def test_missing_binary_finalizes_abnormally(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d)/'session'
-            result = subprocess.run([str(ROOT/'lh-recorder'), 'run', '--output', str(p),
-                                     '--survive-cli', '/not/a/survive-cli'], capture_output=True, text=True, timeout=10)
+    def test_recording_commands_removed(self):
+        result = subprocess.run([str(ROOT/'lh-recorder'), '--help'], capture_output=True, text=True, check=True)
+        self.assertIn('validate', result.stdout)
+        self.assertNotIn('--survive-cli', result.stdout)
+        for command in ('start', 'run', 'stop', 'status'):
+            result = subprocess.run([str(ROOT/'lh-recorder'), command], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(r.read(p/'manifest.json')['status'], 'abnormal')
-            self.assertFalse((p/'active').exists())
-            self.assertFalse(r.read(p/'validation.json')['valid'])
+
 
 
 @unittest.skipUnless(os.getenv('LH_POSE_HARNESS'), 'Set LH_POSE_HARNESS to compiled pose_harness')
@@ -175,15 +168,38 @@ class StartupTests(unittest.TestCase):
             base = Path(d)
             conf = base/'config.json'
             conf.write_text(json.dumps({'lighthouse-recording': {'enabled': True, 'output-directory': str(base/'logs')}}))
-            result = subprocess.run([os.environ['LH_STARTUP_HARNESS'], str(conf)],
-                                    env=dict(os.environ, LH_RECORDER_SURVIVE_CLI=str(ROOT/'tests/fake_usb.py'), LH_TEST_DENY_CAPTURE='1'),
+            result = subprocess.run([os.environ['LH_STARTUP_HARNESS'], str(conf), 'deny'],
+                                    env=dict(os.environ, PATH='', LH_RECORDER_ENABLE='1'),
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
             self.assertIn('ready', result.stdout)
             session = next((base/'logs').iterdir())
             self.assertEqual(r.read(session/'manifest.json')['status'], 'abnormal')
-            self.assertIn('permission denied', (session/'usb_capture.log').read_text())
-            self.assertFalse((session/'poses.jsonl').exists())
+            self.assertTrue(any('permission denied' in e for e in r.read(session/'manifest.json')['errors']))
+            records = list(r.lines(session/'poses.jsonl'))
+            status = r.read(session/'pose_status.json')
+            announcements = sum(event.get('event') == 'device_announced' for event in r.lines(session/'events.jsonl'))
+            self.assertEqual(status['attempted'], 121)
+            self.assertEqual(status['attempted'], len(records)+status['dropped']+announcements)
+            self.assertGreater(records[-1]['capture_time_ns']-records[0]['capture_time_ns'], 2_000_000_000)
+            self.assertTrue(r.read(session/'pose_status.json')['stopped'])
+            self.assertEqual(list(r.pcap_records(session/'usb.pcap.gz')), [])
+
+    def test_abnormal_owner_exit_closes_both_streams(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            conf = base/'config.json'
+            conf.write_text(json.dumps({'lighthouse-recording': {'enabled': True, 'output-directory': str(base/'logs')}}))
+            result = subprocess.run([os.environ['LH_STARTUP_HARNESS'], str(conf), 'abnormal'], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0)
+            session = next((base/'logs').iterdir())
+            manifest = r.read(session/'manifest.json')
+            self.assertEqual(manifest['owner_exit_status'], 1)
+            self.assertEqual(manifest['status'], 'abnormal')
+            self.assertTrue(r.read(session/'pose_status.json')['stopped'])
+            self.assertGreater(len(list(r.pcap_records(session/'usb.pcap.gz'))), 30)
+            self.assertFalse(r.read(session/'validation.json')['valid'])
+            self.assertEqual({name:r.sha(session/name) for name in manifest['files_sha256']}, manifest['files_sha256'])
 
     def test_snapshot_restart_and_owner_finalization(self):
         with tempfile.TemporaryDirectory() as d:
@@ -194,18 +210,19 @@ class StartupTests(unittest.TestCase):
                 conf.write_text(json.dumps({'lighthouse-recording': {'enabled': enabled, 'output-directory': str(output)}}))
             def launch():
                 return subprocess.Popen([os.environ['LH_STARTUP_HARNESS'], str(conf)],
-                                        env=dict(os.environ, LH_RECORDER_SURVIVE_CLI=str(ROOT/'tests/fake_usb.py')),
+                                        env=dict(os.environ, PATH='', LH_RECORDER_ENABLE='1', LH_RECORDER_OUTPUT=str(base/'env-must-not-trigger')),
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             configure(False, old)
             off = launch(); stdout, stderr = off.communicate(timeout=10)
             self.assertEqual(off.returncode, 0, stderr)
             self.assertFalse(old.exists())
+            self.assertFalse((base/'env-must-not-trigger').exists())
             configure(True, old)
             on = launch()
             deadline = time.monotonic()+10
-            while time.monotonic() < deadline and not list(old.glob('*/ready.json')):
+            while time.monotonic() < deadline and not list(old.glob('*/pose_status.json')):
                 time.sleep(0.02)
-            self.assertTrue(list(old.glob('*/ready.json')))
+            self.assertTrue(list(old.glob('*/pose_status.json')))
             configure(False, new)  # Current immutable snapshot must keep both capture streams alive.
             stdout, stderr = on.communicate(timeout=10)
             self.assertEqual(on.returncode, 0, stderr)
@@ -217,13 +234,42 @@ class StartupTests(unittest.TestCase):
             while time.monotonic() < deadline and r.read(session/'manifest.json', {}).get('status') == 'recording':
                 time.sleep(0.05)
             self.assertEqual(r.read(session/'manifest.json')['status'], 'complete', (session/'manifest.json').read_text())
-            self.assertEqual(len(list(r.lines(session/'poses.jsonl'))), 120)
+            records = list(r.lines(session/'poses.jsonl'))
+            status = r.read(session/'pose_status.json')
+            announcements = sum(event.get('event') == 'device_announced' for event in r.lines(session/'events.jsonl'))
+            self.assertEqual(status['attempted'], 121)
+            self.assertEqual(status['attempted'], len(records)+status['dropped']+announcements)
+            self.assertGreater(records[-1]['capture_time_ns']-records[0]['capture_time_ns'], 2_000_000_000)
             self.assertGreater(len(list(r.pcap_records(session/'usb.pcap.gz'))), 30)
             self.assertTrue(r.validate(session)['valid'])
+            self.assertEqual(r.read(session/'manifest.json')['owner_exit_status'], 0)
+            checksums = r.read(session/'manifest.json')['files_sha256']
+            time.sleep(0.1)
+            self.assertEqual({name:r.sha(session/name) for name in checksums}, checksums)
+            if os.getenv('LH_SURVIVE_CLI'):
+                config = base/'replay-config'/'libsurvive'
+                config.mkdir(parents=True)
+                for _ in range(2):
+                    replay = subprocess.run([os.environ['LH_SURVIVE_CLI'], '--usbmon-playback', str(session/'usb.pcap.gz'), '--playback-factor', '0'],
+                                            env=dict(os.environ, XDG_CONFIG_HOME=str(config.parent)),
+                                            cwd=base, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(replay.returncode, 0, replay.stdout+replay.stderr)
+                    self.assertIn(f"usbmon saw {r.read(session/'manifest.json')['usb_packet_count']}/", replay.stdout)
+                    self.assertIn('Loaded drivers: USBMon_Playback', replay.stdout)
+                    self.assertTrue(r.validate(session)['valid'])
             restarted = launch(); restarted.communicate(timeout=10)
             self.assertFalse(new.exists())
-            configure(True, new)
-            again = launch(); again.communicate(timeout=10)
+            configure(True, '~/LH-Dump')
+            old_home = os.environ.get('HOME')
+            os.environ['HOME'] = str(base)
+            try:
+                again = launch()
+            finally:
+                if old_home is None:
+                    os.environ.pop('HOME', None)
+                else:
+                    os.environ['HOME'] = old_home
+            new = base/'LH-Dump'; again.communicate(timeout=10)
             self.assertEqual(again.returncode, 0)
             self.assertTrue(list(new.glob('*/poses.jsonl')))
             self.assertEqual(len(list(old.iterdir())), 1)

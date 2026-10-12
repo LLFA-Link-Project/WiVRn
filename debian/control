@@ -24,6 +24,7 @@ Build-Depends:
  libglu1-mesa-dev,
  libglx-dev,
  libnotify-dev,
+ libpcap-dev,
  libpipewire-0.3-dev,
  libswscale-dev,
  libsystemd-dev,
@@ -40,7 +41,8 @@ Build-Depends:
  qt6-base-dev,
  qt6-tools-dev,
  qcoro-qt6-dev,
- xz-utils
+ xz-utils,
+ zlib1g-dev
 Standards-Version: 4.6.2
 Homepage: https://wivrn.github.io
 #Vcs-Browser: https://salsa.debian.org/debian/wivrn

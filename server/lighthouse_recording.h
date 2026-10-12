@@ -5,4 +5,5 @@ namespace wivrn
 {
 // Called once in the Monado child before ipc_server_main_common. Never reloads settings.
 void start_lighthouse_recording(const configuration & snapshot) noexcept;
+void stop_lighthouse_recording(int exit_status = 0) noexcept;
 } // namespace wivrn

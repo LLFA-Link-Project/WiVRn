@@ -1,4 +1,30 @@
-# 実施した検証
+# Native 記録 v2 の検証
+
+基準: WiVRn `dad7b6a29a52ec6624b8895d5d7892f73147059a`。記録用 CLI / 外部 supervisor を廃止し、server 内に libpcap / gzip / clock sampler / session finalization を組み込みました。
+Monado の追加0017は Pose writer を明示的に停止・flush するAPIです。0016は初版のまま保持しています。
+
+- Native server / Dashboard / OpenXR runtime のビルド成功。
+- 自動テスト **19件成功**。Qt Settings の保存・復元テストも成功。
+- PATH を空にし、Python や survive-cli を起動できない状態で同時記録・通常終了を確認。
+- OFF では外部環境変数が残っていても出力ディレクトリを作らない。
+- 記録中のOFF / 出力先変更 / 再度start呼出しは無視。新しいMonado起動で変更を反映。
+- `~/LH-Dump` を HOME へ展開し、保存できることを確認。
+- 正常終了は owner_exit_status=0、異常終了は1で確定。両方でPose writer停止、USB source破棄、gzipを閉じることを確認。
+- 終了後に記録ファイルが変わらず、SHA-256と一致することを確認。
+- 内蔵writerで生成したpcapを、実際のpatched libsurviveで2回読込。ファイルを変更せず、各回120 packetを読み込む。
+- 新しい `synthetic-native-session` は全内容検証でvalid、120 Pose / 120 USB packets。実際のセンサー由来ではなく、Pose solve は未実施。
+- usbmon開始をpermission-deniedで失敗させても、Poseは記録してflushし、manifestはabnormalとして失敗理由を保存する。
+- 実際のusbmon backendも実行。この環境には `/dev/usbmon0` がないため失敗を検出。Pose 120件を保存し、USB 0件をabnormalとして記録した（Poseはテスト入力）。
+- SteamVR LighthouseをOFFにした別ビルドでも、recordingの無効stubがコンパイルできることを確認。recordingのlibpcap依存はこの構成で追加しない。
+- ステージングinstall成功。オフラインCLIに残るのは validate / align / export-public のみ。
+
+実機のValve callbackとの同時収集、追跡品質、実測センサーからのlibsurvive Pose solve、長時間の実機記録は未検証です。
+Poseキューは飽和／mutex競合で待機せずdropし、その件数を保存します。低レートのテストでも稀な競合によるdropがあり得るため、試行数・保存数・announcement数・drop数の整合性を検証しています。
+終了時の自動validationはcounter/packet length/writer状態の検査で、`full_content_validation=false` を明記します。オフラインvalidateが全内容・hash・clock mappingを検査します。
+
+以下は初版の検証記録です。recording helper / Python / survive-cli の依存は v2 で除去されています。
+
+## 初版 v1 の検証記録
 
 実装基準と patch hashes は `provenance.json`。WiVRn の変更は本実装コミットに含まれます。
 環境: Linux `7.2.9-arch1-1`、GCC `16.2.1`、Qt `6.12.0`、libpcap `1.11.0`、libusb `1.0.30`。

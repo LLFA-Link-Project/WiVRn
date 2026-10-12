@@ -1,33 +1,36 @@
-# Lighthouse Reference Dataset Recorder v1
+# Lighthouse Reference Dataset Recorder v2
 
 Valve Pose は Ground Truth ではなく **Reference Pose** です。本実装はデータ収集を担当します。
 Dashboard の設定項目は「Enable recording」と「Output directory」の2つだけです。
 設定は既存の WiVRn JSON / D-Bus 保存経路を通り、Monado 子プロセスを起動する際の
 `configuration` のコピーから一度だけ読みます。稼働中の編集は現在のセッションに反映されません。
-Pose のロガーはプロセス終了時まで動作し、専用 supervisor は Linux pidfd で終了を検出します。
+記録は wivrn-server に組み込まれています。外部の記録用 CLI、Python、survive-cli は起動しません。
+Monado の正常／異常終了経路で Pose writer・USB capture・clock sampler を停止・joinし、manifest を確定します。
 ランタイム設定 IPC、設定ファイル監視、Dashboard の状態ポーリングはありません。
 
 ## ソース調査と revision
 
 | コンポーネント | 調査・実装の基準 |
 | --- | --- |
-| WiVRn | `34afe754f8750e8a98e2e6db8e0c25b44502e72a`、本実装コミットの親 revision |
+| WiVRn | `dad7b6a29a52ec6624b8895d5d7892f73147059a` を基準に native 記録へ改修。初版の基準は `34afe754f8750e8a98e2e6db8e0c25b44502e72a` |
 | Monado | `monado-rev`: `09741cbcb45236f4f4f79790ea133cd90d68d5eb` + WiVRn patches 0001–0015 |
 | ローカルの参考 Monado | `ad7610a5561325a9b368cda5d45fe195d67f4c3b`。実装パッチは上の WiVRn pin に対して作成 |
 | libsurvive | `23f03665070549f0c13a6e768dfaf7764f75c417`、CMake project version `0.3`、CLI 表示 `v1.01-206-g23f0366-dirty` |
-| ロガー | `1.0.0`、schema version `1` |
+| ロガー | `2.0.0`、schema version `1` |
 
 追加パッチ:
 
 - `patches/monado/0016-d-steamvr_lh-record-valve-reference-poses.patch`
-- `patches/libsurvive/0001-usbmon-safe-passive-recording.patch`
+- `patches/monado/0017-d-steamvr_lh-finalize-reference-recorder.patch`
+- `patches/libsurvive/0001-usbmon-safe-passive-recording.patch`（任意のオフライン再生用。記録には不要）
 
 WiVRn の `CMakeLists.txt` は `patches/monado/*` を既に FetchContent 時に適用します。
 Monado の `src/xrt/drivers/CMakeLists.txt` に独立した recorder コンポーネントを追加しました。
-既存の checkout や `FETCHCONTENT_SOURCE_DIR_MONADO` を使う場合は、0016 の適用を確認してください。
+既存の checkout や `FETCHCONTENT_SOURCE_DIR_MONADO` を使う場合は、0016・0017 の適用を確認してください。
 実行時 manifest は期待する pin と実際の WiVRn/Monado ビルド revision を区別します。
-libsurvive の実際の full revision は `--libsurvive-source` を指定した場合に記録し、未指定なら
-`null` です。バイナリ SHA-256 と CLI バージョン出力も保存します。期待 pin を実測 revision に見せません。
+記録には libsurvive をロードしないため、`libsurvive_revision` は `null` です。
+互換形式の参照 revision は別フィールドに保存します。WiVRn/Monado のビルド revision と
+実際の server 実行ファイルの SHA-256 を保存し、期待 pin を実測 revision に見せません。
 
 ## Pose の伝搬経路
 
@@ -48,50 +51,42 @@ Monado の Linux `os_monotonic_get_ns()` は `CLOCK_MONOTONIC`、この pin の 
 
 ## ビルドと導入
 
-WiVRn 本体の通常のビルド依存関係に加えて、Python 3.9 以上、libpcap、libusb、zlib の development packages が必要です。
-Linux pidfd 対応 kernel が必要です。USB 権限を取得するために WiVRn 全体を root で実行する必要はありません。
+既存の `WIVRN_FEATURE_STEAMVR_LIGHTHOUSE` を含む server ビルドでは、記録コードも自動で組み込まれます。
+記録専用の CMake 有効化設定や実行ファイルパス指定はありません。既定の記録状態は OFF で、Dashboard の設定が唯一のトリガーです。
+標準の WiVRn ビルド依存関係に加えて libpcap と zlib の development packages が必要です。
+Debian の Build-Depends にも追加しています。記録には Python/libsurvive のインストールも PATH 設定も不要です。
 
 ```sh
-# 初回のみ。スクリプトは既存 checkout を変更しません。
-tools/lh-recorder/build-libsurvive.sh /tmp/lh-survive-src /tmp/lh-survive-build
-
-# WiVRn を起動する環境に渡す。shared plugin directories は build 内に残してください。
-export LH_RECORDER_SURVIVE_CLI=/tmp/lh-survive-build/survive-cli
-
-# 開発ビルド。production install では recorder path override を省略。
 cmake -S . -B build-lh -G Ninja \
-  -DWIVRN_BUILD_CLIENT=OFF -DWIVRN_BUILD_SERVER=ON -DWIVRN_BUILD_DASHBOARD=ON \
-  -DWIVRN_BUILD_TEST=ON \
-  -DWIVRN_LH_RECORDER_EXECUTABLE="$PWD/tools/lh-recorder/lh-recorder"
-cmake --build build-lh # server / Dashboard / OpenXR runtime library を含む
+  -DWIVRN_BUILD_CLIENT=OFF -DWIVRN_BUILD_SERVER=ON -DWIVRN_BUILD_DASHBOARD=ON
+cmake --build build-lh
 ```
 
-インストールでは CLI を `${CMAKE_INSTALL_BINDIR}/lh-recorder` と
-`${CMAKE_INSTALL_LIBEXECDIR}/wivrn/lh-recorder` に配置します。ビルド用 override を設定したままの
-バイナリはそのパスを参照するので、配布ビルドではデフォルトに戻してください。
-libsurvive は別途導入し、`survive-cli` を PATH に置くか上の環境変数を使います。
-systemd サービス起動ではサービスにもその環境変数を渡す必要があります。
-Flatpak は usbmon デバイス、Python、libsurvive plugin と出力先へのアクセスが必要です。
-この変更では Flatpak に依存ライブラリや権限を追加していないため、native install を検証対象にしてください。
+ビルドツリーの server を直接実行した場合も記録できます。install 済み helper に依存しません。
+Python 3.9 以上はオフライン検証 CLI を使う場合のみ必要です。
+`lh-recorder` は validate / align / export-public のみ提供し、record/start/stop コマンドはありません。
 
-管理者による USB 権限設定の例（本実装は自動で権限変更しません）:
+USB 権限設定の例（自動で権限変更や root 起動はしません）:
 
 ```sh
 sudo modprobe usbmon
 sudo setfacl -m u:"$USER":r /dev/usbmon0
 ```
 
-usbmon0 は全 bus を監視します。libsurvive は既知の Lighthouse VID/PID と起動時のアドレスだけを保存します。
-kernel の observer ring は他の USB traffic にも影響されるので drop counts は Lighthouse 限定の損失数ではありません。
-ACL は reboot/module reload で失われる可能性があります。個々の OS に合わせて永続的な設定を行ってください。
-特権 capture プロセスを別に用意する場合も、一般ユーザーの session ディレクトリへ出力できる構成にしてください。
+USB は server 内の専用スレッドで、libpcap の Linux usbmon インターフェースから受動的に収集します。
+USB デバイスの claim/detach や追加の control request は行いません。
+usbmon0 の observer ring は全 bus の traffic に影響されるため、kernel drop counts は Lighthouse 限定の損失数ではありません。
+権限不足・usbmon 不在でも Pose 記録を続け、manifest の errors と server log に失敗理由を残します。
+Flatpak の標準 manifest は SteamVR Lighthouse を OFF にしています。native ビルドを検証対象とし、
+Flatpak でこの driver を使う場合の USB device / 保存先アクセスは別途必要です。
 
 ## Dashboard での利用
 
 SteamVR tracked devices の利用設定を有効にし、Settings の Lighthouse Recording で記録を ON にして保存します。
 出力先は既定で `$XDG_DATA_HOME/wivrn/lighthouse-recordings`、未設定時は
 `$HOME/.local/share/wivrn/lighthouse-recordings` です。文字列入力と FolderDialog はローカルパスを扱います。
-絶対パスを指定してください。日本語や空白を含むパスも保存できます。
+絶対パスまたは `~/LH-Dump` のようなホーム相対表記を指定してください。
+`~` / `~/` は Monado 起動時に HOME へ展開します。日本語や空白を含むパスも保存できます。
 
 ```json
 {
@@ -105,31 +100,24 @@ SteamVR tracked devices の利用設定を有効にし、Settings の Lighthouse
 
 次の Monado 子プロセス起動時に日付・nanoseconds・PID を含む新しいディレクトリを作り、USB を先に開始してから
 Valve driver の初期化へ進みます。設定が OFF の場合、recorder の spawn や出力ディレクトリの作成はありません。
-開始失敗は stderr とセッションに記録され、通常のトラッキングの起動を続けます。
+USB 開始失敗は stderr とセッションに記録され、Pose 記録と通常のトラッキングを続けます。
 記録中に OFF / 出力先変更を保存しても、既存の recorder の環境・設定は変わりません。
-Monado の終了時に Pose writer を join/flush し、supervisor が USB を SIGINT で停止して manifest を確定します。
+Monado の終了時に Pose writer を join/flush し、USB / clock スレッドを停止・joinして gzip を閉じ、manifest を確定します。
+正常／例外経路の owner exit status も保存します。記録終了後に残る capture 子プロセスはありません。
 自動削除、容量上限、ローテーションはありません。ディスク不足は異常終了として扱います。
 
-## CLI
+## オフライン CLI
+
+記録開始・停止は WiVRn/Monado の起動・終了に従います。CLI は記録経路に存在しません。
 
 ```sh
-lh-recorder start --output /absolute/path/new-session \
-  --survive-cli /path/to/patched/survive-cli --libsurvive-source /path/to/source
-# 出力された LH_RECORDER_ENABLE=1 / LH_RECORDER_OUTPUT を WiVRn の起動環境に設定する。
-# Dashboard による自動起動の場合、この手動操作は不要。
-lh-recorder status /absolute/path/new-session
-# 先に Monado を通常終了する。Pose logger はプロセス寿命に従い、runtime control IPC は持たない。
-lh-recorder stop /absolute/path/new-session
-lh-recorder validate /absolute/path/new-session
-lh-recorder align /absolute/path/new-session
-lh-recorder export-public /absolute/path/new-session /absolute/path/new-public-export
+lh-recorder validate /absolute/path/session
+lh-recorder align /absolute/path/session
+lh-recorder export-public /absolute/path/session /absolute/path/new-public-export
 ```
 
-`run --owner-pid PID` は WiVRn の起動処理が使う foreground supervisor です。
-`start` は supervisor を背景起動して初期化の成否を待ちます。`stop` は Pose writer が終了していることを確認して
-supervisor を終了します。稼働中の Monado の Pose ロガーを動的に停止する操作ではありません。
-CLI と Dashboard は USB/Pose の個別スイッチを提供しません。`LH_RECORDER_ENABLE=1` の明示指定は CLI 管理セッションを
-選ぶため、Dashboard の OFF より優先します。通常の Dashboard 利用ではこの変数を設定しないでください。
+`LH_RECORDER_ENABLE` / `LH_RECORDER_OUTPUT` は server から Monado コンポーネントへの内部受渡しのみです。
+外部から設定しても Dashboard の OFF を上書きできません。稼働中の設定編集や再度の start 呼出しは無視します。
 
 ## Session format
 
@@ -147,14 +135,15 @@ CLI と Dashboard は USB/Pose の個別スイッチを提供しません。`LH_
 | `devices.json` | sysfs の起動時の VID/PID、bus/address、serial と stable ID（不明なら null） |
 | `usb_devices.jsonl` | 記録中の USB enumeration 変化。bus/address を永続 ID としない |
 | `pose_status.json` | 試行数、書込数、drop、queue capacity、停止状態、writer error |
-| `validation.json` | 構造・hash・timestamp・不足データの検証結果 |
+| `validation.json` | 終了時の counters / writer 状態の検査。オフライン validate で全内容・hash・時刻を検査して更新 |
 | `usb_timestamps.jsonl` | `align` が生成する派生インデックス。原 timestamp と変換値・誤差を併記 |
-| `libsurvive-config/` | capture プロセスの private config。利用者の既存 libsurvive config を変更しない |
 
-manifest 自身、validation、lock/ready/manager.log は hash 集合から除外します。その他の nested config を含めて SHA-256 を計算します。
+manifest 自身と validation は hash 集合から除外し、記録ファイルの SHA-256 を計算します。
+native 記録には lock/ready/manager.log/private libsurvive config は生成しません。
+終了時検査は `full_content_validation=false` を明記します。オフライン validate は全内容を検査します。
 `align` で追加した派生ファイルは manifest の原データ hash 集合に追加しません。
 異常終了時にバッファ末尾が壊れた JSONL / gzip、未確定 manifest は validation で成功としません。
-SIGKILL / ホスト電源断では supervisor 自身が確定処理を実行できない場合があります。
+SIGKILL / ホスト電源断では server 自身が確定処理を実行できない場合があります。
 既存 WiVRn の終了処理には3.5秒の timeout があり、極端に遅い writer drain は強制終了で欠損する可能性があります。
 
 ### Pose の意味
@@ -182,22 +171,23 @@ DriverPose に prediction が含まれるかは特定できず、「無予測 Gr
 無効化・再有効化、切断・再接続を識別できますが、更新が来なくなっただけのケースを切断と推測しません。
 キュー損失中の状態遷移は復元できません。Base Station は callback が通知した識別子と class を announcement として保存します。
 
-### USB 互換修正
+### USB 互換形式
 
-既存 `--usbmon-record` を再利用しています。`--usbmon --usbmon-only-record --usbmon-record FILE` で
-HTCVive のデフォルト排他的 driver を選ばず、patched only-record モードを受動にします。
-デバイスを claim/detach せず、列挙では USB string descriptor のための open/read も行いません。
-通常の tracking / offline replay の設定は変更しません。
-256-byte snaplen を 65535 に拡大し、終了時 statistics、write error、nonblocking read、空読み時の待機を追加しました。
-libpcap 1.11 の 4-byte-aligned ABI wrapper と旧 scalar field の両方に対応する memcpy 読取を使用します。
-短い header と切り詰め payload の再生は警告して skip し、範囲外を読まないようにしています。
+記録用 capture は `server/lighthouse_capture.cpp` / `lighthouse_recording.cpp` に組み込まれています。
+既存 libsurvive の VID/PID/codename 対応表と `.usbdevs` 形式を再利用し、libpcap の原パケットを
+classic pcap 2.4 / DLT_USB_LINUX_MMAPPED=220 / snaplen=65535 として gzip に保存します。
+排他的な USB open / claim や追加制御リクエストはありません。
 
-USB raw header は bus/address、endpoint/direction、transfer type、URB ID、S/C/E、status、length、data/setup flags、
-kernel timestamp を保持します。原 payload は pcap に保存し、派生インデックスは位置を参照します。
+原 USB header は bus/address、endpoint/direction、transfer type、URB ID、S/C/E、status、length、data/setup flags、
+kernel timestamp を保持します。原 payload は pcap に保存し、オフラインインデックスが位置を参照します。
 IN submission / OUT completion の payload 不在は通常の usbmon 動作であり、それだけで損失とは数えません。
-起動時に列挙した既知 VID/PID だけが保存対象です。再接続で新アドレスになったデバイスや未対応 VID/PID は
-観測されない可能性があり、sysfs snapshots と validation の unobserved report に表示します。
-アドレス再利用による機器対応の曖昧さは解消できません。全 USB traffic を保存するフラグは本 CLI では使いません。
+短い header・切り詰め payload・kernel drop と書込エラーを保存します。
+
+起動時に列挙した既知 VID/PID / アドレスが保存対象です。新アドレス・未対応 VID/PID は観測されない可能性があり、
+sysfs snapshots と unobserved report に保存します。アドレス再利用による機器対応の曖昧さは解消できません。
+
+オフライン再生のための libsurvive patch は libpcap 1.11 ABI wrapper 対応と短い／切り詰め packet の検査を含みます。
+通常の tracking 設定は変更せず、WiVRn の記録にはこの patch や survive-cli は不要です。
 
 ## 時刻同期と誤差
 
@@ -208,7 +198,7 @@ clock_sync の範囲で検査します。kernel の独自改造等で別 domain 
 
 各測定は monotonic-before → realtime → monotonic-after。
 対応 offset は realtime − monotonic midpoint、read uncertainty は前後の半幅です。
-同様に RAW 読取を MONOTONIC で挟んだサンプルも保存します。既定周期は1秒、CLI で0.05〜60秒に指定できます。
+同様に RAW 読取を MONOTONIC で挟んだサンプルも保存します。記録中の測定周期は1秒です。GUI に周期設定は追加していません。
 開始・記録中・終了のサンプルが揃わない session は正常扱いしません。
 
 `align` は隣接測定で挟まれた USB realtime のみを monotonic に補間します。
@@ -221,6 +211,13 @@ validation は最大 read uncertainty と USB alignment の最大推定誤差を
 長時間セッションの変換インデックスは一時 SQLite と固定 page cache で作成し、全 packets を RAM に保持しません。
 
 ## Replay と比較ツールの後続設計
+
+libsurvive は再生時だけ必要です。任意で次のスクリプトから pin と互換修正をビルドできます。
+
+```sh
+tools/lh-recorder/build-libsurvive.sh /tmp/lh-survive-src /tmp/lh-survive-build
+```
+
 
 ```sh
 /path/to/patched/survive-cli \
@@ -256,12 +253,13 @@ USB の設定 payload 自体にシリアル等が入る可能性があるので�
 ## 自動テストと実機手順
 
 ```sh
-# build-lh は上の WIVRN_BUILD_TEST=ON ビルド。
+# 自動テストのみ。通常の記録にはこの設定は不要。
+cmake -S . -B build-lh -DWIVRN_BUILD_TEST=ON
 cmake --build build-lh --target lh-recording-settings-test lh-recording-startup-test
 build-lh/tests/lh-recording-settings-test
 # 実際の binary 配置は generator / CMAKE_RUNTIME_OUTPUT_DIRECTORY に従う。
 
-# Pose 単体テストの harness。MONADO_SRC は0016適用済み checkout。
+# Pose 単体テストの harness。MONADO_SRC は0016・0017適用済み checkout。
 c++ -std=c++17 -Wall -Wextra -Werror -pthread \
   -isystem "$MONADO_SRC/src/external/openvr_includes" \
   -I"$MONADO_SRC/src/xrt/drivers/steamvr_lh" \
@@ -272,8 +270,10 @@ LH_STARTUP_HARNESS="$PWD/build-lh/tests/lh-recording-startup-test" \
   python3 -m unittest discover -s tools/lh-recorder/tests -v
 ```
 
-`tests/fake_usb.py` は USB にアクセスしない合成 fixture です。起動時 snapshot / owner 終了 / manifest のテストで使用します。
-`tools/lh-recorder/samples/synthetic-session` は合成 Pose と合成 URB、実際に測定した host clock brackets を含みます。
+`tests/mock_usb_capture.cpp` は USB にアクセスしない、テストビルド限定の capture source です。
+PATH を空にして、起動時 snapshot / OFF / 正常・異常終了 / manifest の native 統合テストを行います。
+`tools/lh-recorder/samples/synthetic-native-session` は内蔵 capture のテストハーネスが生成した合成 Pose と合成 URB、
+実際に測定した host clock brackets を含みます。`synthetic-session` は初版の互換 fixture として残しています。
 センサー由来のデータや solve 用 calibration は含みません。
 
 実機では以下を実施してください。

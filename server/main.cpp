@@ -282,11 +282,14 @@ void start_server(configuration config)
 
 		try
 		{
-			exit(ipc_server_main_common(&server_info, &server_cb, nullptr));
+			int result = ipc_server_main_common(&server_info, &server_cb, nullptr);
+			wivrn::stop_lighthouse_recording(result);
+			exit(result);
 		}
 		catch (std::exception & e)
 		{
 			std::cerr << e.what() << std::endl;
+			wivrn::stop_lighthouse_recording(EXIT_FAILURE);
 			exit(EXIT_FAILURE);
 		}
 
