@@ -20,6 +20,7 @@
 #pragma once
 
 #include "hostname.h"
+#include "lighthouse_recording_defaults.h"
 #include "wivrn_config.h"
 #include <array>
 #include <chrono>
@@ -57,6 +58,8 @@ struct configuration
 	std::vector<std::string> application;
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
+	bool lighthouse_recording_enabled = false;
+	std::filesystem::path lighthouse_recording_output = default_lighthouse_recording_directory();
 	std::optional<int64_t> lh_max_extrapolation;
 	std::optional<float> lh_stick_deadzone;
 	bool hid_forwarding = false;

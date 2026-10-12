@@ -17,6 +17,8 @@
  */
 
 #include "settings.h"
+#include "lighthouse_recording_defaults.h"
+#include <QUrl>
 
 #include "escape_string.h"
 #include "gui_config.h"
@@ -121,6 +123,8 @@ void Settings::emitAllChanged()
 	openvrChanged();
 	debugGuiChanged();
 	steamVrLhChanged();
+	lighthouseRecordingEnabledChanged();
+	lighthouseRecordingOutputChanged();
 	lhMaxExtrapolationEnabledChanged();
 	lhMaxExtrapolationChanged();
 	lhStickDeadzoneChanged();
@@ -131,10 +135,14 @@ void Settings::emitAllChanged()
 
 void Settings::load(const wivrn_server * server)
 {
+	loadJson(server->jsonConfiguration());
+}
+
+void Settings::loadJson(const QString & conf)
+{
 	// Encoders configuration
 	try
 	{
-		auto conf = server->jsonConfiguration();
 		m_jsonSettings = nlohmann::json::parse(conf.toUtf8());
 		m_originalSettings = m_jsonSettings;
 		if (not m_jsonSettings.is_object())
@@ -419,6 +427,43 @@ void Settings::set_steamVrLh(const bool & value)
 		steamVrLhChanged();
 }
 
+bool Settings::lighthouseRecordingEnabled() const
+{
+	auto it = m_jsonSettings.find("lighthouse-recording");
+	return it != m_jsonSettings.end() && it->is_object() && it->contains("enabled") && (*it)["enabled"].is_boolean() && (*it)["enabled"].get<bool>();
+}
+
+void Settings::set_lighthouseRecordingEnabled(const bool & value)
+{
+	auto old = lighthouseRecordingEnabled();
+	if (!m_jsonSettings["lighthouse-recording"].is_object())
+		m_jsonSettings["lighthouse-recording"] = nlohmann::json::object();
+	m_jsonSettings["lighthouse-recording"]["enabled"] = value;
+	if (old != value) lighthouseRecordingEnabledChanged();
+}
+
+QString Settings::lighthouseRecordingOutput() const
+{
+	auto it = m_jsonSettings.find("lighthouse-recording");
+	if (it != m_jsonSettings.end() && it->is_object() && it->contains("output-directory") && (*it)["output-directory"].is_string())
+		return QString::fromStdString((*it)["output-directory"].get<std::string>());
+	return QString::fromStdString(wivrn::default_lighthouse_recording_directory().string());
+}
+
+void Settings::set_lighthouseRecordingOutput(const QString & value)
+{
+	auto old = lighthouseRecordingOutput();
+	if (!m_jsonSettings["lighthouse-recording"].is_object())
+		m_jsonSettings["lighthouse-recording"] = nlohmann::json::object();
+	m_jsonSettings["lighthouse-recording"]["output-directory"] = value.toStdString();
+	if (old != value) lighthouseRecordingOutputChanged();
+}
+
+QString Settings::recordingDirectoryFromUrl(const QUrl & url) const
+{
+	return url.toLocalFile();
+}
+
 bool Settings::lhMaxExtrapolationEnabled() const
 {
 	auto it = m_jsonSettings.find("lh-max-extrapolation");
@@ -577,9 +622,14 @@ bool Settings::can10bit() const
 	return ::can10bit(codec());
 }
 
+QString Settings::saveJson() const
+{
+	return QString::fromStdString(m_jsonSettings.dump(2));
+}
+
 void Settings::save(wivrn_server * server)
 {
-	server->setJsonConfiguration(QString::fromStdString(m_jsonSettings.dump(2)));
+	server->setJsonConfiguration(saveJson());
 	if (m_jsonSettings != m_originalSettings)
 		settingsChanged();
 }
@@ -591,6 +641,7 @@ void Settings::restore_defaults()
 	m_jsonSettings.erase("hid-forwarding");
 	m_jsonSettings.erase("debug-gui");
 	m_jsonSettings.erase("use-steamvr-lh");
+	m_jsonSettings.erase("lighthouse-recording");
 	m_jsonSettings.erase("lh-stick-deadzone");
 	m_jsonSettings.erase("tcp-only");
 	m_jsonSettings.erase("application");

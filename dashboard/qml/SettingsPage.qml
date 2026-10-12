@@ -132,6 +132,34 @@ Kirigami.ScrollablePage {
                     toolTipText: i18n("Allows the use of lighthouse-based controllers and trackers.\nRequires SteamVR to be installed.\nDevices must be be powered on before connecting to WiVRn.\nAn external tool such as motoc is needed for calibration.")
                 }
             }
+            Controls.Label {
+                visible: Settings.steamvr_lh_supported
+                text: i18n("Lighthouse Recording")
+                font.bold: true
+            }
+            Controls.CheckBox {
+                id: lighthouse_recording_enabled
+                visible: Settings.steamvr_lh_supported
+                text: i18n("Enable recording")
+            }
+            RowLayout {
+                visible: Settings.steamvr_lh_supported
+                Kirigami.FormData.label: i18n("Output directory:")
+                Controls.TextField {
+                    id: lighthouse_recording_output
+                    Layout.fillWidth: true
+                }
+                Controls.Button {
+                    text: i18n("Browse…")
+                    onClicked: lighthouse_recording_folder.open()
+                }
+            }
+            Controls.Label {
+                visible: Settings.steamvr_lh_supported
+                text: i18n("Changes take effect the next time Monado starts.")
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
             Controls.CheckBox {
                 id: lh_max_extrapolation_enabled
                 visible: Settings.steamvr_lh_supported && steamvr_lh.checked
@@ -334,6 +362,8 @@ Kirigami.ScrollablePage {
 
         Settings.debugGui = debug_gui.checked;
         Settings.steamVrLh = steamvr_lh.checked;
+        Settings.lighthouseRecordingEnabled = lighthouse_recording_enabled.checked;
+        Settings.lighthouseRecordingOutput = lighthouse_recording_output.text;
         if (lh_max_extrapolation_enabled.checked) {
             Settings.lhMaxExtrapolation = lh_max_extrapolation.value;
         } else {
@@ -349,6 +379,8 @@ Kirigami.ScrollablePage {
         select_game.load();
         debug_gui.checked = Settings.debugGui;
         steamvr_lh.checked = Settings.steamVrLh;
+        lighthouse_recording_enabled.checked = Settings.lighthouseRecordingEnabled;
+        lighthouse_recording_output.text = Settings.lighthouseRecordingOutput;
         lh_max_extrapolation_enabled.checked = Settings.lhMaxExtrapolationEnabled;
         lh_max_extrapolation.value = Settings.lhMaxExtrapolation;
         lh_stick_deadzone.value = Settings.lhStickDeadzone;
@@ -362,6 +394,12 @@ Kirigami.ScrollablePage {
         adb_location.text = DashboardSettings.adb_location;
 
         show_system_checks.checked = DashboardSettings.show_system_checks;
+    }
+
+    Dialogs.FolderDialog {
+        id: lighthouse_recording_folder
+        title: i18n("Select Lighthouse recording output directory")
+        onAccepted: lighthouse_recording_output.text = Settings.recordingDirectoryFromUrl(selectedFolder)
     }
 
     Shortcut {

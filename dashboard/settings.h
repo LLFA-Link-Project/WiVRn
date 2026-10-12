@@ -21,6 +21,7 @@
 #include <QJSValue>
 #include <QList>
 #include <QObject>
+#include <QUrl>
 #include <QPointF>
 #include <QSizeF>
 #include <nlohmann/json.hpp>
@@ -75,6 +76,9 @@ public:
 
 	Q_PROPERTY(bool hidForwarding READ hidForwarding WRITE set_hidForwarding NOTIFY hidForwardingChanged)
 	Q_PROPERTY(bool debugGui READ debugGui WRITE set_debugGui NOTIFY debugGuiChanged)
+	Q_PROPERTY(bool lighthouseRecordingEnabled READ lighthouseRecordingEnabled WRITE set_lighthouseRecordingEnabled NOTIFY lighthouseRecordingEnabledChanged)
+	Q_PROPERTY(QString lighthouseRecordingOutput READ lighthouseRecordingOutput WRITE set_lighthouseRecordingOutput NOTIFY lighthouseRecordingOutputChanged)
+	Q_INVOKABLE QString recordingDirectoryFromUrl(const QUrl & url) const;
 	Q_PROPERTY(bool steamVrLh READ steamVrLh WRITE set_steamVrLh NOTIFY steamVrLhChanged)
 	Q_PROPERTY(bool lhMaxExtrapolationEnabled READ lhMaxExtrapolationEnabled NOTIFY lhMaxExtrapolationEnabledChanged)
 	Q_PROPERTY(int64_t lhMaxExtrapolation READ lhMaxExtrapolation WRITE set_lhMaxExtrapolation NOTIFY lhMaxExtrapolationChanged)
@@ -94,6 +98,8 @@ public:
 	SETTER_GETTER_NOTIFY(bool, hidForwarding)
 	SETTER_GETTER_NOTIFY(bool, debugGui)
 	SETTER_GETTER_NOTIFY(bool, steamVrLh)
+	SETTER_GETTER_NOTIFY(bool, lighthouseRecordingEnabled)
+	SETTER_GETTER_NOTIFY(QString, lighthouseRecordingOutput)
 	SETTER_GETTER_NOTIFY(bool, lhMaxExtrapolationEnabled)
 	SETTER_GETTER_NOTIFY(int64_t, lhMaxExtrapolation)
 	SETTER_GETTER_NOTIFY(float, lhStickDeadzone)
@@ -111,6 +117,8 @@ public:
 	        QObject(parent) {}
 
 	Q_INVOKABLE void load(const wivrn_server * server);
+	void loadJson(const QString & configuration);
+	QString saveJson() const;
 	Q_INVOKABLE void save(wivrn_server * server);
 	Q_INVOKABLE void restore_defaults();
 

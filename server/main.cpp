@@ -32,6 +32,7 @@
 #include "active_runtime.h"
 #include "avahi_publisher.h"
 #include "driver/configuration.h"
+#include "lighthouse_recording.h"
 #include "driver/wivrn_connection.h"
 #include "exit_codes.h"
 #include "ipc_server_cb.h"
@@ -262,6 +263,8 @@ void start_server(configuration config)
 		setenv("INTEL_DEBUG", "noccs", false);
 
 		setenv("XRT_LOG", "info", false);
+
+		wivrn::start_lighthouse_recording(config);
 
 		wivrn::ipc_server_cb server_cb;
 

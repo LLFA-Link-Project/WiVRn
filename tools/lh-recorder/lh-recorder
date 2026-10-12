@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Passive Lighthouse dataset session supervisor (Python standard library only)."""
+import argparse
+import fcntl
+import gzip
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import select
+import secrets
+import shutil
+import signal
+import struct
+import sqlite3
+import tempfile
+import subprocess
+import sys
+import time
+
+VERSION = '1.0.0'
+SUPPORTED = {(0x28de, 0x2000), (0x0bb4, 0x2c87), (0x28de, 0x2101),
+             (0x28de, 0x2022), (0x28de, 0x2300), (0x28de, 0x2012), (0x28de, 0x2102)}
+
+
+def dump(path, value):
+    tmp = path.with_name(path.name + '.tmp')
+    with tmp.open('w') as f:
+        json.dump(value, f, ensure_ascii=True, allow_nan=False, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def read(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def lines(path):
+    with path.open() as f:
+        for n, line in enumerate(f, 1):
+            yield json.loads(line, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x)))
+
+
+def clock_sample(phase):
+    before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    realtime = time.clock_gettime_ns(time.CLOCK_REALTIME)
+    after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    raw_before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    raw = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    raw_after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    return dict(schema_version=1, phase=phase, monotonic_before_ns=before,
+                realtime_ns=realtime, monotonic_after_ns=after,
+                offset_realtime_minus_monotonic_ns=realtime-(before+after)//2,
+                uncertainty_ns=(after-before+1)//2, raw_ns=raw,
+                raw_monotonic_before_ns=raw_before, raw_monotonic_after_ns=raw_after,
+                clocks=['CLOCK_REALTIME', 'CLOCK_MONOTONIC', 'CLOCK_MONOTONIC_RAW'])
+
+
+class ClockMap:
+    """Bracketing interpolation; estimates are explicitly not accuracy guarantees."""
+    def __init__(self, samples, jump_ns=1_000_000):
+        self.samples = samples
+        self.intervals = []
+        self.database = None
+        self.jumps = []
+        for a, b in zip(samples, samples[1:]):
+            dt = b['monotonic_before_ns']-a['monotonic_after_ns']
+            change = abs(b['offset_realtime_minus_monotonic_ns']-a['offset_realtime_minus_monotonic_ns'])
+            limit = jump_ns + max(dt, 0)*0.0005 + a['uncertainty_ns']+b['uncertainty_ns']
+            valid = dt > 0 and b['realtime_ns'] > a['realtime_ns'] and change <= limit
+            self.intervals.append((a, b, valid))
+            if not valid:
+                self.jumps.append(dict(monotonic_start_ns=a['monotonic_before_ns'],
+                                       monotonic_end_ns=b['monotonic_after_ns'], offset_change_ns=change))
+
+    def convert(self, realtime_ns):
+        # Overlapping realtime ranges after a backward step are ambiguous.
+        if self.database is not None:
+            rows = self.database.execute('SELECT a,b,valid FROM intervals WHERE lo BETWEEN ? AND ? AND hi >= ? LIMIT 2', (realtime_ns-self.max_interval_span, realtime_ns, realtime_ns))
+            intervals = [(json.loads(a), json.loads(b), bool(ok)) for a, b, ok in rows]
+        else:
+            intervals = [(a, b, ok) for a, b, ok in self.intervals
+                         if min(a['realtime_ns'], b['realtime_ns']) <= realtime_ns <= max(a['realtime_ns'], b['realtime_ns'])]
+        if len(intervals) != 1 or not intervals[0][2]:
+            return dict(monotonic_estimate_ns=None, estimated_error_ns=None, alignment='unbracketed_or_clock_jump')
+        a, b, _ = intervals[0]
+        fraction = (realtime_ns-a['realtime_ns'])/(b['realtime_ns']-a['realtime_ns'])
+        off_a, off_b = (a['offset_realtime_minus_monotonic_ns'], b['offset_realtime_minus_monotonic_ns'])
+        offset = off_a + round(fraction*(off_b-off_a))
+        # Include observed offset variation rather than claiming half the read bracket
+        # measures kernel capture/clock drift accuracy. USB timestamp quantization: 1 us.
+        estimate = max(a['uncertainty_ns'], b['uncertainty_ns'])+abs(off_b-off_a)+1000
+        return dict(monotonic_estimate_ns=realtime_ns-offset, estimated_error_ns=estimate,
+                    alignment='interpolated_estimate', estimate_clock='CLOCK_MONOTONIC')
+
+    @classmethod
+    def from_file(cls, path):
+        result = cls([])
+        # Temporary SQLite file, 2MiB page cache; originals remain in clock_sync.jsonl.
+        result.temp = tempfile.TemporaryDirectory(prefix='lh-clock-index-')
+        result.database = sqlite3.connect(str(Path(result.temp.name)/'clock.sqlite'))
+        result.database.execute('PRAGMA cache_size=-2048')
+        result.database.execute('CREATE TABLE intervals(lo INTEGER, hi INTEGER, a TEXT, b TEXT, valid INTEGER)')
+        result.sample_count = 0
+        result.max_uncertainty = None
+        result.jump_count = 0
+        result.max_interval_span = 0
+        result.first = result.last = None
+        previous = None
+        for current in lines(path):
+            result.sample_count += 1
+            result.max_uncertainty = max(result.max_uncertainty or 0, current['uncertainty_ns'])
+            if result.first is None:
+                result.first = current
+            if previous is not None:
+                interval = cls([previous, current])
+                a, b, valid = interval.intervals[0]
+                result.max_interval_span = max(result.max_interval_span, abs(b['realtime_ns']-a['realtime_ns']))
+                result.database.execute('INSERT INTO intervals VALUES(?,?,?,?,?)',
+                                        (min(a['realtime_ns'], b['realtime_ns']), max(a['realtime_ns'], b['realtime_ns']), json.dumps(a), json.dumps(b), int(valid)))
+                result.jump_count += len(interval.jumps)
+                if len(result.jumps) < 1000:
+                    result.jumps.extend(interval.jumps)
+                if result.sample_count % 1000 == 0:
+                    result.database.commit()
+            previous = current
+        result.last = previous
+        result.database.execute('CREATE INDEX realtime_intervals ON intervals(lo,hi)')
+        result.database.commit()
+        return result
+
+    def close(self):
+        if self.database is not None:
+            self.database.close()
+            self.database = None
+            self.temp.cleanup()
+
+    def __del__(self):
+        if getattr(self, 'database', None) is not None:
+            self.close()
+
+    def report(self):
+        if self.database is not None:
+            return dict(sample_count=self.sample_count, clock_jump_intervals=self.jumps, clock_jump_count=self.jump_count,
+                        clock_jump_report_truncated=self.jump_count > len(self.jumps), max_read_uncertainty_ns=self.max_uncertainty,
+                        error_model='read brackets + observed interval offset variation + 1000ns USB quantization; not a guaranteed bound',
+                        unsampled_steps_detectable=False)
+        return dict(sample_count=len(self.samples), clock_jump_intervals=self.jumps,
+                    max_read_uncertainty_ns=max((s['uncertainty_ns'] for s in self.samples), default=None),
+                    error_model='read brackets + observed interval offset variation + 1000ns USB quantization; not a guaranteed bound',
+                    unsampled_steps_detectable=False)
+
+
+def devices():
+    result = []
+    for p in sorted(Path('/sys/bus/usb/devices').glob('*')):
+        try:
+            vid, pid = int((p/'idVendor').read_text(), 16), int((p/'idProduct').read_text(), 16)
+            if vid not in (0x28de, 0x0bb4):
+                continue
+            serial = (p/'serial').read_text().strip() if (p/'serial').exists() else None
+            result.append(dict(sysfs_path=p.name, vid=vid, pid=pid, bus=int((p/'busnum').read_text()),
+                               address=int((p/'devnum').read_text()), serial=serial,
+                               stable_id=serial, supported_by_pinned_libsurvive=(vid, pid) in SUPPORTED))
+        except (OSError, ValueError):
+            continue
+    return result
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(1024*1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def pcap_records(path):
+    """Read original DLT_USB_LINUX_MMAPPED bytes without modifying the replay file."""
+    with gzip.open(path, 'rb') as f:
+        hdr = f.read(24)
+        formats = {b'\xd4\xc3\xb2\xa1': ('<', 1000), b'\xa1\xb2\xc3\xd4': ('>', 1000),
+                   b'\x4d\x3c\xb2\xa1': ('<', 1), b'\xa1\xb2\x3c\x4d': ('>', 1)}
+        if len(hdr) != 24 or hdr[:4] not in formats:
+            raise ValueError('Invalid classic pcap header')
+        endian, scale = formats[hdr[:4]]
+        _, major, minor, _, _, snaplen, linktype = struct.unpack(endian+'IHHIIII', hdr)
+        if (major, minor, linktype) != (2, 4, 220):
+            raise ValueError('Expected pcap 2.4 DLT_USB_LINUX_MMAPPED (220)')
+        index = 0
+        while True:
+            ph = f.read(16)
+            if not ph:
+                break
+            if len(ph) != 16:
+                raise ValueError('Truncated packet header')
+            sec, fraction, caplen, length = struct.unpack(endian+'IIII', ph)
+            if caplen > snaplen or caplen > 16*1024*1024 or caplen < 64 or caplen > length:
+                raise ValueError('Invalid USB packet capture length')
+            packet = f.read(caplen)
+            if len(packet) != caplen:
+                raise ValueError('Truncated packet')
+            urb, event, transfer, endpoint, address, bus, setup_flag, data_flag, ts_sec, ts_us, status, urb_len, data_len = struct.unpack_from(endian+'QBBBBHBBqiiII', packet)
+            if not 0 <= ts_us < 1_000_000:
+                raise ValueError('Invalid USB timestamp fraction')
+            available = caplen-64
+            has_data = data_flag == 0
+            payload_incomplete = has_data and (data_len > available or urb_len > available)
+            yield dict(schema_version=1, packet_index=index, bus=bus, address=address,
+                       endpoint=endpoint & 0x7f, direction='in' if endpoint & 0x80 else 'out',
+                       transfer_type=transfer, urb_id=f'{urb:016x}', event=chr(event), urb_status=status,
+                       pcap_timestamp_ns=sec*1_000_000_000+fraction*scale,
+                       usb_timestamp_ns=ts_sec*1_000_000_000+ts_us*1000,
+                       capture_clock='CLOCK_REALTIME', clock_basis='Linux mon_bin ktime_get_real_ts64; validate epoch against clock_sync',
+                       captured_length=caplen, original_length=length, urb_length=urb_len,
+                       data_length=data_len, data_flag=data_flag, setup_flag=setup_flag,
+                       payload_available=has_data, payload_captured_bytes=available,
+                       payload_incomplete=payload_incomplete, pcap_truncated=caplen < length,
+                       payload_location='usb.pcap.gz: original packet after 64-byte header; iso descriptors retained')
+            index += 1
+
+
+def validate(session, write=True):
+    issues, warnings = set(), set()
+    manifest = read(session/'manifest.json', {})
+    if manifest.get('status') == 'abnormal':
+        issues.add('session_ended_abnormally')
+    if write and manifest.get('status') != 'complete':
+        issues.add('manifest_not_finalized_normally')
+    mapping = ClockMap.from_file(session/'clock_sync.jsonl') if (session/'clock_sync.jsonl').exists() else ClockMap([])
+    sync_count = getattr(mapping, 'sample_count', 0)
+    pose_count = 0
+    ids = set()
+    last_time = {}
+    last_seq = -1
+    invalid_components = 0
+    if (session/'poses.jsonl').exists():
+        try:
+            for p in lines(session/'poses.jsonl'):
+                pose_count += 1
+                if p['stream'] != 'valve_driver_pose' or p['capture_clock'] != 'CLOCK_MONOTONIC':
+                    issues.add('wrong_pose_stream_or_clock'); break
+                dev, t, seq = p['device_id'], p['capture_time_ns'], p['sequence']
+                ids.add(dev)
+                if seq <= last_seq:
+                    # Concurrent callbacks can acquire queue lock out of capture order.
+                    warnings.add('callback_queue_order_differs_from_sequence')
+                last_seq = seq
+                if t < last_time.get(dev, 0):
+                    warnings.add('per_device_capture_order_differs')
+                last_time[dev] = t
+                if sync_count and not mapping.first['monotonic_before_ns'] <= t <= mapping.last['monotonic_after_ns']:
+                    issues.add('pose_outside_sync_session')
+                for key, size in [('position_m', 3), ('orientation_xyzw', 4)]:
+                    v = p[key]
+                    if len(v) != size:
+                        issues.add('invalid_vector_size'); continue
+                    if any(x is None or not isinstance(x, (int, float)) or not math.isfinite(x) for x in v):
+                        invalid_components += 1
+                        if p['pose_is_valid']:
+                            issues.add('nonfinite_valid_pose')
+                    elif key == 'orientation_xyzw' and p['pose_is_valid'] and abs(sum(x*x for x in v)-1) > 0.02:
+                        issues.add('nonunit_valid_quaternion')
+        except (ValueError, KeyError, TypeError) as e:
+            issues.add(f'pose_parse_error: {e}')
+    if not pose_count:
+        issues.add('no_reference_poses')
+    packet_count = incomplete = unaligned = pcap_truncated = 0
+    max_alignment_error = None
+    observed = set()
+    if (session/'usb.pcap.gz').exists():
+        try:
+            for p in pcap_records(session/'usb.pcap.gz'):
+                packet_count += 1
+                observed.add((p['bus'], p['address']))
+                incomplete += int(p['payload_incomplete'])
+                pcap_truncated += int(p['pcap_truncated'])
+                aligned = mapping.convert(p['usb_timestamp_ns'])
+                unaligned += aligned['monotonic_estimate_ns'] is None
+                if aligned['estimated_error_ns'] is not None:
+                    max_alignment_error = max(max_alignment_error or 0, aligned['estimated_error_ns'])
+        except (OSError, EOFError, ValueError, struct.error) as e:
+            issues.add(f'usb_parse_error: {e}')
+    if not packet_count:
+        issues.add('no_usb_packets')
+    if not (session/'usb.pcap.gz.usbdevs').exists():
+        issues.add('missing_usbdevs')
+    pose_status = read(session/'pose_status.json', {})
+    usb_status = read(session/'usb_stats.json', {})
+    if not pose_status.get('stopped'):
+        issues.add('pose_writer_not_finalized')
+    if pose_status.get('error'):
+        issues.add('pose_writer_error: '+pose_status['error'])
+    if pose_status.get('dropped', 0):
+        warnings.add('pose_records_dropped')
+    if usb_status.get('write_error'):
+        issues.add('usb_write_error')
+    if not usb_status.get('stats_available'):
+        warnings.add('usb_capture_loss_unknown')
+    elif usb_status.get('dropped', 0) or usb_status.get('interface_dropped', 0):
+        warnings.add('usb_capture_records_dropped')
+    if pcap_truncated:
+        warnings.add('usb_pcap_packets_truncated')
+    if incomplete:
+        warnings.add('usb_payload_incomplete')
+    if unaligned:
+        warnings.add('usb_timestamps_not_aligned')
+    if packet_count and unaligned == packet_count:
+        issues.add('no_usb_timestamps_in_verified_clock_intervals')
+    if sync_count < 2:
+        issues.add('insufficient_clock_samples')
+    if mapping.jumps:
+        warnings.add('clock_jump_intervals')
+    for name, expected in manifest.get('files_sha256', {}).items():
+        if Path(name).is_absolute() or '..' in Path(name).parts or not (session/name).is_file() or sha(session/name) != expected:
+            issues.add('hash_mismatch: '+name)
+    unobserved = [d for d in read(session/'devices.json', [])
+                  if (d['bus'], d['address']) not in observed]
+    unseen_keys = {(d['bus'], d['address']) for d in unobserved}
+    unseen_truncated = False
+    if (session/'usb_devices.jsonl').exists():
+        for snapshot in lines(session/'usb_devices.jsonl'):
+            for d in snapshot['devices']:
+                key = (d['bus'], d['address'])
+                if key not in observed and key not in unseen_keys:
+                    if len(unobserved) < 4096:
+                        unobserved.append(d); unseen_keys.add(key)
+                    else:
+                        unseen_truncated = True
+    if unobserved:
+        warnings.add('usb_target_devices_not_observed')
+    result = dict(schema_version=1, valid=not issues, issues=sorted(set(issues)), warnings=sorted(set(warnings)),
+                  pose_count=pose_count, device_ids=sorted(ids), nonfinite_pose_fields=invalid_components,
+                  usb_packet_count=packet_count, usb_incomplete_payloads=incomplete, usb_pcap_truncated_packets=pcap_truncated, unaligned_usb_packets=unaligned,
+                  usb_unobserved_devices=unobserved, usb_unobserved_report_truncated=unseen_truncated, timestamp_alignment_complete=bool(packet_count) and not unaligned, clock_sync=mapping.report(), max_estimated_usb_alignment_error_ns=max_alignment_error,
+                  hardware_tracking_quality_test='not_run', libsurvive_replay=manifest.get('libsurvive_replay', 'not_run'))
+    if write:
+        dump(session/'validation.json', result)
+    return result
+
+
+def usb_command(binary, session):
+    # --usbmon=1 selects only usbmon and precludes the default exclusive HTC driver.
+    # Patched --usbmon-only-record=1 makes that driver passive without issuing requests.
+    return [binary, '--usbmon', '--usbmon-only-record', '--usbmon-record', str(session/'usb.pcap.gz'),
+            '--usbmon-stats', str(session/'usb_stats.json')]
+
+
+def run(args):
+    session = Path(args.output).resolve()
+    session.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = (session/'.manager.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if (session/'manifest.json').exists():
+        raise ValueError('Session already exists; use a new output directory')
+    if len(str(session/'usb.pcap.gz')) >= 240:
+        raise ValueError('Session path too long for pinned libsurvive 256-byte sidecar filename')
+    os.umask(0o077)
+    owner_fd = os.pidfd_open(args.owner_pid) if args.owner_pid else None
+    initial = devices()
+    dump(session/'devices.json', initial)
+    provenance = read(Path(__file__).with_name('provenance.json'), {})
+    manifest = dict(schema_version=1, session_id=session.name, logger_version=VERSION,
+                    start_realtime_ns=time.time_ns(), end_realtime_ns=None, kernel=platform.release(),
+                    expected_source_revisions=provenance, actual_wivrn_build=os.getenv('LH_RECORDER_WIVRN_BUILD'),
+                    monado_revision=os.getenv('LH_RECORDER_MONADO_REV'), libsurvive_revision=None,
+                    libsurvive_binary_sha256=None, status='recording',
+                    configuration=dict(output_directory=str(session), usb_and_pose=True, sync_interval_s=args.sync_interval),
+                    clock_domains=dict(poses='CLOCK_MONOTONIC', usb='CLOCK_REALTIME', sync=['CLOCK_REALTIME', 'CLOCK_MONOTONIC', 'CLOCK_MONOTONIC_RAW']),
+                    calibration_files=[], base_stations='device_announced events when supplied; calibration unavailable unless explicit --calibration',
+                    files_sha256={}, loss=dict(pose=None, usb=None))
+    for file in args.calibration:
+        p = Path(file)
+        manifest['calibration_files'].append(dict(path=str(p), sha256=sha(p)))
+    binary = args.survive_cli or os.getenv('LH_RECORDER_SURVIVE_CLI') or shutil.which('survive-cli')
+    binary = str(Path(binary).resolve()) if binary else None
+    manifest['libsurvive_binary'] = binary
+    if args.owner_pid:
+        try:
+            manifest['owner_executable_sha256'] = sha(Path(f'/proc/{args.owner_pid}/exe'))
+        except OSError:
+            manifest['owner_executable_sha256'] = None
+    if args.libsurvive_source:
+        manifest['libsurvive_revision'] = subprocess.check_output(['git', '-C', args.libsurvive_source, 'rev-parse', 'HEAD'], text=True).strip()
+        manifest['libsurvive_source_dirty'] = bool(subprocess.check_output(['git', '-C', args.libsurvive_source, 'status', '--porcelain'], text=True).strip())
+    dump(session/'manifest.json', manifest)
+    stopping = False
+    def stop_signal(_sig, _frame):
+        nonlocal stopping
+        stopping = True
+    signal.signal(signal.SIGINT, stop_signal)
+    signal.signal(signal.SIGTERM, stop_signal)
+    usb = None
+    errors = []
+    last_devices = initial
+    (session/'usb_devices.jsonl').write_text(json.dumps(dict(capture_time_ns=time.monotonic_ns(), devices=initial))+'\n')
+    try:
+        with (session/'clock_sync.jsonl').open('w') as clocks, (session/'usb_capture.log').open('w') as usb_log:
+            def sample(phase):
+                clocks.write(json.dumps(clock_sample(phase))+'\n'); clocks.flush()
+            sample('start')
+            if not binary:
+                raise ValueError('Patched survive-cli not found; set LH_RECORDER_SURVIVE_CLI')
+            help_result = subprocess.run([binary, '--help'], capture_output=True, text=True, timeout=5)
+            help_text = help_result.stdout+help_result.stderr
+            if not all(flag in help_text for flag in ('--usbmon-stats', '--usbmon-only-record', '--usbmon-record')):
+                raise ValueError('survive-cli lacks required passive recording patch/plugin; see build instructions')
+            manifest['libsurvive_version_output'] = help_text.splitlines()[0] if help_text.splitlines() else None
+            manifest['libsurvive_binary_sha256'] = sha(Path(binary))
+            private_config = session/'libsurvive-config'/'libsurvive'
+            private_config.mkdir(parents=True)
+            usb = subprocess.Popen(usb_command(binary, session), cwd=session, stdout=usb_log, stderr=subprocess.STDOUT,
+                                   env=dict(os.environ, XDG_CONFIG_HOME=str(private_config.parent)))
+            # Require actual capture creation before declaring ready, not process existence alone.
+            deadline = time.monotonic()+5
+            while time.monotonic() < deadline and usb.poll() is None and not (session/'usb.pcap.gz.usbdevs').exists():
+                time.sleep(0.05)
+            if usb.poll() is not None or not (session/'usb.pcap.gz.usbdevs').exists():
+                raise ValueError('USB capture failed to initialize; inspect usb_capture.log (usbmon permissions/plugin/device support)')
+            dump(session/'ready.json', dict(pid=os.getpid(), usb_pid=usb.pid, owner_pid=args.owner_pid, manager_start_ticks=Path('/proc/self/stat').read_text().split(') ', 1)[1].split()[19]))
+            while not stopping:
+                if owner_fd is not None and select.select([owner_fd], [], [], 0)[0]:
+                    break
+                if usb.poll() is not None:
+                    errors.append('usb_process_exited'); break
+                sample('periodic')
+                current_devices = devices()
+                if current_devices != last_devices:
+                    with (session/'usb_devices.jsonl').open('a') as f:
+                        f.write(json.dumps(dict(capture_time_ns=time.monotonic_ns(), devices=current_devices))+'\n')
+                    last_devices = current_devices
+                # Interruptible short wait; no configuration reload or dashboard polling.
+                until = time.monotonic()+args.sync_interval
+                while not stopping and time.monotonic() < until:
+                    if owner_fd is not None and select.select([owner_fd], [], [], 0.1)[0]:
+                        stopping = True
+                    else:
+                        time.sleep(0.1 if owner_fd is None else 0)
+            if usb.poll() is None:
+                usb.send_signal(signal.SIGINT)
+                try:
+                    usb.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    usb.kill(); usb.wait(); errors.append('usb_shutdown_timeout')
+            if usb.returncode:
+                errors.append(f'usb_exit_{usb.returncode}')
+            sample('end')
+    except Exception as e:
+        errors.append(str(e))
+        print(f'lh-recorder: {e}', file=sys.stderr)
+    finally:
+        if usb and usb.poll() is None:
+            usb.send_signal(signal.SIGINT)
+            try:
+                usb.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                usb.kill(); usb.wait(); errors.append('usb_shutdown_timeout')
+        if owner_fd is not None:
+            os.close(owner_fd)
+        # Normal owner termination has already joined the in-process pose writer.
+        deadline = time.monotonic()+3
+        while time.monotonic() < deadline and not read(session/'pose_status.json', {}).get('stopped'):
+            time.sleep(0.05)
+        # Keep the initial enumeration immutable; changes are an append-only stream.
+        with (session/'clock_sync.jsonl').open('a') as f:
+            f.write(json.dumps(clock_sample('finalize'))+'\n')
+        manifest['end_realtime_ns'] = time.time_ns()
+        manifest['errors'] = errors
+        manifest['loss']['pose'] = read(session/'pose_status.json')
+        manifest['loss']['usb'] = read(session/'usb_stats.json')
+        manifest['status'] = 'abnormal' if errors or not read(session/'pose_status.json', {}).get('stopped') else 'complete'
+        try:
+            result = validate(session, write=False)
+            manifest['usb_unobserved_devices'] = result['usb_unobserved_devices']
+            manifest['clock_sync'] = result['clock_sync']
+            if not result['valid']:
+                manifest['status'] = 'abnormal'
+        except Exception as e:
+            manifest['status'] = 'abnormal'; errors.append(f'validation: {e}')
+        manifest['files_sha256'] = {str(p.relative_to(session)): sha(p) for p in session.rglob('*')
+                                   if p.is_file() and p.name not in ('manifest.json', 'validation.json', '.manager.lock', 'ready.json', 'manager.log')}
+        announcements = {}
+        if (session/'events.jsonl').exists():
+            for event in lines(session/'events.jsonl'):
+                if event.get('event') == 'device_announced' and len(announcements) < 1024:
+                    announcements[event['device_id']] = dict(device_id=event['device_id'], device_class=event['device_class'])
+        manifest['valve_devices_observed'] = list(announcements.values())
+        manifest['base_stations_observed'] = [device for device in announcements.values() if device['device_class'] == 4]
+        manifest['base_station_metadata_basis'] = 'delivered driver announcements only; absent announcements do not establish absence'
+        manifest['usb_driver_pose_mapping'] = 'Not inferred: receiver serials may differ from tracked-object serials; use captured device configuration'
+        manifest['logger_sha256'] = sha(Path(__file__))
+        dump(session/'manifest.json', manifest)
+        validate(session)
+    return int(manifest['status'] != 'complete')
+
+
+def align(session):
+    mapping = ClockMap.from_file(session/'clock_sync.jsonl')
+    with (session/'usb_timestamps.jsonl').open('w') as output:
+        for packet in pcap_records(session/'usb.pcap.gz'):
+            packet.update(mapping.convert(packet['usb_timestamp_ns']))
+            output.write(json.dumps(packet, allow_nan=False)+'\n')
+    return mapping.report()
+
+
+def export_public(source, dest):
+    # USB configuration payloads contain identities; retaining them cannot promise anonymity.
+    dest.mkdir(mode=0o700, parents=True, exist_ok=False)
+    salt = secrets.token_bytes(32)
+    def identity(value):
+        return hashlib.sha256(salt+value.encode()).hexdigest()
+    for name in ('poses.jsonl', 'events.jsonl'):
+        with (dest/name).open('w') as f:
+            for record in lines(source/name):
+                record['device_id'] = identity(record['device_id'])
+                f.write(json.dumps(record, allow_nan=False)+'\n')
+    shutil.copyfile(source/'clock_sync.jsonl', dest/'clock_sync.jsonl')
+    dump(dest/'manifest.json', dict(schema_version=1, public_export=True,
+                                    anonymization='session salted SHA256 device IDs; salt discarded; raw USB, serials, calibration and host paths excluded',
+                                    usb_replay_available=False, logger_version=VERSION))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    for name in ('run', 'start'):
+        p = sub.add_parser(name)
+        p.add_argument('--output', required=True)
+        p.add_argument('--owner-pid', type=int)
+        p.add_argument('--survive-cli')
+        p.add_argument('--libsurvive-source')
+        p.add_argument('--calibration', action='append', default=[])
+        p.add_argument('--sync-interval', type=float, default=1)
+    for name in ('status', 'stop', 'validate', 'align'):
+        p = sub.add_parser(name); p.add_argument('session', type=Path)
+    p = sub.add_parser('export-public'); p.add_argument('session', type=Path); p.add_argument('output', type=Path)
+    args = parser.parse_args(argv)
+    if args.command in ('run', 'start'):
+        if not 0.05 <= args.sync_interval <= 60:
+            parser.error('--sync-interval must be between 0.05 and 60 seconds')
+        if args.command == 'run':
+            return run(args)
+        session = Path(args.output).resolve()
+        session.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if (session/'manifest.json').exists():
+            raise ValueError('Session already exists')
+        child_args = [sys.executable, str(Path(__file__).resolve()), 'run']+sys.argv[2:]
+        with (session/'manager.log').open('a') as log:
+            child = subprocess.Popen(child_args, stdout=log, stderr=log, start_new_session=True)
+        deadline = time.monotonic()+8
+        while time.monotonic() < deadline and child.poll() is None and not (session/'ready.json').exists():
+            time.sleep(0.05)
+        if not (session/'ready.json').exists():
+            raise ValueError('Capture initialization failed; inspect '+str(session/'manager.log'))
+        print(json.dumps(dict(manager_pid=child.pid, session=str(session), environment=dict(LH_RECORDER_ENABLE='1', LH_RECORDER_OUTPUT=str(session))), indent=2))
+        return 0
+    if args.command == 'stop':
+        status = read(args.session/'pose_status.json', {})
+        if not status.get('stopped'):
+            raise ValueError('Stop Monado first: pose recording follows its lifetime; no runtime pose control IPC')
+        ready = read(args.session/'ready.json', {})
+        pid = ready.get('pid')
+        if pid and read(args.session/'manifest.json', {}).get('status') == 'recording':
+            try:
+                ticks = Path(f'/proc/{pid}/stat').read_text().split(') ', 1)[1].split()[19]
+                if ticks != ready['manager_start_ticks']:
+                    raise ValueError('Manager PID was reused; refusing to signal it')
+                os.kill(pid, signal.SIGTERM)
+            except FileNotFoundError:
+                raise ValueError('Manager no longer exists; session is incomplete')
+        deadline = time.monotonic()+15
+        while time.monotonic() < deadline:
+            m = read(args.session/'manifest.json', {})
+            if m.get('status') in ('complete', 'abnormal'):
+                print(json.dumps(m)); return int(m['status'] != 'complete')
+            time.sleep(0.1)
+        raise ValueError('Finalization timeout; inspect manager.log')
+    if args.command == 'status':
+        print(json.dumps(read(args.session/'manifest.json', {}), indent=2)); return 0
+    if args.command == 'validate':
+        r = validate(args.session); print(json.dumps(r, indent=2)); return int(not r['valid'])
+    if args.command == 'align':
+        print(json.dumps(align(args.session), indent=2)); return 0
+    if args.command == 'export-public':
+        export_public(args.session, args.output); return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError) as error:
+        print(f'lh-recorder: {error}', file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,12 @@
+[
+  {
+    "sysfs_path": "synthetic",
+    "vid": 10462,
+    "pid": 8449,
+    "bus": 1,
+    "address": 7,
+    "serial": "synthetic-radio",
+    "stable_id": "synthetic-radio",
+    "supported_by_pinned_libsurvive": true
+  }
+]

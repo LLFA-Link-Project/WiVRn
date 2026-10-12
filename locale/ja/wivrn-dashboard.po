@@ -1016,3 +1016,27 @@ msgstr "xrizer"
 #, kde-format
 msgid "Open Composite"
 msgstr "OpenComposite"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Lighthouse Recording"
+msgstr "Lighthouse 記録"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Enable recording"
+msgstr "記録を有効にする"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Output directory:"
+msgstr "出力先ディレクトリ:"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Browse…"
+msgstr "参照…"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Changes take effect the next time Monado starts."
+msgstr "変更は次回の Monado 起動時に反映されます。"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Select Lighthouse recording output directory"
+msgstr "Lighthouse 記録の出力先ディレクトリを選択"

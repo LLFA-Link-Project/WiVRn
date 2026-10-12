@@ -104,3 +104,13 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/io.github.wivrn.wivrn.desktop
 )
 
 create_mo_files(wivrn-dashboard wivrn-dashboard "${CMAKE_CURRENT_SOURCE_DIR}/../locale")
+
+if(WIVRN_BUILD_TEST)
+    add_executable(lh-recording-settings-test
+        ../tools/lh-recorder/tests/settings_test.cpp
+        settings.cpp settings.h escape_string.cpp)
+    set_target_properties(lh-recording-settings-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    target_include_directories(lh-recording-settings-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(lh-recording-settings-test PRIVATE
+        Qt6::Core Qt6::Qml Qt6::DBus Qt6::Gui nlohmann_json::nlohmann_json wivrn-common wivrn-common-server wivrn-external)
+endif()
