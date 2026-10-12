@@ -5,10 +5,16 @@ import os
 from pathlib import Path
 import struct
 import gzip
+import hashlib
 import subprocess
 import tempfile
 import time
+import io
+import lzma
+import tarfile
+import shutil
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 r = importlib.machinery.SourceFileLoader('recorder', str(ROOT/'lh-recorder')).load_module()
@@ -92,7 +98,7 @@ class FileTests(unittest.TestCase):
                 (source/name).write_text('{"device_id":"PRIVATE_SERIAL"}\n')
             (source/'clock_sync.jsonl').write_text('{}\n')
             r.export_public(source, dest)
-            self.assertNotIn('PRIVATE_SERIAL', (dest/'poses.jsonl').read_text())
+            self.assertNotIn('PRIVATE_SERIAL', gzip.open(dest/'poses.jsonl.gz', 'rt').read())
             self.assertFalse((dest/'usb.pcap.gz').exists())
             self.assertFalse(r.read(dest/'manifest.json')['usb_replay_available'])
 
@@ -104,6 +110,185 @@ class FileTests(unittest.TestCase):
             result = subprocess.run([str(ROOT/'lh-recorder'), command], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
 
+
+
+class CompressionTests(unittest.TestCase):
+    def test_streaming_gzip_and_legacy_readers(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)/'data.jsonl'
+            p.write_text('{"test":1}\n')
+            self.assertEqual(list(r.lines(p)), [{'test': 1}])
+            with gzip.open(p.with_suffix('.jsonl.gz'), 'wt') as f:
+                f.write('{"test":2}\n')
+            self.assertEqual(list(r.lines(p)), [{'test': 2}])
+
+    def test_batch_archive_roundtrip_and_standard_tools(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = base/'sessions'; source.mkdir()
+            for name in ('one', 'two'):
+                shutil.copytree(ROOT/'samples/synthetic-native-session', source/name)
+            # Include a gzip session and a historical plain JSONL session.
+            compressed_session = source/'two'
+            manifest = r.read(compressed_session/'manifest.json')
+            for stream in ('poses.jsonl', 'events.jsonl', 'clock_sync.jsonl', 'usb_devices.jsonl'):
+                path = compressed_session/stream
+                with path.open('rb') as input_file, gzip.open(str(path)+'.gz', 'wb') as output_file:
+                    shutil.copyfileobj(input_file, output_file)
+                path.unlink()
+                del manifest['files_sha256'][stream]
+                manifest['files_sha256'][stream+'.gz'] = r.sha(compressed_session/(stream+'.gz'))
+            r.dump(compressed_session/'manifest.json', manifest)
+            before = {str(p.relative_to(source)): r.sha(p) for p in source.rglob('*') if p.is_file()}
+            def contents(root):
+                result = {}
+                for path in root.rglob('*'):
+                    if not path.is_file() or path.name in ('manifest.json', 'validation.json'):
+                        continue
+                    name = str(path.relative_to(root))
+                    if name.endswith('.gz'):
+                        name = name[:-3]
+                        with gzip.open(path, 'rb') as f:
+                            result[name] = hashlib.sha256(f.read()).hexdigest()
+                    else:
+                        result[name] = r.sha(path)
+                return result
+            logical_before = contents(source)
+            archives = r.compress_sessions(source, base/'archives')
+            self.assertEqual(len(archives), 2)
+            for path in archives:
+                self.assertEqual(Path(path).read_bytes()[:6], b'\xfd7zXZ\x00')
+                with tarfile.open(path, 'r:xz') as archive:
+                    members = archive.getnames()
+                    self.assertFalse(any(name.endswith('.gz') for name in members))
+                    self.assertTrue(any(name.endswith('/usb.pcap') for name in members))
+                    archived_manifest = json.load(archive.extractfile(Path(path).name[:-7]+'/manifest.json'))
+                    self.assertIn('usb.pcap', archived_manifest['archive_recompression']['gzip_files'])
+                    self.assertIn('usb.pcap', archived_manifest['files_sha256'])
+                if shutil.which('xz') and shutil.which('tar'):
+                    subprocess.run(['xz', '-t', path], check=True, timeout=15)
+                    subprocess.run(['tar', '-tf', path], check=True, capture_output=True, timeout=15)
+            restored = r.decompress_sessions(base/'archives', base/'restored')
+            self.assertEqual(logical_before, contents(base/'restored'))
+            self.assertEqual(before, {str(p.relative_to(source)): r.sha(p) for p in source.rglob('*') if p.is_file()})
+            for path in restored:
+                session = Path(path)
+                self.assertEqual(r.read(session/'manifest.json')['archive_restore']['level'], 6)
+                for name in ('poses.jsonl', 'events.jsonl', 'clock_sync.jsonl', 'usb_devices.jsonl', 'usb.pcap'):
+                    self.assertFalse((session/name).exists())
+                    self.assertTrue((session/(name+'.gz')).exists())
+                    self.assertEqual((session/(name+'.gz')).read_bytes()[8], 0)  # gzip level 6 XFL
+                self.assertTrue(r.validate(session, write=False)['valid'])
+                if os.getenv('LH_SURVIVE_CLI'):
+                    config = base/'replay-config'/'libsurvive'; config.mkdir(parents=True, exist_ok=True)
+                    replay = subprocess.run([os.environ['LH_SURVIVE_CLI'], '--usbmon-playback', str(Path(path)/'usb.pcap.gz'), '--playback-factor', '0'],
+                                            env=dict(os.environ, XDG_CONFIG_HOME=str(config.parent)), cwd=base, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(replay.returncode, 0, replay.stdout+replay.stderr)
+                    self.assertIn('usbmon saw 120/', replay.stdout)
+            with self.assertRaises(FileExistsError):
+                r.compress_sessions(source, base/'archives')
+            with self.assertRaises(FileExistsError):
+                r.decompress_sessions(base/'archives', base/'restored')
+
+    def test_active_and_changed_sessions_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d); source = base/'active'; source.mkdir()
+            r.dump(source/'manifest.json', {'status': 'recording', 'end_realtime_ns': None})
+            with self.assertRaises(ValueError):
+                r.compress_sessions(source, base/'archives')
+            self.assertFalse(list((base/'archives').glob('*.tar.xz')))
+            r.dump(source/'manifest.json', {'status': 'complete', 'end_realtime_ns': 1})
+            with self.assertRaises(ValueError):
+                r.compress_sessions(source, source/'archives')
+            self.assertFalse((source/'archives').exists())
+            original_add = tarfile.TarFile.add
+            def change_file(archive, *args, **kwargs):
+                result = original_add(archive, *args, **kwargs)
+                (source/'changed').write_text('modified during compression')
+                return result
+            with mock.patch.object(tarfile.TarFile, 'add', change_file):
+                with self.assertRaises(ValueError):
+                    r.compress_sessions(source, base/'archives')
+            self.assertFalse(list((base/'archives').glob('*.tar.xz')))
+            (source/'link').symlink_to('/tmp')
+            with self.assertRaises(ValueError):
+                r.compress_sessions(source, base/'archives')
+
+    def test_unsafe_archives_and_corruption_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            for index, kind in enumerate(('traversal', 'link', 'duplicate', 'corrupt')):
+                path = base/f'test{index}.tar.xz'
+                with tarfile.open(path, 'w:xz') as archive:
+                    record = tarfile.TarInfo(f'test{index}/manifest.json')
+                    data = b'{"status":"complete"}'
+                    record.size = len(data)
+                    archive.addfile(record, io.BytesIO(data))
+                    bad = tarfile.TarInfo(f'test{index}/../escaped')
+                    if kind == 'link':
+                        bad.name = f'test{index}/link'; bad.type = tarfile.SYMTYPE; bad.linkname = '/tmp'
+                    if kind == 'duplicate':
+                        bad.name = record.name
+                    if kind != 'corrupt': archive.addfile(bad)
+                if kind == 'corrupt':
+                    contents = path.read_bytes(); path.write_bytes(contents[:-10])
+                with self.assertRaises((ValueError, EOFError, tarfile.TarError, lzma.LZMAError)):
+                    r.decompress_sessions(path, base/'restored')
+                self.assertFalse((base/'restored'/f'test{index}').exists())
+                self.assertFalse((base/'escaped').exists())
+
+    def test_gzip_is_recompressed_with_xz_then_restored(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d); source = base/'session'; source.mkdir()
+            data = b'{"value":"' + b'abcdefgh' * 150000 + b'"}\n'
+            with gzip.open(source/'data.jsonl.gz', 'wb', compresslevel=1) as f:
+                f.write(data)
+            r.dump(source/'manifest.json', dict(status='complete', end_realtime_ns=1,
+                   files_sha256={'data.jsonl.gz': r.sha(source/'data.jsonl.gz')}))
+            archives = r.compress_sessions(source, base/'archives')
+            self.assertLess(Path(archives[0]).stat().st_size, (source/'data.jsonl.gz').stat().st_size)
+            with tarfile.open(archives[0], 'r:xz') as archive:
+                self.assertEqual(archive.extractfile('session/data.jsonl').read(), data)
+            restored = Path(r.decompress_sessions(Path(archives[0]), base/'restored')[0])
+            with gzip.open(restored/'data.jsonl.gz', 'rb') as f:
+                self.assertEqual(f.read(), data)
+            manifest = r.read(restored/'manifest.json')
+            self.assertEqual(manifest['files_sha256']['data.jsonl.gz'], r.sha(restored/'data.jsonl.gz'))
+            self.assertLess((restored/'data.jsonl.gz').stat().st_size, (source/'data.jsonl.gz').stat().st_size)
+
+    def test_legacy_archive_normalization_and_hash_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = ROOT/'samples/synthetic-native-session'
+            path = base/'legacy.tar.xz'
+            with tarfile.open(path, 'w:xz') as archive:
+                archive.add(source, arcname='legacy')
+            restored = Path(r.decompress_sessions(path, base/'restored')[0])
+            self.assertTrue(r.validate(restored, write=False)['valid'])
+            self.assertTrue((restored/'poses.jsonl.gz').exists())
+            self.assertEqual((restored/'usb.pcap.gz').read_bytes()[8], 0)
+            bad = base/'bad'; shutil.copytree(source, bad)
+            manifest = r.read(bad/'manifest.json')
+            manifest['files_sha256']['usb.pcap.gz'] = '0' * 64
+            r.dump(bad/'manifest.json', manifest)
+            path = base/'bad.tar.xz'
+            with tarfile.open(path, 'w:xz') as archive:
+                archive.add(bad, arcname='bad')
+            with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+                r.decompress_sessions(path, base/'restored')
+            self.assertFalse((base/'restored'/'bad').exists())
+
+    def test_cli_output_option_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = ROOT/'samples/synthetic-native-session'
+            for command, path, output in [('compress', source, base/'archives'),
+                                          ('decompress', base/'archives', base/'restored')]:
+                subprocess.run([str(ROOT/'lh-recorder'), command, str(path), '--output', str(output)],
+                               check=True, capture_output=True, timeout=30)
+            restored = base/'restored'/source.name
+            self.assertEqual(r.read(source/'manifest.json')['session_id'], r.read(restored/'manifest.json')['session_id'])
+            self.assertTrue(r.validate(restored, write=False)['valid'])
 
 
 @unittest.skipUnless(os.getenv('LH_POSE_HARNESS'), 'Set LH_POSE_HARNESS to compiled pose_harness')
@@ -123,6 +308,9 @@ class PoseTests(unittest.TestCase):
             self.invoke(p, 30, True)
             records = list(r.lines(p/'poses.jsonl'))
             self.assertEqual(len(records), 30)
+            self.assertFalse((p/'poses.jsonl').exists())
+            self.assertTrue((p/'poses.jsonl.gz').read_bytes().startswith(b'\x1f\x8b'))
+            self.assertLess((p/'poses.jsonl.gz').stat().st_size, len(gzip.decompress((p/'poses.jsonl.gz').read_bytes())) // 2)
             self.assertEqual({x['device_id'] for x in records}, {'tracker-A', 'controller-B'})
             self.assertEqual(records[0]['position_m'][0], 1.25)
             self.assertEqual(records[0]['pose_time_offset_s'], -0.004)
@@ -157,7 +345,7 @@ class PoseTests(unittest.TestCase):
     def test_io_failure_does_not_crash_driver(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d)
-            (p/'poses.jsonl').mkdir()
+            (p/'poses.jsonl.gz').mkdir()
             self.invoke(p, 30, True)
             self.assertTrue(r.read(p/'pose_status.json')['error'])
 
@@ -234,6 +422,13 @@ class StartupTests(unittest.TestCase):
             while time.monotonic() < deadline and r.read(session/'manifest.json', {}).get('status') == 'recording':
                 time.sleep(0.05)
             self.assertEqual(r.read(session/'manifest.json')['status'], 'complete', (session/'manifest.json').read_text())
+            for name in ('poses', 'events', 'clock_sync', 'usb_devices'):
+                self.assertTrue((session/(name+'.jsonl.gz')).is_file())
+                self.assertFalse((session/(name+'.jsonl')).exists())
+                with gzip.open(session/(name+'.jsonl.gz'), 'rb') as f:
+                    self.assertTrue(f.read())
+            r.align(session)
+            self.assertEqual(len(list(r.lines(session/'usb_timestamps.jsonl.gz'))), r.read(session/'manifest.json')['usb_packet_count'])
             records = list(r.lines(session/'poses.jsonl'))
             status = r.read(session/'pose_status.json')
             announcements = sum(event.get('event') == 'device_announced' for event in r.lines(session/'events.jsonl'))
@@ -271,7 +466,7 @@ class StartupTests(unittest.TestCase):
                     os.environ['HOME'] = old_home
             new = base/'LH-Dump'; again.communicate(timeout=10)
             self.assertEqual(again.returncode, 0)
-            self.assertTrue(list(new.glob('*/poses.jsonl')))
+            self.assertTrue(list(new.glob('*/poses.jsonl.gz')))
             self.assertEqual(len(list(old.iterdir())), 1)
 
 

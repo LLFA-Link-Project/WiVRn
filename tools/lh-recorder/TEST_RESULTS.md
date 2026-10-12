@@ -1,3 +1,21 @@
+# gzip 記録・tar.xz 保存 v2.1 の検証
+
+基準: WiVRn `bd799f4feef31f79d5aaf5bd2e3971829c10fa02` + Monado追加パッチ0018。
+
+- server / 起動 harness ビルド成功。zlibでPose・events・clock_sync・usb_devicesをgzipに逐次保存。
+- 全自動テスト **26件成功**（Pose、設定snapshot、通常／異常終了、permission failure、overflow、replay、圧縮・展開）。
+- 圧縮処理の最終変更後も専用テスト7件が成功。標準 `xz -t` / `tar -tf` で読込可能。
+- 旧JSONLとgzip JSONLの両方を検証し、align派生インデックス／public exportもgzipで出力。
+- 2セッション一括圧縮・展開後のJSONL原文／USB payloadが元データと一致。gzipセッションと旧非圧縮セッションの両方をgzip level 6へ復元し、再計算したSHA-256と全内容validationが成功。元セッションの全ファイルSHA-256は変更なし。
+- 展開後の2セッションのUSB記録を実際のpatched libsurviveで再生し、各120 packet読込を確認。
+- gzipを展開してpreset 9 + EXTREMEの標準tar.xzに再圧縮。tar内に生JSONL／pcapが入り、復元はgzip level 6に統一。繰り返しパターンの合成ログでarchiveが元gzipより小さくなることを確認。元セッションを変更せず、同名archive／展開先の上書きを拒否。
+- 記録中、圧縮中のファイル変更、symlink、path traversal、重複entry、切れたxz trailer、archive内のhash不一致を拒否。一時出力を除去。旧tar.xzのgzip／非圧縮JSONLをgzip level 6に統一できることも確認。
+- 圧縮後も100,000更新負荷試験でqueue capacity4096、欠落counter整合、callback平均100µs未満、Pose executableのピークRSS64MiB未満。
+  Linux `ru_maxrss` は親Pythonのxz圧縮時のhigh-water markがexec後にも影響するため、harnessのRSS測定を `/proc/self/status` の `VmHWM` に変更。
+
+実機でのトラッキング品質・長時間記録と、実測センサー入力からのPose solveは未検証です。
+以下は過去版の検証記録です。
+
 # Native 記録 v2 の検証
 
 基準: WiVRn `dad7b6a29a52ec6624b8895d5d7892f73147059a`。記録用 CLI / 外部 supervisor を廃止し、server 内に libpcap / gzip / clock sampler / session finalization を組み込みました。

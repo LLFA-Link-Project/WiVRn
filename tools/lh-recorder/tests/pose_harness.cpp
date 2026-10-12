@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
 #include <locale>
 #include <sys/resource.h>
 #include <thread>
@@ -75,6 +76,13 @@ int main(int argc, char ** argv)
 	auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
 	rusage usage{};
 	getrusage(RUSAGE_SELF, &usage);
-	std::cout << "{\"samples\":" << count << ",\"callback_total_ns\":" << elapsed << ",\"peak_rss_kib\":" << usage.ru_maxrss << "}\n";
+	// Linux ru_maxrss may inherit the Python parent high-water mark across exec.
+	// VmHWM measures this executable's own address space after exec.
+	long peak_rss = usage.ru_maxrss;
+	std::ifstream status("/proc/self/status");
+	for (std::string line; std::getline(status, line);)
+		if (line.rfind("VmHWM:", 0) == 0)
+			peak_rss = std::stol(line.substr(6));
+	std::cout << "{\"samples\":" << count << ",\"callback_total_ns\":" << elapsed << ",\"peak_rss_kib\":" << peak_rss << "}\n";
 	// The destructor joins the writer and flushes all accepted updates.
 }

@@ -5,7 +5,7 @@
   "libsurvive_revision": "23f03665070549f0c13a6e768dfaf7764f75c417",
   "libsurvive_version": "0.3",
   "monado_inspected_local_revision": "ad7610a5561325a9b368cda5d45fe195d67f4c3b",
-  "recorder_version": "2.0.0",
+  "recorder_version": "2.1.0",
   "hardware_validation": "not performed",
   "patches_sha256": {
     "patches/monado/0001-c-multi-early-wake-of-compositor.patch": "d097a6a339a226526f6e49345bc1f97f4fd7fee65916ce9f08c306c0736beafd",
@@ -25,7 +25,9 @@
     "patches/monado/0015-d-steamvr_lh-predict-raw-reference-first.patch": "0daacfe2d70c73a59dfbdd2f60cd24ba0565a126778a799773440841fd731985",
     "patches/monado/0016-d-steamvr_lh-record-valve-reference-poses.patch": "a7aff10e4cc817ec6a555abb2ecb0623734fa88c9ec26cff0df73dfd29aa4edd",
     "patches/libsurvive/0001-usbmon-safe-passive-recording.patch": "a86275ec6768adc46cfdf15bdf34ccc5b951724197739a15fd19c744aa393e2f",
-    "patches/monado/0017-d-steamvr_lh-finalize-reference-recorder.patch": "f52fd484fe139ff87ec58694ae440511868bba8df658613acf0fb4673455474d"
+    "patches/monado/0017-d-steamvr_lh-finalize-reference-recorder.patch": "f52fd484fe139ff87ec58694ae440511868bba8df658613acf0fb4673455474d",
+    "patches/monado/0018-d-steamvr_lh-compress-reference-streams.patch": "204d1654fdea5566b0ecc1d8c9dc92d6c5d97a72dbb2a155e0926d04b1c035a5"
   },
-  "native_recording_base_revision": "dad7b6a29a52ec6624b8895d5d7892f73147059a"
+  "native_recording_base_revision": "dad7b6a29a52ec6624b8895d5d7892f73147059a",
+  "compression_base_revision": "bd799f4feef31f79d5aaf5bd2e3971829c10fa02"
 }

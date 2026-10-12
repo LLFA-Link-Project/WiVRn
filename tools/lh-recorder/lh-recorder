@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Offline Lighthouse dataset utilities (Python standard library only)."""
 import argparse
+import io
 import gzip
 import hashlib
 import json
 import math
+import lzma
+import tarfile
 import os
 from pathlib import Path
 import secrets
@@ -16,7 +19,7 @@ import tempfile
 import sys
 import time
 
-VERSION = '2.0.0'
+VERSION = '2.1.0'
 
 
 def dump(path, value):
@@ -36,8 +39,15 @@ def read(path, default=None):
         return default
 
 
+def stream_path(path):
+    """Read both current gzip streams and historical uncompressed sessions."""
+    compressed = path.with_name(path.name + '.gz')
+    return compressed if compressed.exists() else path
+
+
 def lines(path):
-    with path.open() as f:
+    path = stream_path(path)
+    with (gzip.open(path, 'rt', encoding='utf-8') if path.suffix == '.gz' else path.open(encoding='utf-8')) as f:
         for n, line in enumerate(f, 1):
             yield json.loads(line, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x)))
 
@@ -212,14 +222,14 @@ def validate(session, write=True):
         issues.add('session_ended_abnormally')
     if write and manifest.get('status') != 'complete':
         issues.add('manifest_not_finalized_normally')
-    mapping = ClockMap.from_file(session/'clock_sync.jsonl') if (session/'clock_sync.jsonl').exists() else ClockMap([])
+    mapping = ClockMap.from_file(session/'clock_sync.jsonl') if stream_path(session/'clock_sync.jsonl').exists() else ClockMap([])
     sync_count = getattr(mapping, 'sample_count', 0)
     pose_count = 0
     ids = set()
     last_time = {}
     last_seq = -1
     invalid_components = 0
-    if (session/'poses.jsonl').exists():
+    if stream_path(session/'poses.jsonl').exists():
         try:
             for p in lines(session/'poses.jsonl'):
                 pose_count += 1
@@ -303,7 +313,7 @@ def validate(session, write=True):
                   if (d['bus'], d['address']) not in observed]
     unseen_keys = {(d['bus'], d['address']) for d in unobserved}
     unseen_truncated = False
-    if (session/'usb_devices.jsonl').exists():
+    if stream_path(session/'usb_devices.jsonl').exists():
         for snapshot in lines(session/'usb_devices.jsonl'):
             for d in snapshot['devices']:
                 key = (d['bus'], d['address'])
@@ -326,7 +336,7 @@ def validate(session, write=True):
 
 def align(session):
     mapping = ClockMap.from_file(session/'clock_sync.jsonl')
-    with (session/'usb_timestamps.jsonl').open('w') as output:
+    with gzip.open(session/'usb_timestamps.jsonl.gz', 'wt', encoding='utf-8', compresslevel=6) as output:
         for packet in pcap_records(session/'usb.pcap.gz'):
             packet.update(mapping.convert(packet['usb_timestamp_ns']))
             output.write(json.dumps(packet, allow_nan=False)+'\n')
@@ -340,23 +350,228 @@ def export_public(source, dest):
     def identity(value):
         return hashlib.sha256(salt+value.encode()).hexdigest()
     for name in ('poses.jsonl', 'events.jsonl'):
-        with (dest/name).open('w') as f:
+        with gzip.open(dest/(name+'.gz'), 'wt', encoding='utf-8', compresslevel=6) as f:
             for record in lines(source/name):
                 record['device_id'] = identity(record['device_id'])
                 f.write(json.dumps(record, allow_nan=False)+'\n')
-    shutil.copyfile(source/'clock_sync.jsonl', dest/'clock_sync.jsonl')
+    with gzip.open(dest/'clock_sync.jsonl.gz', 'wb', compresslevel=6) as output:
+        path = stream_path(source/'clock_sync.jsonl')
+        with (gzip.open(path, 'rb') if path.suffix == '.gz' else path.open('rb')) as input_file:
+            shutil.copyfileobj(input_file, output, 1024*1024)
     dump(dest/'manifest.json', dict(schema_version=1, public_export=True,
                                     anonymization='session salted SHA256 device IDs; salt discarded; raw USB, serials, calibration and host paths excluded',
                                     usb_replay_available=False, logger_version=VERSION))
 
 
+def compress_sessions(source, output):
+    """One standard tar.xz per finalized session, recompressing gzip contents."""
+    source, output = source.resolve(), output.resolve()
+    sessions = [source] if (source/'manifest.json').is_file() else sorted(
+        p for p in source.iterdir() if p.is_dir() and (p/'manifest.json').is_file())
+    if not sessions:
+        raise ValueError('No sessions found')
+    for session in sessions:
+        if output == session or session in output.parents:
+            raise ValueError('Archive output must be outside the session')
+    output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    results = []
+    for session in sessions:
+        manifest = read(session/'manifest.json', {})
+        if manifest.get('status') not in ('complete', 'abnormal') or manifest.get('end_realtime_ns') is None:
+            raise ValueError(f'Session is still recording or not finalized: {session}')
+        target = output/(session.name+'.tar.xz')
+        if target.exists():
+            raise FileExistsError(target)
+        # Streaming tar/xz, no data-set-sized memory buffer. Preset 9e is deliberately
+        # expensive (~674 MiB encoder memory); recording uses lightweight gzip instead.
+        def inventory():
+            result = {}
+            for path in [session, *sorted(session.rglob('*'))]:
+                if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                    raise ValueError(f'Only regular files and directories can be archived: {path}')
+                stat = path.stat()
+                result[path] = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            return result
+        before = inventory()
+        entries, hashes, gzip_files = {}, {}, {}
+        for path in before:
+            name = str(path.relative_to(session))
+            archived_name = name[:-3] if path.is_file() and name.endswith('.gz') else name
+            if archived_name in entries:
+                raise ValueError(f'Archive name collision: {archived_name}')
+            entries[archived_name] = path
+            if name in manifest.get('files_sha256', {}) and sha(path) != manifest['files_sha256'][name]:
+                raise ValueError(f'Source hash mismatch: {name}')
+            if archived_name != name:
+                gzip_files[archived_name] = name
+        with tempfile.TemporaryDirectory(prefix='.lh-compress-', dir=output) as staging:
+            temp = Path(staging)/target.name
+            with lzma.open(temp, 'wb', format=lzma.FORMAT_XZ,
+                           preset=9 | lzma.PRESET_EXTREME) as compressed:
+                with tarfile.open(fileobj=compressed, mode='w|', format=tarfile.PAX_FORMAT) as archive:
+                    for name, path in entries.items():
+                        if name == 'manifest.json':
+                            continue
+                        arcname = str(Path(session.name)/name)
+                        if name in gzip_files:
+                            # Tar requires the expanded size up front. Two bounded
+                            # reads verify the gzip CRC and avoid staging full logs.
+                            size, digest = 0, hashlib.sha256()
+                            with gzip.open(path, 'rb') as input_file:
+                                for block in iter(lambda: input_file.read(1024*1024), b''):
+                                    size += len(block); digest.update(block)
+                            info = archive.gettarinfo(str(path), arcname=arcname)
+                            info.size = size
+                            with gzip.open(path, 'rb') as input_file:
+                                archive.addfile(info, input_file)
+                            if gzip_files[name] in manifest.get('files_sha256', {}):
+                                hashes[name] = digest.hexdigest()
+                        else:
+                            archive.add(path, arcname=arcname, recursive=False)
+                            if name in manifest.get('files_sha256', {}):
+                                hashes[name] = sha(path)
+                    archived_manifest = dict(manifest)
+                    archived_manifest['files_sha256'] = hashes
+                    archived_manifest['archive_recompression'] = dict(
+                        gzip_files=gzip_files, source_files_sha256=manifest.get('files_sha256', {}),
+                        format='tar.xz', preset='9e')
+                    if 'stream_compression' in archived_manifest:
+                        archived_manifest['stream_compression'] = dict(format='none', level=None,
+                            jsonl_streams=[name for name in entries if name.endswith('.jsonl')])
+                    data = (json.dumps(archived_manifest, allow_nan=False, indent=2)+'\n').encode()
+                    info = tarfile.TarInfo(str(Path(session.name)/'manifest.json'))
+                    info.size, info.mode = len(data), 0o600
+                    archive.addfile(info, io.BytesIO(data))
+            if inventory() != before:
+                raise ValueError(f'Session changed during compression: {session}')
+            # Exclusive publish: existing archives are never overwritten.
+            os.link(temp, target)
+        results.append(str(target))
+    return results
+
+
+def decompress_sessions(source, output):
+    """Restore standard tar.xz archives with bounded streaming extraction."""
+    source, output = source.resolve(), output.resolve()
+    archives = sorted(source.glob('*.tar.xz')) if source.is_dir() else [source]
+    if not archives:
+        raise ValueError('No .tar.xz archives found')
+    output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    results = []
+    for path in archives:
+        if not path.name.endswith('.tar.xz'):
+            raise ValueError('Expected .tar.xz archive')
+        session_name = path.name[:-7]
+        if session_name in ('', '.', '..'):
+            raise ValueError('Invalid session name')
+        target = output/session_name
+        if target.exists():
+            raise FileExistsError(target)
+        with tempfile.TemporaryDirectory(prefix='.lh-extract-', dir=output) as staging:
+            staging = Path(staging)
+            seen = set()
+            # Explicit extraction supports Python 3.9 and rejects links, special
+            # files, traversal and duplicate entries without relying on tar defaults.
+            with lzma.open(path, 'rb') as compressed:
+                with tarfile.open(fileobj=compressed, mode='r|') as archive:
+                    for member in archive:
+                        name = Path(member.name)
+                        if (name.is_absolute() or '..' in name.parts or not name.parts or
+                                name.parts[0] != session_name or member.name in seen or
+                                not (member.isdir() or member.isfile())):
+                            raise ValueError(f'Unsafe archive entry: {member.name}')
+                        seen.add(member.name)
+                        dest = staging/name
+                        if member.isdir():
+                            dest.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        else:
+                            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            with archive.extractfile(member) as input_file, dest.open('xb') as output_file:
+                                shutil.copyfileobj(input_file, output_file, 1024*1024)
+                            dest.chmod(0o600)
+                # Tar EOF precedes the xz trailer; drain to verify CRC and truncation.
+                while compressed.read(1024*1024):
+                    pass
+            restored = staging/session_name
+            if not (restored/'manifest.json').is_file():
+                raise ValueError('Archive contains no session manifest')
+            manifest = read(restored/'manifest.json')
+            if not isinstance(manifest, dict):
+                raise ValueError('Invalid session manifest')
+            recompression = manifest.get('archive_recompression', {})
+            if not isinstance(recompression, dict):
+                raise ValueError('Invalid archive recompression metadata')
+            gzip_files = recompression.get('gzip_files', {})
+            if not isinstance(gzip_files, dict):
+                raise ValueError('Invalid gzip correspondence')
+            for name, destination in gzip_files.items():
+                relative = Path(name)
+                if (relative.is_absolute() or '..' in relative.parts or destination != name+'.gz' or
+                        not (restored/relative).is_file()):
+                    raise ValueError('Invalid gzip correspondence')
+            old_hashes = manifest.get('files_sha256', {})
+            for name, expected in old_hashes.items():
+                relative = Path(name)
+                if (relative.is_absolute() or '..' in relative.parts or not (restored/relative).is_file() or
+                        sha(restored/relative) != expected):
+                    raise ValueError(f'Archive content hash mismatch: {name}')
+            renamed = {}
+            for original in sorted(restored.rglob('*')):
+                if not original.is_file():
+                    continue
+                name = str(original.relative_to(restored))
+                if name.endswith('.gz'):
+                    destination = original
+                elif name in gzip_files or name.endswith(('.jsonl', '.pcap')):
+                    destination = original.with_name(original.name+'.gz')
+                    if destination.exists():
+                        raise ValueError(f'Restored name collision: {destination.name}')
+                else:
+                    continue
+                # Normalize old archives and new expanded tar members to level 6.
+                with tempfile.TemporaryDirectory(prefix='.lh-gzip-', dir=restored) as scratch:
+                    temp = Path(scratch)/'stream.gz'
+                    with (gzip.open(original, 'rb') if name.endswith('.gz') else original.open('rb')) as input_file:
+                        with temp.open('wb') as output_file:
+                            with gzip.GzipFile(filename='', mode='wb', fileobj=output_file,
+                                               compresslevel=6, mtime=0) as gzip_file:
+                                shutil.copyfileobj(input_file, gzip_file, 1024*1024)
+                    temp.replace(destination)
+                if destination != original:
+                    original.unlink()
+                renamed[name] = str(destination.relative_to(restored))
+            manifest['files_sha256'] = {renamed.get(name, name): sha(restored/renamed.get(name, name))
+                                        for name in old_hashes}
+            manifest['stream_compression'] = dict(format='gzip', level=6,
+                jsonl_streams=sorted(str(p.relative_to(restored)) for p in restored.rglob('*.jsonl.gz')))
+            manifest['archive_restore'] = dict(format='gzip', level=6, archive=path.name,
+                source_files_sha256=recompression.get('source_files_sha256', {}))
+            manifest.pop('archive_recompression', None)
+            dump(restored/'manifest.json', manifest)
+            if (restored/'validation.json').is_file():
+                validate(restored)
+            if target.exists():
+                raise FileExistsError(target)
+            restored.rename(target)
+        results.append(str(target))
+    return results
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Offline Lighthouse dataset validation, clock alignment and public export. Recording is built into wivrn-server.')
+    parser = argparse.ArgumentParser(description='Offline Lighthouse dataset validation, clock alignment, public export and tar.xz archival. Recording is built into wivrn-server.')
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('validate', 'align'):
         p = sub.add_parser(name); p.add_argument('session', type=Path)
     p = sub.add_parser('export-public'); p.add_argument('session', type=Path); p.add_argument('output', type=Path)
+    for name in ('compress', 'decompress'):
+        p = sub.add_parser(name)
+        p.add_argument('source', type=Path, help='Session/archive, or directory containing sessions/archives')
+        p.add_argument('--output', required=True, type=Path, help='Destination directory (existing data is never overwritten)')
     args = parser.parse_args(argv)
+    if args.command == 'compress':
+        print(json.dumps(compress_sessions(args.source, args.output), indent=2)); return 0
+    if args.command == 'decompress':
+        print(json.dumps(decompress_sessions(args.source, args.output), indent=2)); return 0
     if args.command == 'validate':
         result = validate(args.session); print(json.dumps(result, indent=2)); return int(not result['valid'])
     if args.command == 'align':
@@ -368,6 +583,6 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (OSError, ValueError, KeyError) as error:
+    except (OSError, EOFError, ValueError, KeyError, tarfile.TarError, lzma.LZMAError) as error:
         print(f'lh-recorder: {error}', file=sys.stderr)
         sys.exit(1)

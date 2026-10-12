@@ -344,7 +344,7 @@ if(WIVRN_BUILD_SERVER)
 		target_sources(wivrn-server PRIVATE lighthouse_capture.cpp)
 		target_link_libraries(wivrn-server PRIVATE PkgConfig::LH_PCAP ZLIB::ZLIB xrt-external-openvr)
 	endif()
-	# Offline validation/alignment only; recording never invokes these programs.
+	# Offline validation, alignment and archival; recording never invokes these programs.
 	install(PROGRAMS ${PROJECT_SOURCE_DIR}/tools/lh-recorder/lh-recorder DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/wivrn)
 	configure_file(${PROJECT_SOURCE_DIR}/tools/lh-recorder/launcher.in ${CMAKE_CURRENT_BINARY_DIR}/lh-recorder-cli @ONLY)
 	install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/lh-recorder-cli DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME lh-recorder)

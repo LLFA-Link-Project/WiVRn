@@ -1,4 +1,4 @@
-# Lighthouse Reference Dataset Recorder v2
+# Lighthouse Reference Dataset Recorder v2.1
 
 Valve Pose は Ground Truth ではなく **Reference Pose** です。本実装はデータ収集を担当します。
 Dashboard の設定項目は「Enable recording」と「Output directory」の2つだけです。
@@ -16,17 +16,18 @@ Monado の正常／異常終了経路で Pose writer・USB capture・clock sampl
 | Monado | `monado-rev`: `09741cbcb45236f4f4f79790ea133cd90d68d5eb` + WiVRn patches 0001–0015 |
 | ローカルの参考 Monado | `ad7610a5561325a9b368cda5d45fe195d67f4c3b`。実装パッチは上の WiVRn pin に対して作成 |
 | libsurvive | `23f03665070549f0c13a6e768dfaf7764f75c417`、CMake project version `0.3`、CLI 表示 `v1.01-206-g23f0366-dirty` |
-| ロガー | `2.0.0`、schema version `1` |
+| ロガー | `2.1.0`、schema version `1` |
 
 追加パッチ:
 
 - `patches/monado/0016-d-steamvr_lh-record-valve-reference-poses.patch`
 - `patches/monado/0017-d-steamvr_lh-finalize-reference-recorder.patch`
+- `patches/monado/0018-d-steamvr_lh-compress-reference-streams.patch`
 - `patches/libsurvive/0001-usbmon-safe-passive-recording.patch`（任意のオフライン再生用。記録には不要）
 
 WiVRn の `CMakeLists.txt` は `patches/monado/*` を既に FetchContent 時に適用します。
 Monado の `src/xrt/drivers/CMakeLists.txt` に独立した recorder コンポーネントを追加しました。
-既存の checkout や `FETCHCONTENT_SOURCE_DIR_MONADO` を使う場合は、0016・0017 の適用を確認してください。
+既存の checkout や `FETCHCONTENT_SOURCE_DIR_MONADO` を使う場合は、0016〜0018 の適用を確認してください。
 実行時 manifest は期待する pin と実際の WiVRn/Monado ビルド revision を区別します。
 記録には libsurvive をロードしないため、`libsurvive_revision` は `null` です。
 互換形式の参照 revision は別フィールドに保存します。WiVRn/Monado のビルド revision と
@@ -44,7 +45,7 @@ Monado の `src/xrt/drivers/CMakeLists.txt` に独立した recorder コンポ�
 5. WiVRn の `server/driver/wivrn_session.cpp` は `steamvr_lh_create_devices` でこれらの `xrt_device` を
    OpenXR 用 system devices / roles に組み込む。アプリ側の要求時刻と空間変換はこの後段にある。
 
-`poses.jsonl` は手順2の A ストリームだけです。Application-Facing Pose（B）は今回実装していません。
+`poses.jsonl.gz` は手順2の A ストリームだけです。Application-Facing Pose（B）は今回実装していません。
 Monado の Linux `os_monotonic_get_ns()` は `CLOCK_MONOTONIC`、この pin の `chrono_timestamp_ns()` は
 `std::chrono::steady_clock` です。この Linux/libstdc++ ビルドでは後者も monotonic ですが、他の標準ライブラリへの
 移植時は対応を再検証してください。ロガーの clock ID は標準ライブラリの推測に依存させていません。
@@ -64,7 +65,7 @@ cmake --build build-lh
 
 ビルドツリーの server を直接実行した場合も記録できます。install 済み helper に依存しません。
 Python 3.9 以上はオフライン検証 CLI を使う場合のみ必要です。
-`lh-recorder` は validate / align / export-public のみ提供し、record/start/stop コマンドはありません。
+`lh-recorder` は validate / align / export-public / compress / decompress を提供し、record/start/stop コマンドはありません。
 
 USB 権限設定の例（自動で権限変更や root 起動はしません）:
 
@@ -116,27 +117,73 @@ lh-recorder align /absolute/path/session
 lh-recorder export-public /absolute/path/session /absolute/path/new-public-export
 ```
 
+### 保存済みセッションの一括圧縮・展開
+
+```sh
+# 直下の全セッションを別のディレクトリへ圧縮。単独のセッションも指定可能。
+lh-recorder compress ~/LH-Dump --output ~/LH-Archives
+# 全アーカイブを展開。単独の .tar.xz ファイルも指定可能。
+lh-recorder decompress ~/LH-Archives --output ~/LH-Restored
+lh-recorder validate ~/LH-Restored/SESSION_ID
+```
+
+インストール前は `tools/lh-recorder/lh-recorder` を直接実行できます。
+標準 tar (PAX) + xz (LZMA2、preset 9 + EXTREME) でセッションごとに
+`SESSION_ID.tar.xz` を作成します。Python 標準ライブラリの tarfile / lzma を使い、独自形式は使用しません。
+通常の `tar -xJf SESSION_ID.tar.xz` でも展開できます。
+圧縮先と展開先は `--output` で必須指定し、元データは削除せず、既存の同名出力も上書きしません。
+記録中／未確定のセッション、圧縮中に変更されたファイル、symlink や特殊ファイルはエラーとします。
+複数セッションは順に処理するため、後続セッションの失敗時にも先に完了したアーカイブは残ります。
+展開は一時ディレクトリで行い、xz の CRC と終端を検査してから公開します。
+アーカイブ内の絶対パス、親ディレクトリ参照、リンク、重複ファイルは受け付けません。
+
+最高圧縮はオフラインの処理で、preset 9e の encoder は約674 MiBのメモリを使用し、時間もかかります。
+記録データ全体をメモリに読み込みません。既存 gzip はストリームとして展開し、
+非圧縮の JSONL / pcap 等を tar に格納したうえで xz 最高圧縮をかけます。
+各 gzip の展開サイズを事前の1回目の読み取りで測定し、2回目の読み取りで tar に格納するため、
+展開したログ全体を一時ディスクに保存する必要もありません。
+アーカイブ内の `manifest.json` は非圧縮ファイルの SHA-256 に更新し、
+`archive_recompression` に gzip 名称の対応と元セッションの SHA-256 を保存します。
+形式は通常の tar.xz と JSON であり、独自の圧縮方式やアーカイブ形式は使いません。
+
+展開 CLI は JSONL / pcap と元の gzip データを **gzip level 6** に揃えます。
+`usb.pcap.gz` と `usb.pcap.gz.usbdevs` は libsurvive が使える名称に戻ります。
+gzip の bytes は再圧縮で変わるため、manifest の SHA-256 は保存し直したファイルに対して再計算します。
+`validation.json` があれば全内容の検証結果も再生成します。JSONL の原文と USB payload は変更しません。
+復元 manifest の `archive_restore` は復元設定と元ファイルの SHA-256 を保持します。
+旧版のgzipを内包したtar.xzも読めます。標準 `tar -xJf` で展開した場合は非圧縮のログが得られるため、
+libsurvive再生用には `usb.pcap` をgzipに戻してください（`.usbdevs` はそのまま使用）。
+アーカイブ名は `SESSION_ID.tar.xz` のまま保持してください。
+
 `LH_RECORDER_ENABLE` / `LH_RECORDER_OUTPUT` は server から Monado コンポーネントへの内部受渡しのみです。
 外部から設定しても Dashboard の OFF を上書きできません。稼働中の設定編集や再度の start 呼出しは無視します。
 
 ## Session format
 
 全 JSON は schema version 1。JSONL の各行は単独の JSON object です。
+時間に比例して増える Pose、イベント、clock sync、USB デバイス履歴を記録中から
+標準 gzip (DEFLATE level 6) で圧縮します。USB pcap は従来どおり gzip です。
+圧縮は専用 writer／収集スレッドで行い、Pose callback に圧縮やディスク I/O を追加しません。
+manifest の `stream_compression` に形式・level・対象ストリームを保存します。
+SHA-256 は圧縮済みファイルの bytes に対して計算します。
+旧版の非圧縮 `.jsonl` も validate / align / export-public で読み込めます。
+派生 `usb_timestamps.jsonl.gz` と匿名化エクスポートの JSONL も gzip で出力します。
+容量増加そのものは継続しますが、テキストの重複部分を圧縮してディスク使用量を削減します。
 
 | ファイル | 内容 |
 | --- | --- |
 | `manifest.json` | 状態、開始/終了 realtime、設定 snapshot、revision、kernel、clock domains、損失と SHA-256 |
-| `poses.jsonl` | 原精度の DriverPose の double 値、xyzw quaternion、ドライバー flag、変換 metadata |
-| `events.jsonl` | device announcement、ドライバーの connected/valid/tracking-result 変化 |
+| `poses.jsonl.gz` | 原精度の DriverPose の double 値、xyzw quaternion、ドライバー flag、変換 metadata |
+| `events.jsonl.gz` | device announcement、ドライバーの connected/valid/tracking-result 変化 |
 | `usb.pcap.gz` | 原パケット bytes。DLT_USB_LINUX_MMAPPED=220、snaplen=65535 |
 | `usb.pcap.gz.usbdevs` | libsurvive 原形式: `decimal VID PID bus address codename` |
 | `usb_stats.json` | pcap statistics の可用性、received/drop/ifdrop、write error |
-| `clock_sync.jsonl` | start/periodic/end/finalize の realtime と monotonic 前後サンプル、RAW 対応 |
+| `clock_sync.jsonl.gz` | start/periodic/end/finalize の realtime と monotonic 前後サンプル、RAW 対応 |
 | `devices.json` | sysfs の起動時の VID/PID、bus/address、serial と stable ID（不明なら null） |
-| `usb_devices.jsonl` | 記録中の USB enumeration 変化。bus/address を永続 ID としない |
+| `usb_devices.jsonl.gz` | 記録中の USB enumeration 変化。bus/address を永続 ID としない |
 | `pose_status.json` | 試行数、書込数、drop、queue capacity、停止状態、writer error |
 | `validation.json` | 終了時の counters / writer 状態の検査。オフライン validate で全内容・hash・時刻を検査して更新 |
-| `usb_timestamps.jsonl` | `align` が生成する派生インデックス。原 timestamp と変換値・誤差を併記 |
+| `usb_timestamps.jsonl.gz` | `align` が生成する派生インデックス。原 timestamp と変換値・誤差を併記 |
 
 manifest 自身と validation は hash 集合から除外し、記録ファイルの SHA-256 を計算します。
 native 記録には lock/ready/manager.log/private libsurvive config は生成しません。

@@ -103,6 +103,78 @@ std::string digest(const std::filesystem::path & path)
 		result << std::hex << std::setw(2) << std::setfill('0') << unsigned(bytes[i]);
 	return result.str();
 }
+// Standard gzip JSONL; used only by the sampler thread, never pose callbacks.
+class gzip_jsonl
+{
+	gzFile file = nullptr;
+
+public:
+	~gzip_jsonl()
+	{
+		if (file)
+			gzclose(file);
+	}
+	void open(const std::filesystem::path & path)
+	{
+		file = gzopen(path.c_str(), "wb6");
+		if (!file)
+			throw std::runtime_error("Cannot open " + path.string());
+	}
+	void write(const json & record)
+	{
+		auto line = encoded(record) + '\n';
+		if (!file || gzwrite(file, line.data(), line.size()) != int(line.size()) ||
+		    gzflush(file, Z_SYNC_FLUSH) != Z_OK)
+			throw std::runtime_error("Lighthouse gzip metadata write failed");
+	}
+	void close()
+	{
+		if (!file)
+			return;
+		auto f = file;
+		file = nullptr;
+		if (gzclose(f) != Z_OK)
+			throw std::runtime_error("Lighthouse gzip metadata close failed");
+	}
+};
+void append(gzip_jsonl & file, const json & record)
+{
+	file.write(record);
+}
+// Read one bounded JSONL record at a time when sealing the session.
+class gzip_input
+{
+	gzFile file;
+
+public:
+	explicit gzip_input(const std::filesystem::path & path) : file(gzopen(path.c_str(), "rb"))
+	{
+		if (!file)
+			throw std::runtime_error("Cannot read " + path.string());
+	}
+	~gzip_input()
+	{
+		gzclose(file);
+	}
+	bool getline(std::string & line)
+	{
+		line.clear();
+		std::array<char, 4096> buffer;
+		while (gzgets(file, buffer.data(), buffer.size()))
+		{
+			line += buffer.data();
+			if (line.size() > 1024 * 1024)
+				throw std::runtime_error("Oversized event record");
+			if (!line.empty() && line.back() == '\n')
+				return true;
+		}
+		int code;
+		const char * message = gzerror(file, &code);
+		if (code != Z_OK && code != Z_STREAM_END)
+			throw std::runtime_error(message);
+		return !line.empty();
+	}
+};
 struct pcap_file_header
 {
 	uint32_t magic = 0xa1b2c3d4;
@@ -133,7 +205,7 @@ class native_session
 	std::vector<std::string> errors;
 	std::unique_ptr<usb_capture> capture;
 	gzFile output = nullptr;
-	std::ofstream clocks, device_changes;
+	gzip_jsonl clocks, device_changes;
 	uint64_t packet_count = 0, incomplete_payloads = 0, truncated_packets = 0, short_headers = 0;
 	uint64_t sync_count = 0, jump_count = 0;
 	int64_t max_read_uncertainty = 0, max_alignment_estimate = 0;
@@ -267,15 +339,16 @@ public:
 	{
 		utsname kernel{};
 		uname(&kernel);
-		manifest = {{"schema_version", 1}, {"session_id", directory.filename().string()}, {"logger_version", "2.0.0"}, {"start_realtime_ns", timestamp(CLOCK_REALTIME)}, {"end_realtime_ns", nullptr}, {"kernel", kernel.release}, {"actual_wivrn_build", WIVRN_LH_WIVRN_REV}, {"monado_revision", WIVRN_LH_MONADO_REV}, {"usb_capture_engine", "embedded_linux_usbmon_libpcap"}, {"libsurvive_revision", nullptr}, {"libsurvive_format_reference_revision", "23f03665070549f0c13a6e768dfaf7764f75c417"}, {"clock_domains", {{"poses", "CLOCK_MONOTONIC"}, {"usb", "CLOCK_REALTIME"}, {"sync", {"CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW"}}}}, {"configuration", {{"output_directory", directory.string()}, {"usb_and_pose", true}, {"sync_interval_s", 1}}}, {"calibration_files", nullptr}, {"calibration_metadata_available", false}, {"status", "recording"}, {"files_sha256", json::object()}, {"errors", json::array()}};
+		manifest = {{"schema_version", 1}, {"session_id", directory.filename().string()}, {"logger_version", "2.1.0"}, {"start_realtime_ns", timestamp(CLOCK_REALTIME)}, {"end_realtime_ns", nullptr}, {"kernel", kernel.release}, {"actual_wivrn_build", WIVRN_LH_WIVRN_REV}, {"monado_revision", WIVRN_LH_MONADO_REV}, {"usb_capture_engine", "embedded_linux_usbmon_libpcap"}, {"libsurvive_revision", nullptr}, {"libsurvive_format_reference_revision", "23f03665070549f0c13a6e768dfaf7764f75c417"}, {"clock_domains", {{"poses", "CLOCK_MONOTONIC"}, {"usb", "CLOCK_REALTIME"}, {"sync", {"CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW"}}}}, {"configuration", {{"output_directory", directory.string()}, {"usb_and_pose", true}, {"sync_interval_s", 1}}}, {"calibration_files", nullptr}, {"calibration_metadata_available", false}, {"status", "recording"}, {"files_sha256", json::object()}, {"errors", json::array()}};
 
 #ifdef WIVRN_LH_RECORDING_TEST
 		manifest["synthetic"] = true;
 		manifest["test_harness"] = true;
 #endif
+		manifest["stream_compression"] = {{"format", "gzip"}, {"level", 6}, {"jsonl_streams", {"poses.jsonl.gz", "events.jsonl.gz", "clock_sync.jsonl.gz", "usb_devices.jsonl.gz"}}};
 		save(directory / "manifest.json", manifest);
-		clocks.open(directory / "clock_sync.jsonl");
-		device_changes.open(directory / "usb_devices.jsonl");
+		clocks.open(directory / "clock_sync.jsonl.gz");
+		device_changes.open(directory / "usb_devices.jsonl.gz");
 		sample("start");
 		try
 		{
@@ -391,8 +464,8 @@ public:
 				if (!observed.contains({device["bus"].get<unsigned>(), device["address"].get<unsigned>()}))
 					unobserved.push_back(device);
 			json announcements = json::object();
-			std::ifstream events(directory / "events.jsonl");
-			for (std::string line; std::getline(events, line);)
+			gzip_input events(directory / "events.jsonl.gz");
+			for (std::string line; events.getline(line);)
 			{
 				auto event = json::parse(line, nullptr, false);
 				if (event.is_discarded())
