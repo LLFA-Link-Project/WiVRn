@@ -95,10 +95,14 @@ class FileTests(unittest.TestCase):
             source, dest = Path(d)/'in', Path(d)/'public'
             source.mkdir()
             for name in ('poses.jsonl', 'events.jsonl'):
-                (source/name).write_text('{"device_id":"PRIVATE_SERIAL"}\n')
+                (source/name).write_text(json.dumps(dict(device_id='PRIVATE_SERIAL', universe_id='PRIVATE_UNIVERSE',
+                                                        chaperone_transform={'position_m': [1, 2, 3]}))+'\n')
             (source/'clock_sync.jsonl').write_text('{}\n')
             r.export_public(source, dest)
-            self.assertNotIn('PRIVATE_SERIAL', gzip.open(dest/'poses.jsonl.gz', 'rt').read())
+            exported = gzip.open(dest/'poses.jsonl.gz', 'rt').read()
+            self.assertNotIn('PRIVATE_SERIAL', exported)
+            self.assertNotIn('PRIVATE_UNIVERSE', exported)
+            self.assertNotIn('chaperone_transform', json.loads(exported))
             self.assertFalse((dest/'usb.pcap.gz').exists())
             self.assertFalse(r.read(dest/'manifest.json')['usb_replay_available'])
 

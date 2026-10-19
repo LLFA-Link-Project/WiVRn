@@ -297,21 +297,22 @@ USB の設定 payload 自体にシリアル等が入る可能性があるので�
 公開 export は Pose/clock の共有用で、manifest に `usb_replay_available=false` を記録します。
 完全な replay 用原 session は私的に保持してください。
 
+ベースステーションの取得と相対 pose の比較は [ベースステーション診断](lighthouse-base-stations.md) を参照してください。
+
 ## 自動テストと実機手順
 
 ```sh
 # 自動テストのみ。通常の記録にはこの設定は不要。
 cmake -S . -B build-lh -DWIVRN_BUILD_TEST=ON
-cmake --build build-lh --target lh-recording-settings-test lh-recording-startup-test
-build-lh/tests/lh-recording-settings-test
+cmake --build build-lh --target lh-recording-startup-test
 # 実際の binary 配置は generator / CMAKE_RUNTIME_OUTPUT_DIRECTORY に従う。
 
-# Pose 単体テストの harness。MONADO_SRC は0016・0017適用済み checkout。
+# Pose 単体テストの harness。MONADO_SRC は固定 revision に全パッチ適用済みの checkout。
 c++ -std=c++17 -Wall -Wextra -Werror -pthread \
   -isystem "$MONADO_SRC/src/external/openvr_includes" \
   -I"$MONADO_SRC/src/xrt/drivers/steamvr_lh" \
   "$MONADO_SRC/src/xrt/drivers/steamvr_lh/reference_recorder.cpp" \
-  tools/lh-recorder/tests/pose_harness.cpp -o /tmp/lh-pose-harness
+  tools/lh-recorder/tests/pose_harness.cpp -lz -o /tmp/lh-pose-harness
 LH_POSE_HARNESS=/tmp/lh-pose-harness \
 LH_STARTUP_HARNESS="$PWD/build-lh/tests/lh-recording-startup-test" \
   python3 -m unittest discover -s tools/lh-recorder/tests -v

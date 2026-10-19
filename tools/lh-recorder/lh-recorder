@@ -353,6 +353,9 @@ def export_public(source, dest):
         with gzip.open(dest/(name+'.gz'), 'wt', encoding='utf-8', compresslevel=6) as f:
             for record in lines(source/name):
                 record['device_id'] = identity(record['device_id'])
+                # Diagnostic metadata includes a stable universe identity and room calibration.
+                record.pop('universe_id', None)
+                record.pop('chaperone_transform', None)
                 f.write(json.dumps(record, allow_nan=False)+'\n')
     with gzip.open(dest/'clock_sync.jsonl.gz', 'wb', compresslevel=6) as output:
         path = stream_path(source/'clock_sync.jsonl')
