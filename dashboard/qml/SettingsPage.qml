@@ -132,6 +132,27 @@ Kirigami.ScrollablePage {
                     toolTipText: i18n("Allows the use of lighthouse-based controllers and trackers.\nRequires SteamVR to be installed.\nDevices must be be powered on before connecting to WiVRn.\nAn external tool such as motoc is needed for calibration.")
                 }
             }
+            Controls.CheckBox {
+                id: lighthouse_stabilization_enabled
+                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                text: i18n("Use a base station as tracking origin (experimental)")
+            }
+            Controls.ComboBox {
+                id: lighthouse_reference_serial
+                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                enabled: lighthouse_stabilization_enabled.checked
+                editable: true
+                Layout.fillWidth: true
+                Kirigami.FormData.label: i18n("Reference base station serial:")
+                model: Settings.lighthouseReferenceCandidates
+                validator: RegularExpressionValidator { regularExpression: /[!-~]{0,255}/ }
+            }
+            Controls.Label {
+                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                text: i18n("Select a remembered base station or enter its serial. Reconnect the headset to apply. Calibrate again after enabling or changing the reference base station.")
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
             Controls.Label {
                 visible: Settings.steamvr_lh_supported
                 text: i18n("Lighthouse Recording")
@@ -362,6 +383,7 @@ Kirigami.ScrollablePage {
 
         Settings.debugGui = debug_gui.checked;
         Settings.steamVrLh = steamvr_lh.checked;
+        Settings.lighthouseReferenceSerial = lighthouse_stabilization_enabled.checked ? lighthouse_reference_serial.editText.trim() : "";
         Settings.lighthouseRecordingEnabled = lighthouse_recording_enabled.checked;
         Settings.lighthouseRecordingOutput = lighthouse_recording_output.text;
         if (lh_max_extrapolation_enabled.checked) {
@@ -379,6 +401,9 @@ Kirigami.ScrollablePage {
         select_game.load();
         debug_gui.checked = Settings.debugGui;
         steamvr_lh.checked = Settings.steamVrLh;
+        lighthouse_stabilization_enabled.checked = Settings.lighthouseReferenceSerial.length > 0;
+        lighthouse_reference_serial.currentIndex = Settings.lighthouseReferenceCandidates.indexOf(Settings.lighthouseReferenceSerial);
+        lighthouse_reference_serial.editText = Settings.lighthouseReferenceSerial;
         lighthouse_recording_enabled.checked = Settings.lighthouseRecordingEnabled;
         lighthouse_recording_output.text = Settings.lighthouseRecordingOutput;
         lh_max_extrapolation_enabled.checked = Settings.lhMaxExtrapolationEnabled;

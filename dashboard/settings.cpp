@@ -18,6 +18,7 @@
 
 #include "settings.h"
 #include "lighthouse_recording_defaults.h"
+#include "lighthouse_reference_settings.h"
 #include <QUrl>
 
 #include "escape_string.h"
@@ -125,6 +126,8 @@ void Settings::emitAllChanged()
 	steamVrLhChanged();
 	lighthouseRecordingEnabledChanged();
 	lighthouseRecordingOutputChanged();
+	lighthouseReferenceSerialChanged();
+	lighthouseReferenceCandidatesChanged();
 	lhMaxExtrapolationEnabledChanged();
 	lhMaxExtrapolationChanged();
 	lhStickDeadzoneChanged();
@@ -427,6 +430,42 @@ void Settings::set_steamVrLh(const bool & value)
 		steamVrLhChanged();
 }
 
+QString Settings::lighthouseReferenceSerial() const
+{
+	auto it = m_jsonSettings.find("lighthouse-reference-serial");
+	if (it != m_jsonSettings.end() && it->is_string() && wivrn::valid_lighthouse_serial(it->get<std::string>()))
+		return QString::fromStdString(it->get<std::string>());
+	return {};
+}
+
+QStringList Settings::lighthouseReferenceCandidates() const
+{
+	QStringList result;
+	for (const auto & serial: wivrn::lighthouse_reference_candidates(m_jsonSettings))
+		result.append(QString::fromStdString(serial));
+	return result;
+}
+
+void Settings::set_lighthouseReferenceSerial(const QString & value)
+{
+	const auto serial = value.trimmed();
+	if (!serial.isEmpty() && !wivrn::valid_lighthouse_serial(serial.toStdString()))
+		return;
+	const auto old = lighthouseReferenceSerial();
+	// Remember the old choice even when disabling or switching to a different base.
+	wivrn::remember_lighthouse_reference(m_jsonSettings, old.toStdString());
+	if (serial.isEmpty())
+		m_jsonSettings.erase("lighthouse-reference-serial");
+	else
+	{
+		m_jsonSettings["lighthouse-reference-serial"] = serial.toStdString();
+		wivrn::remember_lighthouse_reference(m_jsonSettings, serial.toStdString());
+	}
+	if (old != serial)
+		lighthouseReferenceSerialChanged();
+	lighthouseReferenceCandidatesChanged();
+}
+
 bool Settings::lighthouseRecordingEnabled() const
 {
 	auto it = m_jsonSettings.find("lighthouse-recording");
@@ -629,6 +668,16 @@ QString Settings::saveJson() const
 
 void Settings::save(wivrn_server * server)
 {
+	try
+	{
+		auto current = nlohmann::json::parse(server->jsonConfiguration().toStdString());
+		for (const auto & serial: wivrn::lighthouse_reference_candidates(current))
+			wivrn::remember_lighthouse_reference(m_jsonSettings, serial);
+	}
+	catch (const std::exception & e)
+	{
+		qWarning() << "Cannot merge Lighthouse candidates:" << e.what();
+	}
 	server->setJsonConfiguration(saveJson());
 	if (m_jsonSettings != m_originalSettings)
 		settingsChanged();

@@ -21,9 +21,10 @@
 #include <QJSValue>
 #include <QList>
 #include <QObject>
-#include <QUrl>
 #include <QPointF>
 #include <QSizeF>
+#include <QStringList>
+#include <QUrl>
 #include <nlohmann/json.hpp>
 #include <qqmlintegration.h>
 
@@ -79,6 +80,8 @@ public:
 	Q_PROPERTY(bool lighthouseRecordingEnabled READ lighthouseRecordingEnabled WRITE set_lighthouseRecordingEnabled NOTIFY lighthouseRecordingEnabledChanged)
 	Q_PROPERTY(QString lighthouseRecordingOutput READ lighthouseRecordingOutput WRITE set_lighthouseRecordingOutput NOTIFY lighthouseRecordingOutputChanged)
 	Q_INVOKABLE QString recordingDirectoryFromUrl(const QUrl & url) const;
+	Q_PROPERTY(QString lighthouseReferenceSerial READ lighthouseReferenceSerial WRITE set_lighthouseReferenceSerial NOTIFY lighthouseReferenceSerialChanged)
+	Q_PROPERTY(QStringList lighthouseReferenceCandidates READ lighthouseReferenceCandidates NOTIFY lighthouseReferenceCandidatesChanged)
 	Q_PROPERTY(bool steamVrLh READ steamVrLh WRITE set_steamVrLh NOTIFY steamVrLhChanged)
 	Q_PROPERTY(bool lhMaxExtrapolationEnabled READ lhMaxExtrapolationEnabled NOTIFY lhMaxExtrapolationEnabledChanged)
 	Q_PROPERTY(int64_t lhMaxExtrapolation READ lhMaxExtrapolation WRITE set_lhMaxExtrapolation NOTIFY lhMaxExtrapolationChanged)
@@ -100,6 +103,10 @@ public:
 	SETTER_GETTER_NOTIFY(bool, steamVrLh)
 	SETTER_GETTER_NOTIFY(bool, lighthouseRecordingEnabled)
 	SETTER_GETTER_NOTIFY(QString, lighthouseRecordingOutput)
+	SETTER_GETTER_NOTIFY(QString, lighthouseReferenceSerial)
+public:
+	QStringList lighthouseReferenceCandidates() const;
+	Q_SIGNAL void lighthouseReferenceCandidatesChanged();
 	SETTER_GETTER_NOTIFY(bool, lhMaxExtrapolationEnabled)
 	SETTER_GETTER_NOTIFY(int64_t, lhMaxExtrapolation)
 	SETTER_GETTER_NOTIFY(float, lhStickDeadzone)

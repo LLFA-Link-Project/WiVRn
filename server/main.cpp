@@ -32,16 +32,20 @@
 #include "active_runtime.h"
 #include "avahi_publisher.h"
 #include "driver/configuration.h"
-#include "lighthouse_recording.h"
 #include "driver/wivrn_connection.h"
 #include "exit_codes.h"
 #include "ipc_server_cb.h"
+#include "lighthouse_recording.h"
+#include "lighthouse_reference_settings.h"
 #include "protocol_version.h"
 #include "start_application.h"
 #include "start_systemd_unit.h"
 #include "utils/overloaded.h"
 #include "version.h"
 #include "wivrn_config.h"
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+#include "steamvr_lh_interface.h"
+#endif
 #include "wivrn_ipc.h"
 #include "wivrn_packets.h"
 #include "wivrn_sockets.h"
@@ -86,6 +90,8 @@ using namespace std::chrono_literals;
 
 static std::unique_ptr<TCPListener> listener;
 std::optional<wivrn::typed_socket<wivrn::UnixDatagram, from_monado::packets, to_monado::packets>> wivrn_ipc_socket_main_loop;
+// Main-loop owned: preserve discoveries even if an already-open settings dialog saves older JSON.
+std::vector<std::string> observed_lighthouse_references;
 std::optional<wivrn::typed_socket<wivrn::UnixDatagram, to_monado::packets, from_monado::packets>> wivrn_ipc_socket_monado;
 
 std::filesystem::path socket_path()
@@ -264,6 +270,21 @@ void start_server(configuration config)
 
 		setenv("XRT_LOG", "info", false);
 
+		// Snapshot for this runtime only. Dashboard/config OFF overrides inherited env.
+		setenv("LH_STABILIZE_REFERENCE_SERIAL", config.lighthouse_reference_serial.c_str(), true);
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+		steamvr_lh_set_reference_callback([](const char * serial) {
+			try
+			{
+				if (serial && wivrn::valid_lighthouse_serial(serial))
+					send_to_main(from_monado::lighthouse_reference{serial});
+			}
+			catch (const std::exception & e)
+			{
+				std::cerr << "Cannot report Lighthouse base station: " << e.what() << '\n';
+			}
+		});
+#endif
 		wivrn::start_lighthouse_recording(config);
 
 		wivrn::ipc_server_cb server_cb;
@@ -563,6 +584,18 @@ gboolean control_received(gint fd, GIOCondition condition, gpointer user_data)
 		                   [&](const wivrn::from_headset::stream_tab_changed & event) {
 			                   wivrn_server_set_client_tab(dbus_server, magic_enum::enum_name(event.tab).data());
 		                   },
+		                   [&](const from_monado::lighthouse_reference & event) {
+			                   try
+			                   {
+				                   auto json = nlohmann::json::parse(wivrn_server_get_json_configuration(dbus_server));
+				                   if (wivrn::remember_lighthouse_reference(json, event.serial))
+					                   wivrn_server_set_json_configuration(dbus_server, json.dump().c_str());
+			                   }
+			                   catch (const std::exception & e)
+			                   {
+				                   std::cerr << "Cannot remember Lighthouse base station: " << e.what() << '\n';
+			                   }
+		                   },
 		                   [&](const from_monado::server_error & e) {
 			                   wivrn_server_emit_server_error(dbus_server, e.where.c_str(), e.message.c_str());
 		                   },
@@ -752,6 +785,23 @@ void on_bitrate(WivrnServer * server, const GParamSpec * pspec, gpointer data)
 void on_json_configuration(WivrnServer * server, const GParamSpec * pspec, gpointer data)
 {
 	const char * json = wivrn_server_get_json_configuration(server);
+	try
+	{
+		auto incoming = nlohmann::json::parse(json);
+		auto merged = incoming;
+		for (const auto & serial: observed_lighthouse_references)
+			wivrn::remember_lighthouse_reference(merged, serial);
+		observed_lighthouse_references = wivrn::lighthouse_reference_candidates(merged);
+		if (merged != incoming)
+		{
+			wivrn_server_set_json_configuration(server, merged.dump().c_str());
+			return; // The resulting notify persists the merged document.
+		}
+	}
+	catch (const std::exception & e)
+	{
+		std::cerr << "Cannot merge remembered Lighthouse base stations: " << e.what() << '\n';
+	}
 
 	std::filesystem::path config = configuration::get_config_file();
 	std::filesystem::path config_new = config;

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "lighthouse_reference_settings.h"
 #include "settings.h"
 #include "wivrn_server.h"
 #include <QCoreApplication>
@@ -46,5 +47,34 @@ int main(int argc, char ** argv)
 	b.loadJson(R"({"lighthouse-recording":{"enabled":"invalid","output-directory":null}})");
 	require(!b.lighthouseRecordingEnabled());
 	require(b.lighthouseRecordingOutput() == "/tmp/lh-xdg-data/wivrn/lighthouse-recordings");
+	// Manual selection survives roundtrip; disabling keeps remembered choices.
+	a.loadJson("{}");
+	require(a.lighthouseReferenceSerial().isEmpty());
+	require(a.lighthouseReferenceCandidates().isEmpty());
+	a.set_lighthouseReferenceSerial(" LHB-A ");
+	a.set_lighthouseReferenceSerial("LHB-B");
+	a.set_lighthouseReferenceSerial("");
+	b.loadJson(a.saveJson());
+	require(b.lighthouseReferenceSerial().isEmpty());
+	require(b.lighthouseReferenceCandidates().contains("LHB-A"));
+	require(b.lighthouseReferenceCandidates().contains("LHB-B"));
+	b.set_lighthouseReferenceSerial("LHB-A");
+	a.loadJson(b.saveJson());
+	require(a.lighthouseReferenceSerial() == "LHB-A");
+	a.set_lighthouseReferenceSerial("invalid serial");
+	require(a.lighthouseReferenceSerial() == "LHB-A");
+	a.loadJson(R"({"unrelated":42,"lighthouse-reference-candidates":[null,1,"LHB-A","LHB-A","bad serial"]})");
+	require(a.lighthouseReferenceCandidates() == QStringList{"LHB-A"});
+	// Server discovery merges with the newest JSON and never changes selection.
+	auto config = nlohmann::json::parse(a.saveJson().toStdString());
+	require(wivrn::remember_lighthouse_reference(config, "LHB-B"));
+	require(!wivrn::remember_lighthouse_reference(config, "LHB-B"));
+	require(!config.contains("lighthouse-reference-serial"));
+	require(config["unrelated"] == 42);
+	require(!wivrn::remember_lighthouse_reference(config, "bad serial"));
+	a.loadJson(QString::fromStdString(config.dump()));
+	require(a.lighthouseReferenceCandidates() == (QStringList{"LHB-A", "LHB-B"}));
+	a.restore_defaults();
+	require(a.lighthouseReferenceSerial().isEmpty());
 	std::cout << "Settings defaults, serialization, restore, path decoding and immutable copies: passed\n";
 }

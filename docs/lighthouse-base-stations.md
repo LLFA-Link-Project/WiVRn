@@ -1,12 +1,67 @@
-# Lighthouse ベースステーションの取得と座標変化の診断
+# Lighthouse ベースステーションを基準にする実験機能
 
 この機能は、WiVRn と VIVE Tracker の空間合わせがずれる原因を測定するための実験機能です。
 ベースステーションとトラッカーの pose を同じ変換段階で記録し、座標変化が共通の剛体変換か確認します。
-この段階では pose の取得・記録と相対 pose の解析を実装します。座標の自動補正は行いません。
+実験用の安定化は、シリアルで固定した BS の位置・姿勢を使い、Lighthouse デバイス群を BS 原点・BS の軸へ変換します。
+WiVRn HMD の座標や motoc の校正 offset は変更しません。既定では無効です。
 
 `patches/monado/0019-d-steamvr_lh-record-diagnostic-base-stations.patch` を、
 `monado-rev` と既存のパッチ 0001–0018 に追加して適用します。
+安定化処理は `0020-d-steamvr_lh-stabilize-against-selected-base-station.patch` に含まれます。
 通常の WiVRn ビルドでは CMake がこのパッチも適用します。
+
+## 設定画面から有効にする
+
+1. 新しいサーバーと Dashboard をビルドして起動し、Lighthouse を有効にします。
+2. 初回は、補正 OFF のまま一度 HMD とトラッカーを接続します。ドライバが初期探索で通知した BS のシリアルを候補として自動保存します。記録機能は OFF でも構いません。
+3. Dashboard の設定を開き直し、`Use a base station as tracking origin (experimental)` を ON にします。
+4. `Reference base station serial` で候補を選びます。初回からシリアルが分かっていれば手入力もできます。保存した手入力も次回の候補になります。
+5. 設定を保存し、HMD を切断・再接続して反映します。**VR 内で位置合わせを使う場合は、初回の有効化後と基準 BS の変更後に motoc で校正し直してください。**
+   pose ログだけを使う遮蔽・復帰試験には motoc の再校正は不要です。
+6. 台とトラッカーを固定して静止状態を記録し、10秒程度遮蔽してから復帰後30秒程度を記録します。正常終了後に補正前後を比較します。
+
+候補が増えても選択した基準を自動では切り替えません。補正を OFF にしても候補は保持します。
+設定を開いている間に検出された候補は、その画面を保存しても失われません。選択肢の更新は画面を開き直すと反映されます。
+補正を OFF に戻した場合も座標規約が変わるため、その規約に合った校正を使ってください。
+
+保存先は通常 `~/.config/wivrn/config.json` です。`XDG_CONFIG_HOME` やサーバーの `-f` 指定がある場合はそちらを使います。
+`lighthouse-reference-serial` が選択中の基準、`lighthouse-reference-candidates` が記憶した候補の配列です。
+シリアルが空または未指定なら補正は無効です。候補だけでは補正を有効にしません。
+実行中の接続には設定を適用せず、次の Monado 起動時の設定を使います。
+サーバーは内部環境変数 `LH_STABILIZE_REFERENCE_SERIAL` で Monado に渡します。WiVRn では Dashboard/config の設定が優先されます。
+
+## 補正と基準喪失時の動作
+
+補正前の BS pose を B、デバイス pose を P とすると、`inverse(B) × P` を履歴へ入れます。
+毎回 BS 原点・BS の軸を使うため、起動ごとに初回 pose を新しい基準として保存する方式ではありません。
+固定した同じ BS と同じ座標規約を使う限り、再起動後も同じ規約です。保存する基準 pose ファイルはありません。
+規約の識別子は `base_station_origin_xyzw_v1` で、記録の manifest に選択シリアルとともに残します。
+既存のずれた motoc 校正を自動で修復する機能はありません。
+
+補正は、Lighthouse HMD を含め当該 Context の pose に適用します。WiVRn の HMD は別のデバイスなので対象外です。
+速度は補正の回転だけで変換し、補正の切り替えを移動速度にはしません。
+補正済みサンプルを履歴に入れ、その後で既存の予測処理を使います。過去の pose に現在の BS 値を掛け直しません。
+
+原 DriverPose の world transform が BS と一致し、かつ BS の pose 推定時刻・受信時刻が将来にない組を使います。
+world transform の一致は並進および quaternion 成分の距離がそれぞれ 1e-5 未満で判定し、quaternion の符号反転は同一の回転として扱います。
+BS 値は低頻度なので保持しますが、別の world transform のデバイスに古い値を適用しません。
+直近64回分の補正区間を保持します。
+
+| 記録・ログの状態 | 動作 |
+| --- | --- |
+| `waiting_for_reference` | 有効な基準が未取得。補正対象の pose は無効 |
+| `tracking` | 対応する有効な基準を使って補正 |
+| `held` | 最後の基準から1秒超、または基準の無効通知を受信。同じ world transform なら最後の補正を保持 |
+| `waiting_for_matching_reference` | world transform の切り替わり、未来の基準しかない等。対応する BS 更新が届くまで pose は無効 |
+| `reference_changed` | world transform 外で基準 pose が初回から5 cm超または約3°超変化。再起動まで pose を無効化 |
+
+指定した BS が見つからなくても、無補正や別の BS に自動では戻りません。
+`held` に保持時間の上限はありません。低頻度の固定基準を保持している状態であり、現在も観測できているという意味ではありません。
+world transform がデバイスごとに異なるドライバ構成では、一致条件を満たさず pose が無効になる可能性があります。
+
+`reference_changed` は基準の移動や非共通の再推定を疑うための検出です。
+単一の BS では、その物理移動が共通の world transform として表現された場合と座標系の変更を区別できません。
+複数 BS の相互整合性の自動判定は今回の補正には含めません。BS は固定したまま試験してください。
 
 ## 記録する
 
@@ -49,12 +104,14 @@
 | `composed_pose` | `chaperone × world_from_driver × raw_pose × driver_from_head` の position と orientation |
 | `composed_coordinate_frame` | `lighthouse_chaperone_before_tracking_origin` |
 | `chaperone_transform` | 当該 Context が使う chaperone の position と orientation |
+| `stabilization` | 補正有効時の状態、適用フラグ、基準推定時刻、補正変換、補正後 pose・速度・relation flags |
 | `universe_id` | 当該デバイスの `Prop_CurrentUniverseId_Uint64`。精度を失わない10進文字列。`"0"` は未取得 |
 
 pose オブジェクトは `position_m` と `orientation_xyzw` を持ちます。
 `composed_pose` は Monado の pose 合成で得た float 精度の値です。
 motoc の tracking-origin offset、WiVRn HMD の変換、アプリ向けの予測は含みません。
 ベースステーションも同じ合成処理を使い、診断 pose を予測履歴や公開デバイスには登録しません。
+`composed_pose` は常に補正前です。`stabilization.output_pose` は補正後・アプリ向け予測前で、同じキュー項目に保存します。
 原 pose と追加データは同じキュー項目に保存します。callback 内にファイル I/O や JSON/gzip 処理は追加しません。
 
 chaperone は Context の最初のデバイス作成時に一度だけ読み込み、Context 内で共有します。
@@ -116,7 +173,7 @@ python3 tools/lh-recorder/base_station_diagnostics.py /path/to/session \
 - 切り替わり中だけ相対 pose が飛ぶなら、両者の更新時刻と最大誤差を調べ、更新保留の方針を決めます。
 
 基準台を実際に動かした場合と座標系変更を区別できるかも確認します。
-これらの実測を使い、座標変化が共通の剛体変換かを確認してから補正方式を検討します。
+この実験機能は、まず単一の固定 BS を使った遮蔽・復帰で評価してください。校正の再利用精度は実機で確認します。
 WiVRn HMD 自身の再ローカライズやドリフトは、この方式での補正対象外です。
 
 ## 自動検証
@@ -127,8 +184,8 @@ WiVRn HMD 自身の再ローカライズやドリフトは、この方式での�
 ```sh
 cmake -S "$MONADO_SRC" -B /tmp/lh-reference-build -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DXRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE=ON
-cmake --build /tmp/lh-reference-build --target tests_steamvr_lh_references
-ctest --test-dir /tmp/lh-reference-build -R steamvr_lh_references --output-on-failure
+cmake --build /tmp/lh-reference-build --target tests_steamvr_lh_references tests_steamvr_lh_stabilization
+ctest --test-dir /tmp/lh-reference-build -R steamvr_lh_ --output-on-failure
 LH_REFERENCE_HARNESS=/tmp/lh-reference-build/tests/tests_steamvr_lh_references \
   python3 -m unittest discover -s tools/lh-recorder/tests -p test_base_station_diagnostics.py -v
 ```

@@ -341,6 +341,10 @@ public:
 		uname(&kernel);
 		manifest = {{"schema_version", 1}, {"session_id", directory.filename().string()}, {"logger_version", "2.1.0"}, {"start_realtime_ns", timestamp(CLOCK_REALTIME)}, {"end_realtime_ns", nullptr}, {"kernel", kernel.release}, {"actual_wivrn_build", WIVRN_LH_WIVRN_REV}, {"monado_revision", WIVRN_LH_MONADO_REV}, {"usb_capture_engine", "embedded_linux_usbmon_libpcap"}, {"libsurvive_revision", nullptr}, {"libsurvive_format_reference_revision", "23f03665070549f0c13a6e768dfaf7764f75c417"}, {"clock_domains", {{"poses", "CLOCK_MONOTONIC"}, {"usb", "CLOCK_REALTIME"}, {"sync", {"CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_MONOTONIC_RAW"}}}}, {"configuration", {{"output_directory", directory.string()}, {"usb_and_pose", true}, {"sync_interval_s", 1}}}, {"calibration_files", nullptr}, {"calibration_metadata_available", false}, {"status", "recording"}, {"files_sha256", json::object()}, {"errors", json::array()}};
 
+		const char *reference = getenv("LH_STABILIZE_REFERENCE_SERIAL");
+		manifest["configuration"]["lighthouse-reference-serial"] = reference ? reference : "";
+		manifest["configuration"]["lighthouse-reference-convention"] = "base_station_origin_xyzw_v1";
+
 #ifdef WIVRN_LH_RECORDING_TEST
 		manifest["synthetic"] = true;
 		manifest["test_harness"] = true;

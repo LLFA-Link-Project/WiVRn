@@ -94,3 +94,23 @@ class HostTests(unittest.TestCase):
                     self.assertAlmostEqual(actual, expected, places=5)
                 for actual in row['composed_pose']['orientation_xyzw']:
                     self.assertAlmostEqual(actual, .5, places=6)
+
+    def test_stabilized_output_preserves_raw_pose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            subprocess.run([os.environ['LH_REFERENCE_HARNESS'], 'stabilized'], check=True, timeout=15,
+                           env=dict(os.environ, HOME='/nonexistent-lh-test', LH_RECORDER_ENABLE='1', LH_RECORDER_OUTPUT=tmp),
+                           capture_output=True)
+            rows = list(d.records(path))
+            self.assertGreater(len(rows), 0)
+            for row in rows:
+                self.assertEqual(row['position_m'], [2, 0, 0])
+                self.assertAlmostEqual(row['composed_pose']['position_m'][0], 10, places=5)
+                normalized = row['stabilization']
+                self.assertTrue(normalized['applied'])
+                self.assertEqual(normalized['state'], 'tracking')
+                self.assertGreater(normalized['relation_flags'], 0)
+                for v in normalized['output_pose']['position_m']:
+                    self.assertAlmostEqual(v, 0, places=4)
+                for v, expected in zip(normalized['output_pose']['orientation_xyzw'], [0, 0, 0, 1]):
+                    self.assertAlmostEqual(v, expected, places=5)

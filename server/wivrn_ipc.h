@@ -42,6 +42,11 @@ struct headset_connected
 struct headset_disconnected
 {};
 
+struct lighthouse_reference
+{
+	std::string serial;
+};
+
 struct server_error
 {
 	std::string where;
@@ -55,7 +60,8 @@ using packets = std::variant<
         wivrn::from_headset::stream_tab_changed,
         headset_connected,
         headset_disconnected,
-        server_error>;
+        server_error,
+        lighthouse_reference>;
 } // namespace from_monado
 
 namespace to_monado
