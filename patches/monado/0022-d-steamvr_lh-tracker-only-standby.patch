@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] d/steamvr_lh: queue tracker-only standby on the frame thread
+
+Expose an internal driver helper for WiVRn's existing control socket.
+Use the original OpenVR device class to exclude controllers even when their
+roles or profiles change. Run EnterStandby outside devices_mut and on the
+frame thread to serialize against activation/reconnection and teardown.
+No libmonado API or OpenXR IPC protocol changes are needed.
+
+---
+
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+index 0510dd835..477610dba 100644
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -307,6 +307,16 @@ Device::~Device()
+ 	m_relation_history_destroy(&relation_hist);
+ }
+ 
++void
++Device::standby_tracker()
++{
++	// Use the original OpenVR class: a controller's role/profile can change,
++	// and must never make the power-off action target that controller.
++	if (recording_class == vr::TrackedDeviceClass_GenericTracker && activated && driver != nullptr) {
++		driver->EnterStandby();
++	}
++}
++
+ void
+ Device::set_driver(vr::ITrackedDeviceServerDriver *new_driver)
+ {
+diff --git a/src/xrt/drivers/steamvr_lh/device.hpp b/src/xrt/drivers/steamvr_lh/device.hpp
+index b5f4996e5..96d6a0cca 100644
+--- a/src/xrt/drivers/steamvr_lh/device.hpp
++++ b/src/xrt/drivers/steamvr_lh/device.hpp
+@@ -88,6 +88,9 @@ public:
+ 	//! Activation completed and the immutable IPC layout can be published.
+ 	bool activated{false};
+ 
++	//! Called on the frame thread, without Context::devices_mut held.
++	void standby_tracker();
++
+ 	virtual ~Device();
+ 
+ 	xrt_input *
+diff --git a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+index b4106358a..8d6735fd0 100644
+--- a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
++++ b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+@@ -102,6 +102,10 @@ private:
+ 	std::vector<PendingAddition> pending_additions;
+ 	std::mutex pending_addition_mut;
+ 
++	std::atomic<bool> tracker_standby_requested{false};
++
++	void process_tracker_standby();
++
+ 	void
+ 	process_pending_additions();
+ 
+@@ -164,6 +168,7 @@ public:
+ 	//! Call with devices_mut held.
+ 	void append_to_xsysd_locked(struct xrt_device *xdev);
+ 	void stop_frame_thread();
++	bool request_tracker_standby(struct xrt_system_devices *system);
+ 	const u_logging_level log_level;
+ 
+ 	void
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+index d956d1d6a..7bc3b1930 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+@@ -170,6 +170,7 @@ Context::create(const std::string &steam_install,
+ 			const std::chrono::time_point<std::chrono::steady_clock> next =
+ 			    std::chrono::steady_clock::now() + 10ms;
+ 			ctx->process_pending_additions();
++			ctx->process_tracker_standby();
+ 			for (vr::IServerTrackedDeviceProvider *const &provider : ctx->providers)
+ 				provider->RunFrame();
+ 			ctx->frame_thread_event.try_acquire_until(next);
+@@ -354,6 +355,49 @@ Context::setup_controller(const char *serial, vr::ITrackedDeviceServerDriver *dr
+ 	return true;
+ }
+ 
++bool
++Context::request_tracker_standby(struct xrt_system_devices *system)
++{
++	std::lock_guard lk(devices_mut);
++	if (stopping || xsysd == nullptr || (system != nullptr && xsysd != system)) {
++		return false;
++	}
++	tracker_standby_requested.store(true);
++	return true;
++}
++
++void
++Context::process_tracker_standby()
++{
++	if (!tracker_standby_requested.exchange(false)) {
++		return;
++	}
++
++	std::array<ControllerDevice *, MAX_CONTROLLERS> devices{};
++	{
++		std::lock_guard lk(devices_mut);
++		if (stopping) {
++			return;
++		}
++		std::copy(std::begin(controller), std::end(controller), devices.begin());
++	}
++	// Devices and their driver handles are changed on this frame thread.
++	// Teardown joins us before destroying them. EnterStandby can call back
++	// into Context, so never hold devices_mut across the proprietary call.
++	for (auto *device : devices) {
++		if (device != nullptr) {
++			device->standby_tracker();
++		}
++	}
++}
++
++extern "C" bool
++steamvr_lh_standby_trackers(struct xrt_system_devices *xsysd)
++{
++	auto ctx = g_context.load();
++	return ctx != nullptr && ctx->request_tracker_standby(xsysd);
++}
++
+ void
+ Context::process_pending_additions()
+ {
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+index af589a969..392028550 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+@@ -83,6 +83,13 @@ steamvr_lh_device_is_connected(struct xrt_device *xdev);
+ void
+ steamvr_lh_set_reference_callback(void (*callback)(const char *serial));
+ 
++/* Queue EnterStandby for all trackers, excluding controllers and base stations.
++ * NULL selects the active system. Returns false if the system is not active. Calls run on the driver frame thread.
++ * This is an internal driver interface, not part of libmonado or the OpenXR IPC.
++ */
++bool
++steamvr_lh_standby_trackers(struct xrt_system_devices *xsysd);
++
+ /* Stop device publication and join the driver frame thread before destroying devices. */
+ void
+ steamvr_lh_stop(struct xrt_system_devices *xsysd);

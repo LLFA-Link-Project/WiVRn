@@ -34,6 +34,9 @@ class wivrn_connection;
 
 extern std::unique_ptr<wivrn::wivrn_connection> connection;
 
+// Uses the active Lighthouse context, including while the headset reconnects.
+void standby_lighthouse_trackers();
+
 namespace from_monado
 {
 struct headset_connected
@@ -77,7 +80,10 @@ struct set_bitrate
 	uint32_t bitrate_bps;
 };
 
-using packets = std::variant<stop, disconnect, set_bitrate, wivrn::to_headset::stream_tab_change>;
+struct standby_lighthouse_trackers
+{};
+
+using packets = std::variant<stop, disconnect, set_bitrate, wivrn::to_headset::stream_tab_change, standby_lighthouse_trackers>;
 } // namespace to_monado
 
 extern std::optional<wivrn::typed_socket<wivrn::UnixDatagram, to_monado::packets, from_monado::packets>> wivrn_ipc_socket_monado;

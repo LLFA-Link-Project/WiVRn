@@ -581,6 +581,19 @@ void wivrn_server::disconnect_headset()
 		server_interface->Disconnect();
 }
 
+void wivrn_server::standby_lighthouse_trackers()
+{
+	if (!server_interface)
+		return;
+	auto * watcher = new QDBusPendingCallWatcher(server_interface->StandbyLighthouseTrackers(), this);
+	connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher]() {
+		QDBusPendingReply<> reply = *watcher;
+		if (reply.isError())
+			Q_EMIT serverError(serverErrorData(i18n("Turn off Lighthouse trackers"), reply.error().message()));
+		watcher->deleteLater();
+	});
+}
+
 void wivrn_server::copy_steam_command()
 {
 	QGuiApplication::clipboard()->setText(m_steamCommand);

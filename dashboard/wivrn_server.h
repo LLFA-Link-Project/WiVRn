@@ -344,6 +344,7 @@ public:
 	QList<openVRCompatLib> openVRCompat() const;
 
 	Q_INVOKABLE void disconnect_headset();
+	Q_INVOKABLE void standby_lighthouse_trackers();
 	Q_INVOKABLE void copy_steam_command();
 
 private:

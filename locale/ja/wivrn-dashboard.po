@@ -1040,3 +1040,19 @@ msgstr "変更は次回の Monado 起動時に反映されます。"
 #: dashboard/qml/SettingsPage.qml
 msgid "Select Lighthouse recording output directory"
 msgstr "Lighthouse 記録の出力先ディレクトリを選択"
+
+#: dashboard/qml/Main.qml
+msgid "Lighthouse trackers"
+msgstr "Lighthouse トラッカー"
+
+#: dashboard/qml/Main.qml
+msgid "Turn off all trackers"
+msgstr "すべてのトラッカーの電源を切る"
+
+#: dashboard/qml/Main.qml
+msgid "Turns off all Lighthouse trackers. Controllers remain on."
+msgstr "すべての Lighthouse トラッカーの電源を切ります。コントローラーの電源は切りません。"
+
+#: dashboard/wivrn_server.cpp
+msgid "Turn off Lighthouse trackers"
+msgstr "Lighthouse トラッカーの電源を切る"

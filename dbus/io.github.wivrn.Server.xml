@@ -27,6 +27,7 @@
 
 	<interface name="io.github.wivrn.Server">
 		<method name="Disconnect"/>
+		<method name="StandbyLighthouseTrackers"/>
 		<method name="Quit"/>
 		<method name="RevokeKey">
 			<arg type="s" name="PublicKey"/>

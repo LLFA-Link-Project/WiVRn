@@ -678,6 +678,29 @@ gboolean on_handle_quit(WivrnServer * skeleton, GDBusMethodInvocation * invocati
 	return G_SOURCE_CONTINUE;
 }
 
+gboolean on_handle_standby_lighthouse_trackers(WivrnServer * skeleton, GDBusMethodInvocation * invocation, gpointer user_data)
+{
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+	if (!wivrn_ipc_socket_main_loop || !wivrn_server_get_session_running(skeleton))
+	{
+		g_dbus_method_invocation_return_dbus_error(invocation, "io.github.wivrn.Server.NoSession", "No runtime session is active.");
+		return G_SOURCE_CONTINUE;
+	}
+	try
+	{
+		wivrn_ipc_socket_main_loop->send(to_monado::standby_lighthouse_trackers{});
+		g_dbus_method_invocation_return_value(invocation, nullptr);
+	}
+	catch (const std::exception & error)
+	{
+		g_dbus_method_invocation_return_dbus_error(invocation, "io.github.wivrn.Server.StandbyFailed", error.what());
+	}
+#else
+	g_dbus_method_invocation_return_dbus_error(invocation, "io.github.wivrn.Server.NotSupported", "Lighthouse support was not built.");
+#endif
+	return G_SOURCE_CONTINUE;
+}
+
 gboolean on_handle_revoke_key(WivrnServer * skeleton, GDBusMethodInvocation * invocation, gpointer user_data)
 {
 	GVariant * args = g_dbus_method_invocation_get_parameters(invocation);
@@ -929,6 +952,7 @@ void on_name_acquired(GDBusConnection * connection, const gchar * name, gpointer
 	}
 
 	g_signal_connect(dbus_server, "handle-set-client-tab", G_CALLBACK(on_handle_set_client_tab), NULL);
+	g_signal_connect(dbus_server, "handle-standby-lighthouse-trackers", G_CALLBACK(on_handle_standby_lighthouse_trackers), NULL);
 
 	wivrn_server_set_steam_command(dbus_server, steam_command().c_str());
 

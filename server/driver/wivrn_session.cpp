@@ -974,6 +974,11 @@ void wivrn_session::operator()(to_monado::set_bitrate && data)
 	compositor.set_bitrate(data.bitrate_bps);
 }
 
+void wivrn_session::operator()(to_monado::standby_lighthouse_trackers &&)
+{
+	standby_lighthouse_trackers();
+}
+
 void wivrn_session::operator()(to_headset::stream_tab_change && data)
 {
 	send_control(std::move(data));
