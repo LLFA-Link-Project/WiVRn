@@ -363,4 +363,10 @@ if(WIVRN_BUILD_TEST AND WIVRN_BUILD_SERVER AND WIVRN_FEATURE_STEAMVR_LIGHTHOUSE)
         WIVRN_LH_RECORDING_TEST=1
         WIVRN_LH_MONADO_REV="${LH_MONADO_ACTUAL_REV}"
         WIVRN_LH_WIVRN_REV="${LH_WIVRN_REV}")
+
+    add_executable(lh-hotplug-test ../tools/lh-recorder/tests/hotplug.cpp)
+    target_compile_features(lh-hotplug-test PRIVATE cxx_std_20)
+    set_target_properties(lh-hotplug-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    target_include_directories(lh-hotplug-test PRIVATE ${monado_SOURCE_DIR}/src/xrt/drivers/steamvr_lh ${monado_SOURCE_DIR}/src/xrt/base)
+    target_link_libraries(lh-hotplug-test PRIVATE drv_steamvr_lh xrt-external-openvr aux_util xrt-interfaces base)
 endif()

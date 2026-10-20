@@ -1,0 +1,1208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0900
+Subject: [PATCH] d/steamvr_lh, ipc: backport live device hotplug for WiVRn
+
+Based on Eidenz's Monado hotplug implementation through 47551c4b2 and the
+threading/chirality adaptations in 1ee366b8c from the local monado-1 fork.
+Keep the pinned upstream API and WiVRn recording/prediction patches.
+
+Publish devices only after WiVRn installs its space callback, retain a
+context even when startup finds no devices, and stop publication before
+session teardown. Refresh per-client device proxies before resolving new
+role indices. Callback hand trackers re-resolve their sources at locate.
+Keep upstream invalid-pose handling rather than importing the fork's
+hold-pose policy or its screenshot/UDCAP features.
+
+---
+
+diff --git a/src/xrt/base/b_hand_tracker.cpp b/src/xrt/base/b_hand_tracker.cpp
+index 25d40a4d2..23726673a 100644
+--- a/src/xrt/base/b_hand_tracker.cpp
++++ b/src/xrt/base/b_hand_tracker.cpp
+@@ -237,6 +237,17 @@ HandTracker::locate(xrt_space_overseer *xso,
+ 
+ 	*out_location = {};
+ 
++	// Callback sources can change when controllers are hotplugged or roles switch.
++	if (mMode == HandTrackerMode::Callback) {
++		mInputCount = 0;
++		mOutputCount = 0;
++		for (uint32_t i = 0; i < mInfo.requested_source_count; i++) {
++			xrt_result_t xret = addCallbackInputs(mInfo.requested_sources[i]);
++			if (xret != XRT_SUCCESS)
++				return xret;
++		}
++	}
++
+ 	xrt_hand_joint_set value = {};
+ 	const Source *active_source = nullptr;
+ 	for (uint32_t i = 0; i < mInputCount; i++) {
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+index d9d2fa81a..0510dd835 100644
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -57,14 +57,6 @@ DEBUG_GET_ONCE_FLOAT_OPTION(lh_override_ipd, "LH_OVERRIDE_IPD_MM", -1.0f)
+ DEBUG_GET_ONCE_BOOL_OPTION(lh_standby_on_exit, "LH_STANDBY_ON_EXIT", false)
+ DEBUG_GET_ONCE_NUM_OPTION(lh_max_extrapolation_ms, "LH_MAX_EXTRAPOLATION_MS", 50)
+ 
+-// Each device will have its own input class.
+-struct InputClass
+-{
+-	xrt_device_name name;
+-	const std::vector<xrt_input_name> poses;
+-	const std::unordered_map<std::string_view, xrt_input_name> non_poses;
+-};
+-
+ namespace {
+ using namespace std::string_view_literals;
+ // From https://github.com/ValveSoftware/openvr/blob/master/docs/Driver_API_Documentation.md#bone-structure
+@@ -315,6 +307,12 @@ Device::~Device()
+ 	m_relation_history_destroy(&relation_hist);
+ }
+ 
++void
++Device::set_driver(vr::ITrackedDeviceServerDriver *new_driver)
++{
++	this->driver = new_driver;
++}
++
+ Device::Device(const DeviceBuilder &builder)
+     : xrt_device({}), ctx(builder.ctx), chaperone(ctx->chaperone), driver(builder.driver),
+       recording_class(builder.device_class)
+@@ -343,10 +341,11 @@ Device::Device(const DeviceBuilder &builder)
+ 		auto *dev = static_cast<Device *>(xdev);
+ 		auto &ctx = dev->ctx;
+ 
+-		if (debug_get_bool_option_lh_standby_on_exit()) {
++		if (dev->driver && debug_get_bool_option_lh_standby_on_exit()) {
+ 			dev->driver->EnterStandby();
+ 		}
+-		dev->driver->Deactivate();
++		if (dev->driver)
++			dev->driver->Deactivate();
+ 
+ 		// The context outlives us until the last device releases it, and its frame thread keeps
+ 		// running that whole time - unregister before tearing anything down so it cannot reach us.
+@@ -388,8 +387,10 @@ Device::Device(const DeviceBuilder &builder)
+ void
+ ControllerDevice::set_input_class(const InputClass *input_class)
+ {
+-	// this should only be called once
+-	assert(inputs_vec.empty());
++	// Skip if already configured (pre-registered devices get this called again during Activate).
++	if (!inputs_vec.empty()) {
++		return;
++	}
+ 	this->input_class = input_class;
+ 
+ 	// reserve to ensure our pointers don't get invalidated
+@@ -403,6 +404,15 @@ ControllerDevice::set_input_class(const InputClass *input_class)
+ 		inputs_map.insert({path, &inputs_vec.back()});
+ 	}
+ 
++	// Pre-allocate an inactive hand tracking input slot so that input_count
++	// is stable before IPC clients connect. set_skeleton() will activate it
++	// with the correct hand when the skeleton data arrives. Trackers never
++	// get a skeleton, and the dead slot would make them get picked for the
++	// hand-tracking roles, so skip them.
++	if (debug_get_bool_option_lh_emulate_hand() && input_class->name != XRT_DEVICE_VIVE_TRACKER) {
++		inputs_vec.push_back({false, 0, XRT_INPUT_HT_CONFORMING_LEFT, {}});
++	}
++
+ 	this->inputs = inputs_vec.data();
+ 	this->input_count = inputs_vec.size();
+ }
+@@ -511,13 +521,15 @@ ControllerDevice::set_skeleton(std::span<const vr::VRBoneTransform_t> bones,
+ {
+ 	assert(bones.size() == eBone_Count);
+ 	generate_palm_pose_offset(bones, hand);
+-	if (!is_simulated && debug_get_bool_option_lh_emulate_hand()) {
+-		assert(inputs_vec.capacity() >= inputs_vec.size() + 1);
++	if (!is_simulated && debug_get_bool_option_lh_emulate_hand() && !has_hand_tracking) {
+ 		const xrt_input_name tracker_name =
+ 		    (hand == XRT_HAND_RIGHT) ? XRT_INPUT_HT_CONFORMING_RIGHT : XRT_INPUT_HT_CONFORMING_LEFT;
+-		inputs_vec.push_back({true, 0, tracker_name, {}});
+-		inputs_map.insert({path, &inputs_vec.back()});
+-		this->input_count = inputs_vec.size();
++		// Update the placeholder slot pre-allocated by set_input_class()
++		// rather than pushing a new entry (which would change input_count
++		// and break IPC clients that cached the old count).
++		auto &ht_input = inputs_vec.back();
++		ht_input = {true, 0, tracker_name, {}};
++		inputs_map.insert({path, &ht_input});
+ 		has_hand_tracking = true;
+ 	}
+ }
+@@ -673,10 +685,14 @@ Device::get_input_from_name(const std::string_view name)
+ void
+ ControllerDevice::set_haptic_handle(vr::VRInputComponentHandle_t handle)
+ {
+-	// this should only be set once
+-	assert(output == nullptr);
+ 	DEV_DEBUG("setting haptic handle for %" PRIu64, handle);
+ 	haptic_handle = handle;
++
++	// Output may already be set up from pre-registration.
++	if (output != nullptr) {
++		return;
++	}
++
+ 	xrt_output_name name;
+ 	switch (this->name) {
+ 	case XRT_DEVICE_VIVE_WAND: {
+@@ -1205,6 +1221,10 @@ operator|=(xrt_space_relation_flags &a, xrt_space_relation_flags b)
+ void
+ Device::update_pose(const vr::DriverPose_t &newPose, uint32_t index, int64_t capture_ns) const
+ {
++	// Track power state so role assignment can skip powered-off devices.
++	connected.store(newPose.deviceIsConnected, std::memory_order_relaxed);
++
++
+ 	xrt_space_relation relation = {};
+ 
+ 	if (newPose.poseIsValid) {
+@@ -1649,7 +1669,14 @@ ControllerDevice::handle_property_write(const vr::PropertyWrite_t &prop)
+ 			break;
+ 		}
+ 		case vr::TrackedControllerRole_OptOut: {
+-			this->device_type = XRT_DEVICE_TYPE_GENERIC_TRACKER;
++			// Only set tracker type for actual tracker devices.
++			// Index/Vive controllers may receive OptOut when the
++			// proprietary driver can't determine handedness.
++			if (this->name == XRT_DEVICE_VIVE_TRACKER) {
++				this->device_type = XRT_DEVICE_TYPE_GENERIC_TRACKER;
++			} else {
++				this->device_type = XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER;
++			}
+ 			break;
+ 		}
+ 		default: {
+diff --git a/src/xrt/drivers/steamvr_lh/device.hpp b/src/xrt/drivers/steamvr_lh/device.hpp
+index 558bb1bf2..b5f4996e5 100644
+--- a/src/xrt/drivers/steamvr_lh/device.hpp
++++ b/src/xrt/drivers/steamvr_lh/device.hpp
+@@ -28,11 +28,18 @@
+ #include <array>
+ #include <optional>
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <mutex>
+ 
+ class Context;
+-struct InputClass;
++
++struct InputClass
++{
++	xrt_device_name name;
++	const std::vector<xrt_input_name> poses;
++	const std::unordered_map<std::string_view, xrt_input_name> non_poses;
++};
+ 
+ struct DeviceBuilder
+ {
+@@ -74,6 +81,12 @@ public:
+ 
+ 	//! The component handles that are attached to this device.
+ 	std::vector<vr::VRInputComponentHandle_t> handles;
++	//! Whether the physical device is currently connected (powered on),
++	//! kept up to date from the deviceIsConnected flag of pose updates.
++	//! Disconnected devices stay in the system but lose role assignment.
++	mutable std::atomic<bool> connected{true};
++	//! Activation completed and the immutable IPC layout can be published.
++	bool activated{false};
+ 
+ 	virtual ~Device();
+ 
+@@ -108,6 +121,9 @@ public:
+ 		this->handles.push_back(h);
+ 		return h;
+ 	}
++	//! Set the proprietary driver handle (used when a known device is re-added by the driver).
++	void
++	set_driver(vr::ITrackedDeviceServerDriver *new_driver);
+ 
+ protected:
+ 	Device(const DeviceBuilder &builder);
+@@ -270,10 +286,11 @@ public:
+ 	xrt_result_t
+ 	notify_chirality(bool has_chirality, xrt_hand chirality);
+ 
+-protected:
+ 	void
+ 	set_input_class(const InputClass *input_class);
+ 
++
++protected:
+ 	void
+ 	generate_palm_pose_offset(std::span<const vr::VRBoneTransform_t> bones, xrt_hand hand);
+ 
+diff --git a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+index e461dc561..b4106358a 100644
+--- a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
++++ b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+@@ -18,6 +18,9 @@
+ #include <deque>
+ #include <mutex>
+ #include <thread>
++#include <string>
++#include <vector>
++#include "xrt/xrt_system.h"
+ 
+ #include "openvr_driver.h"
+ 
+@@ -87,6 +90,26 @@ private:
+ 	std::mutex event_queue_mut;
+ 	std::condition_variable event_popped;
+ 
++	//! Device additions queued by TrackedDeviceAdded, which may be called
++	//! from the lighthouse driver's background threads. Processed on the
++	//! frame thread to avoid data races on shared maps.
++	struct PendingAddition
++	{
++		std::string serial;
++		vr::ITrackedDeviceServerDriver *driver;
++		vr::ETrackedDeviceClass device_class;
++	};
++	std::vector<PendingAddition> pending_additions;
++	std::mutex pending_addition_mut;
++
++	void
++	process_pending_additions();
++
++	void
++	activate_pending(const PendingAddition &pa);
++
++
++
+ 	Device *
+ 	prop_container_to_device(vr::PropertyContainerHandle_t handle);
+ 
+@@ -124,12 +147,23 @@ public:
+ 	std::mutex devices_mut{};
+ 	class HmdDevice *hmd{nullptr};
+ 	class ControllerDevice *controller[16]{nullptr};
++	struct xrt_system_devices *xsysd{nullptr};
++	void (*device_added_cb)(struct xrt_device *, void *){nullptr};
++	void *device_added_ud{nullptr};
++	std::mutex roles_mutex;
++	xrt_system_roles cached_roles = XRT_SYSTEM_ROLES_INIT;
++	Device *device_from_xdev_locked(struct xrt_device *xdev);
++	xrt_result_t get_roles(struct xrt_system_devices *, struct xrt_system_roles *);
+ 
+ 	// One immutable chaperone snapshot shared by this Context's devices.
+ 	std::once_flag chaperone_once;
+ 	xrt_pose chaperone = XRT_POSE_IDENTITY;
+ 
+ 	bool in_setup{true};
++	bool stopping{false};
++	//! Call with devices_mut held.
++	void append_to_xsysd_locked(struct xrt_device *xdev);
++	void stop_frame_thread();
+ 	const u_logging_level log_level;
+ 
+ 	void
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+index b8d16fb56..d956d1d6a 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+@@ -87,6 +87,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(lh_diagnostic_references, "LH_DIAGNOSTIC_REFERENCES",
+ DEBUG_GET_ONCE_FLOAT_OPTION(lh_stick_deadzone, "LH_STICK_DEADZONE", 0)
+ 
+ static constexpr size_t MAX_CONTROLLERS = 16;
++std::atomic<std::shared_ptr<Context>> g_context;
+ std::atomic<void (*)(const char *)> reference_callback{nullptr};
+ 
+ 
+@@ -168,6 +169,7 @@ Context::create(const std::string &steam_install,
+ 			// SteamVR calls `RunFrame()` approximately every 10.1ms
+ 			const std::chrono::time_point<std::chrono::steady_clock> next =
+ 			    std::chrono::steady_clock::now() + 10ms;
++			ctx->process_pending_additions();
+ 			for (vr::IServerTrackedDeviceProvider *const &provider : ctx->providers)
+ 				provider->RunFrame();
+ 			ctx->frame_thread_event.try_acquire_until(next);
+@@ -184,10 +186,7 @@ Context::Context(const std::string &steam_install, const std::string &steamvr_in
+ 
+ Context::~Context()
+ {
+-	this->frame_thread_run.store(false);
+-	this->frame_thread_event.release();
+-	if (this->frame_thread.joinable())
+-		this->frame_thread.join();
++	this->stop_frame_thread();
+ 	// Stop each reference while its callback routing and properties still exist.
+ 	// Never hold devices_mut across a driver call.
+ 	for (auto &reference : references) {
+@@ -334,9 +333,49 @@ Context::setup_hmd(const char *serial, vr::ITrackedDeviceServerDriver *driver)
+ }
+ 
+ bool
+-Context::setup_controller(const char *serial,
+-                          vr::ITrackedDeviceServerDriver *driver,
++Context::setup_controller(const char *serial, vr::ITrackedDeviceServerDriver *driver,
+                           vr::ETrackedDeviceClass device_class)
++{
++	// Defer creation to the frame thread: TrackedDeviceAdded may be called
++	// from the lighthouse driver's background threads, and activating there
++	// would have the Activate() callbacks race the Update* callbacks that
++	// RunFrame() triggers (see process_pending_additions).
++	{
++		std::lock_guard lk(pending_addition_mut);
++		{
++			std::lock_guard lk(this->devices_mut);
++			if (this->stopping)
++				return false;
++			this->devices_in_setup++;
++		}
++		pending_additions.push_back({serial, driver, device_class});
++	}
++
++	return true;
++}
++
++void
++Context::process_pending_additions()
++{
++	std::vector<PendingAddition> to_add;
++	{
++		std::lock_guard lk(pending_addition_mut);
++		to_add.swap(pending_additions);
++	}
++
++	for (const PendingAddition &pa : to_add) {
++		activate_pending(pa);
++
++		{
++			std::lock_guard lk(this->devices_mut);
++			this->devices_in_setup--;
++		}
++		this->discover_cv.notify_all();
++	}
++}
++
++void
++Context::activate_pending(const PendingAddition &pa)
+ {
+ 	size_t device_idx = 0;
+ 	ControllerDevice *device = nullptr;
+@@ -344,34 +383,53 @@ Context::setup_controller(const char *serial,
+ 	{
+ 		std::lock_guard lk(this->devices_mut);
+ 
+-		// Find the first available slot for a new controller
++		// Re-add of a known device (e.g. dongle reconnect): reuse its slot.
+ 		for (; device_idx < MAX_CONTROLLERS; ++device_idx) {
+-			if (!controller[device_idx])
++			if (controller[device_idx] &&
++			    std::strcmp(controller[device_idx]->serial, pa.serial.c_str()) == 0) {
+ 				break;
++			}
+ 		}
+ 
+-		// Check if we've exceeded the maximum number of controllers
+-		if (device_idx == MAX_CONTROLLERS) {
+-			CTX_WARN("Attempted to activate more than %zu controllers - this is unsupported",
+-			         MAX_CONTROLLERS);
+-			return false;
+-		}
++		if (device_idx != MAX_CONTROLLERS) {
++			CTX_INFO("Device %s re-added, reactivating at slot %zu", pa.serial.c_str(), device_idx);
++			device = controller[device_idx];
++			device->set_driver(pa.driver);
++		} else {
++			// Find the first available slot for a new controller
++			for (device_idx = 0; device_idx < MAX_CONTROLLERS; ++device_idx) {
++				if (!controller[device_idx])
++					break;
++			}
++
++			// Check if we've exceeded the maximum number of controllers
++			if (device_idx == MAX_CONTROLLERS) {
++				CTX_WARN("Attempted to activate more than %zu controllers - this is unsupported",
++				         MAX_CONTROLLERS);
++				return;
++			}
+ 
+-		// Create the new controller and claim its slot before activating it: the driver writes its
+-		// properties and creates its input components from within Activate, and those callbacks have to
+-		// be able to find it.
+-		device = new ControllerDevice(device_idx + 1, DeviceBuilder{this->shared_from_this(), driver, serial,
+-		                                                            STEAM_INSTALL_DIR, device_class});
+-		controller[device_idx] = device;
++			// Create the new controller and claim its slot before activating it: the driver writes
++			// its properties and creates its input components from within Activate, and those
++			// callbacks have to be able to find it.
++			device =
++			    new ControllerDevice(device_idx + 1, DeviceBuilder{this->shared_from_this(), pa.driver,
++			                                                       pa.serial.c_str(), STEAM_INSTALL_DIR, pa.device_class});
++			controller[device_idx] = device;
++		}
+ 	}
+ 
+ 	// Never call into the driver with `devices_mut` held: it takes its own locks here, and calls back into
+ 	// us (WritePropertyBatch, TrackedDevicePoseUpdated, ...) from its own threads while holding them.
+-	vr::EVRInitError err = driver->Activate(device_idx + 1);
++	vr::EVRInitError err = pa.driver->Activate(device_idx + 1);
++
+ 	if (err != vr::VRInitError_None) {
+-		CTX_ERR("Activating controller failed: error %u", err);
+-		return false;
++		CTX_ERR("Activating controller %s failed: error %u", pa.serial.c_str(), err);
++		device->connected = false;
++		device->set_driver(nullptr); // OpenVR only requires Deactivate after successful activation.
++		return;
+ 	}
++	device->connected = true;
+ 
+ 	enum xrt_device_name name = device->name;
+ 	switch (name) {
+@@ -390,7 +448,15 @@ Context::setup_controller(const char *serial,
+ 	default: break;
+ 	}
+ 
+-	return true;
++	// Until steamvr_lh_create_devices has assembled the system it picks the
++	// device up from controller[]; after that this is a hotplug and we publish
++	// it ourselves.
++	std::lock_guard lk(this->devices_mut);
++	device->activated = true;
++	if (xsysd != nullptr) {
++		CTX_INFO("Hotplugged device %s at slot %zu", pa.serial.c_str(), device_idx);
++		append_to_xsysd_locked(device);
++	}
+ }
+ 
+ bool
+@@ -462,6 +528,32 @@ Context::wait_for_discover()
+ 	}
+ }
+ 
++void
++Context::append_to_xsysd_locked(struct xrt_device *xdev)
++{
++	uint32_t count = xsysd->static_xdev_count;
++	for (uint32_t i = 0; i < count; i++) {
++		if (xsysd->static_xdevs[i] == xdev) {
++			return; // Already published by steamvr_lh_create_devices.
++		}
++	}
++	if (count >= XRT_SYSTEM_MAX_DEVICES) {
++		CTX_WARN("Out of device slots, not exposing %s", xdev->str);
++		return;
++	}
++
++	// Let the owner add the device to the space overseer first, so poses
++	// can be located as soon as the device is visible.
++	if (device_added_cb != nullptr) {
++		device_added_cb(xdev, device_added_ud);
++	}
++
++	// Fill the slot, then publish it: IPC per-client threads read the
++	// count before the slots, so they never see an empty published slot.
++	xsysd->static_xdevs[count] = xdev;
++	__atomic_store_n(&xsysd->static_xdev_count, count + 1, __ATOMIC_RELEASE);
++}
++
+ void
+ Context::extend_discover()
+ {
+@@ -482,14 +574,11 @@ Context::TrackedDeviceAdded(const char *pchDeviceSerialNumber,
+ 	{
+ 		std::lock_guard lk(this->devices_mut);
+ 
+-		if (!this->in_setup) {
+-			// devices appearing after setup are not added to xrt_system_devices and would be leaked on
+-			// exit
+-			CTX_WARN("Cannot add device after setup; consider increasing LH_DISCOVER_WAIT_MS");
++		// Headsets are supplied by WiVRn; only controllers and trackers can appear later.
++		if (this->stopping || (!this->in_setup && eDeviceClass == vr::TrackedDeviceClass_HMD))
+ 			return false;
+-		}
+-
+-		this->extend_discover();
++		if (this->in_setup)
++			this->extend_discover();
+ 
+ 		// The setup below runs without `devices_mut` held, and publishes the device before the driver has
+ 		// finished activating it - keep discovery from ending in the middle of that.
+@@ -1058,6 +1147,192 @@ steamvr_lh_set_reference_callback(void (*callback)(const char *))
+ 	reference_callback.store(callback);
+ }
+ 
++Device *
++Context::device_from_xdev_locked(struct xrt_device *xdev)
++{
++	if (xdev == nullptr) {
++		return nullptr;
++	}
++	if (this->hmd != nullptr && xdev == this->hmd) {
++		return this->hmd;
++	}
++	for (ControllerDevice *controller : this->controller) {
++		if (controller != nullptr && xdev == controller) {
++			return controller;
++		}
++	}
++	return nullptr;
++}
++
++xrt_result_t
++Context::get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles)
++{
++	std::lock_guard devices_lock(this->devices_mut);
++	int head, eyes, face, left, right, gamepad;
++
++	// Devices can be appended concurrently from the frame thread: the count
++	// is published after the slot is filled, so load it once with acquire.
++	uint32_t count = __atomic_load_n(&xsysd->static_xdev_count, __ATOMIC_ACQUIRE);
++	if (count > XRT_SYSTEM_MAX_DEVICES) {
++		count = XRT_SYSTEM_MAX_DEVICES;
++	}
++
++	/*
++	 * Only consider devices this driver owns and that are currently
++	 * powered on. The builder may have appended foreign devices (e.g.
++	 * udcap gloves) which must not be cast to Device; those get their
++	 * roles from the builder's get_roles wrapper instead.
++	 */
++	struct xrt_device *candidates[XRT_SYSTEM_MAX_DEVICES] = {};
++	{
++		for (uint32_t i = 0; i < count; i++) {
++			Device *dev = device_from_xdev_locked(xsysd->static_xdevs[i]);
++			if (dev != nullptr && dev->connected.load(std::memory_order_relaxed)) {
++				candidates[i] = dev;
++			}
++		}
++	}
++
++	u_device_assign_xdev_roles(candidates, count, &head, &eyes, &face, &left, &right, &gamepad);
++
++	std::lock_guard lk(roles_mutex);
++
++	/*
++	 * Sticky roles: a powered-off device keeps its role until some
++	 * connected device can actually take it over. In-game hands freeze in
++	 * place instead of snapping back to the body, matching what users of
++	 * this fork are used to. The builder's glove wrapper checks
++	 * connectedness itself so gloves still take over from powered-off
++	 * controllers.
++	 */
++	if (left == XRT_DEVICE_ROLE_UNASSIGNED && cached_roles.left != XRT_DEVICE_ROLE_UNASSIGNED &&
++	    cached_roles.left < (int32_t)count) {
++		left = cached_roles.left;
++	}
++	if (right == XRT_DEVICE_ROLE_UNASSIGNED && cached_roles.right != XRT_DEVICE_ROLE_UNASSIGNED &&
++	    cached_roles.right < (int32_t)count) {
++		right = cached_roles.right;
++	}
++
++	if (left != cached_roles.left || right != cached_roles.right || gamepad != cached_roles.gamepad) {
++		CTX_INFO("Controller roles changed: left=%d right=%d gamepad=%d", left, right, gamepad);
++
++		cached_roles.generation_id++;
++
++		cached_roles.left = left;
++		cached_roles.right = right;
++		cached_roles.gamepad = gamepad;
++
++		cached_roles.left_profile =
++		    left != XRT_DEVICE_ROLE_UNASSIGNED ? xsysd->static_xdevs[left]->name : XRT_DEVICE_INVALID;
++		cached_roles.right_profile =
++		    right != XRT_DEVICE_ROLE_UNASSIGNED ? xsysd->static_xdevs[right]->name : XRT_DEVICE_INVALID;
++		cached_roles.gamepad_profile =
++		    gamepad != XRT_DEVICE_ROLE_UNASSIGNED ? xsysd->static_xdevs[gamepad]->name : XRT_DEVICE_INVALID;
++
++		// Tell the devices which hand they are now, as b_system_devices does for the boot roles.
++		if (left != XRT_DEVICE_ROLE_UNASSIGNED && xsysd->static_xdevs[left]->supported.notify_chirality) {
++			xrt_device_notify_chirality(xsysd->static_xdevs[left], true, XRT_HAND_LEFT);
++		}
++		if (right != XRT_DEVICE_ROLE_UNASSIGNED && xsysd->static_xdevs[right]->supported.notify_chirality) {
++			xrt_device_notify_chirality(xsysd->static_xdevs[right], true, XRT_HAND_RIGHT);
++		}
++	}
++
++	*out_roles = cached_roles;
++
++	return XRT_SUCCESS;
++}
++
++extern "C" xrt_result_t
++steamvr_lh_get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles)
++{
++	std::shared_ptr<Context> ctx = g_context.load();
++	if (ctx == nullptr) {
++		// No system has been created (yet, or any more).
++		return XRT_ERROR_DEVICE_CREATION_FAILED;
++	}
++
++	return ctx->get_roles(xsysd, out_roles);
++}
++
++extern "C" void
++steamvr_lh_set_device_added_callback(struct xrt_system_devices *xsysd,
++                                     steamvr_lh_device_added_callback callback,
++                                     void *userdata)
++{
++	(void)xsysd; // There is only ever one steamvr_lh system.
++	std::shared_ptr<Context> ctx = g_context.load();
++	if (ctx == nullptr) {
++		return;
++	}
++
++	std::lock_guard lk(ctx->devices_mut);
++	ctx->device_added_cb = callback;
++	ctx->device_added_ud = userdata;
++	ctx->xsysd = callback ? xsysd : nullptr;
++	if (callback) {
++		for (auto *device : ctx->controller) {
++			if (device != nullptr && device->activated)
++				ctx->append_to_xsysd_locked(device);
++		}
++	}
++}
++
++extern "C" bool
++steamvr_lh_device_is_connected(struct xrt_device *xdev)
++{
++	std::shared_ptr<Context> ctx = g_context.load();
++	if (ctx == nullptr) {
++		return false;
++	}
++
++	std::lock_guard lk(ctx->devices_mut);
++	Device *dev = ctx->device_from_xdev_locked(xdev);
++
++	// Not one of ours (e.g. a glove device).
++	return dev != nullptr && dev->connected.load(std::memory_order_relaxed);
++}
++
++extern "C" void
++steamvr_lh_stop(struct xrt_system_devices *xsysd)
++{
++	auto ctx = g_context.load();
++	if (!ctx)
++		return;
++	{
++		std::lock_guard lk(ctx->devices_mut);
++		ctx->stopping = true;
++		ctx->xsysd = nullptr;
++		ctx->device_added_cb = nullptr;
++	}
++	ctx->stop_frame_thread();
++	// Failed activations and devices beyond the system limit were never published.
++	// Release them here as xsysd's destructor cannot reach them.
++	for (auto *controller : ctx->controller) {
++		if (controller == nullptr)
++			continue;
++		bool published = false;
++		for (uint32_t i = 0; i < xsysd->static_xdev_count; i++)
++			published |= xsysd->static_xdevs[i] == controller;
++		if (!published) {
++			auto *device = static_cast<xrt_device *>(controller);
++			xrt_device_destroy(&device);
++		}
++	}
++	g_context.store(nullptr);
++}
++
++void
++Context::stop_frame_thread()
++{
++	this->frame_thread_run.store(false);
++	this->frame_thread_event.try_acquire();
++	this->frame_thread_event.release();
++	if (this->frame_thread.joinable())
++		this->frame_thread.join();
++}
++
+ extern "C" enum xrt_result
+ steamvr_lh_create_devices(struct xrt_prober *xp, struct xrt_system_devices *xsysd)
+ {
+@@ -1147,10 +1422,12 @@ steamvr_lh_create_devices(struct xrt_prober *xp, struct xrt_system_devices *xsys
+ 
+ 	// Include the controllers
+ 	for (size_t i = 0; i < MAX_CONTROLLERS; i++) {
+-		if (ctx->controller[i]) {
++		if (ctx->controller[i] && ctx->controller[i]->activated) {
+ 			xsysd->static_xdevs[xsysd->static_xdev_count++] = ctx->controller[i];
+ 		}
+ 	}
+ 
++	ctx->cached_roles.generation_id = 1;
++	g_context = ctx;
+ 	return xrt_result::XRT_SUCCESS;
+ }
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+index e55390766..af589a969 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+@@ -9,6 +9,8 @@
+ 
+ #include <xrt/xrt_results.h>
+ 
++#include <stdbool.h>
++
+ #pragma once
+ 
+ #ifdef __cplusplus
+@@ -28,11 +30,6 @@ extern "C" {
+  * @brief @ref drv_steamvr_lh files.
+  */
+ 
+-// Set before device discovery; callbacks run outside Context::devices_mut.
+-// Pass NULL to unregister after the Lighthouse runtime has stopped.
+-void
+-steamvr_lh_set_reference_callback(void (*callback)(const char *serial));
+-
+ /*!
+  * Creates the steamvr system devices.
+  *
+@@ -41,6 +38,54 @@ steamvr_lh_set_reference_callback(void (*callback)(const char *serial));
+ enum xrt_result
+ steamvr_lh_create_devices(struct xrt_prober *xp, struct xrt_system_devices *xsysd);
+ 
++/*!
++ * Controller role assignment that follows the devices which are powered on,
++ * including ones hotplugged after @ref steamvr_lh_create_devices. The builder
++ * installs this as @ref xrt_system_devices::get_roles in place of the static
++ * roles. Devices not owned by this driver never get a role here.
++ *
++ * @ingroup drv_steamvr_lh
++ */
++xrt_result_t
++steamvr_lh_get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles);
++
++/*!
++ * Callback invoked when a device is hotplugged after
++ * @ref steamvr_lh_create_devices returned, right before it is appended to
++ * @ref xrt_system_devices::static_xdevs.
++ *
++ * @ingroup drv_steamvr_lh
++ */
++typedef void (*steamvr_lh_device_added_callback)(struct xrt_device *xdev, void *userdata);
++
++/*!
++ * Register a callback for hotplugged devices, used by the builder to add new
++ * devices to the space overseer. Must be called before any client connects,
++ * once the system that @ref steamvr_lh_create_devices filled is open.
++ *
++ * @ingroup drv_steamvr_lh
++ */
++void
++steamvr_lh_set_device_added_callback(struct xrt_system_devices *xsysd,
++                                     steamvr_lh_device_added_callback callback,
++                                     void *userdata);
++
++/*!
++ * Whether @p xdev is a steamvr_lh device whose physical hardware is currently
++ * powered on. Returns false for devices not owned by this driver.
++ *
++ * @ingroup drv_steamvr_lh
++ */
++bool
++steamvr_lh_device_is_connected(struct xrt_device *xdev);
++
++
++void
++steamvr_lh_set_reference_callback(void (*callback)(const char *serial));
++
++/* Stop device publication and join the driver frame thread before destroying devices. */
++void
++steamvr_lh_stop(struct xrt_system_devices *xsysd);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/xrt/ipc/client/ipc_client_instance.c b/src/xrt/ipc/client/ipc_client_instance.c
+index 41d314bda..8a4097adf 100644
+--- a/src/xrt/ipc/client/ipc_client_instance.c
++++ b/src/xrt/ipc/client/ipc_client_instance.c
+@@ -164,32 +164,9 @@ ipc_client_instance_create_system(struct xrt_instance *xinst,
+ 
+ 	struct xrt_system_devices *xsysd = &icsd->base.base;
+ 
+-	// Query the server for the list of devices
+-	struct ipc_device_list device_list = {0};
+-	xret = ipc_call_system_devices_get_list(&ii->ipc_c, &device_list);
+-	IPC_CHK_AND_RET(&ii->ipc_c, xret, "ipc_call_system_devices_get_list");
+-
+-	// Create client devices for each device in the list
+-	uint32_t count = 0;
+-	struct ipc_client_tracking_origin_manager *ictom = &icsd->tracking_origin_manager;
+-	for (uint32_t i = 0; i < device_list.device_count; i++) {
+-		struct ipc_device_list_entry *entry = &device_list.devices[i];
+-
+-		// Create the appropriate device type
+-		if (entry->device_type == XRT_DEVICE_TYPE_HMD) {
+-			xsysd->static_xdevs[count] = ipc_client_hmd_create(&ii->ipc_c, ictom, entry->id);
+-		} else {
+-			xsysd->static_xdevs[count] = ipc_client_device_create(&ii->ipc_c, ictom, entry->id);
+-		}
+-
+-		// Check if device creation succeeded
+-		if (xsysd->static_xdevs[count] != NULL) {
+-			count++;
+-		} else {
+-			IPC_ERROR(&ii->ipc_c, "Failed to create device %u", i);
+-		}
+-	}
+-	xsysd->static_xdev_count = count;
++	// Query the server for the list of devices and create client proxies.
++	xret = ipc_client_system_devices_refresh(icsd);
++	IPC_CHK_AND_RET(&ii->ipc_c, xret, "ipc_client_system_devices_refresh");
+ 
+ #define SET_ROLE(ROLE)                                                                                                 \
+ 	do {                                                                                                           \
+diff --git a/src/xrt/ipc/client/ipc_client_system_devices.c b/src/xrt/ipc/client/ipc_client_system_devices.c
+index 0ce1a249c..528350f89 100644
+--- a/src/xrt/ipc/client/ipc_client_system_devices.c
++++ b/src/xrt/ipc/client/ipc_client_system_devices.c
+@@ -47,7 +47,20 @@ ipc_client_system_devices_get_roles(struct xrt_system_devices *xsysd, struct xrt
+ {
+ 	struct ipc_client_system_devices *usysd = ipc_system_devices(xsysd);
+ 
+-	return ipc_call_system_devices_get_roles(usysd->ipc_c, out_roles);
++	uint32_t device_count = 0;
++	xrt_result_t xret = ipc_call_system_devices_get_roles(usysd->ipc_c, out_roles, &device_count);
++	IPC_CHK_AND_RET(usysd->ipc_c, xret, "ipc_call_system_devices_get_roles");
++
++	/*
++	 * The server registered devices hotplugged after we connected, fetch
++	 * them before our caller resolves any role index pointing at them.
++	 */
++	if (device_count > xsysd->static_xdev_count) {
++		xret = ipc_client_system_devices_refresh(usysd);
++		IPC_CHK_ALWAYS_RET(usysd->ipc_c, xret, "ipc_client_system_devices_refresh");
++	}
++
++	return XRT_SUCCESS;
+ }
+ 
+ static xrt_result_t
+@@ -144,6 +157,8 @@ ipc_client_system_devices_destroy(struct xrt_system_devices *xsysd)
+ 
+ 	b_system_devices_close(&usysd->base.base);
+ 
++	os_mutex_destroy(&usysd->refresh_mutex);
++
+ 	free(usysd);
+ }
+ 
+@@ -154,6 +169,64 @@ ipc_client_system_devices_destroy(struct xrt_system_devices *xsysd)
+  *
+  */
+ 
++xrt_result_t
++ipc_client_system_devices_refresh(struct ipc_client_system_devices *icsd)
++{
++	struct xrt_system_devices *xsysd = &icsd->base.base;
++
++	os_mutex_lock(&icsd->refresh_mutex);
++
++	struct ipc_device_list device_list = {0};
++	xrt_result_t xret = ipc_call_system_devices_get_list(icsd->ipc_c, &device_list);
++	if (xret != XRT_SUCCESS) {
++		IPC_ERROR(icsd->ipc_c, "ipc_call_system_devices_get_list failed");
++		os_mutex_unlock(&icsd->refresh_mutex);
++		return xret;
++	}
++
++	uint32_t count = xsysd->static_xdev_count;
++	for (uint32_t i = 0; i < device_list.device_count; i++) {
++		struct ipc_device_list_entry *entry = &device_list.devices[i];
++		uint32_t id = entry->id;
++
++		if (id >= XRT_SYSTEM_MAX_DEVICES) {
++			IPC_ERROR(icsd->ipc_c, "Invalid device ID %u from server", id);
++			continue;
++		}
++
++		// Already created, the list is append-only so nothing to update.
++		if (xsysd->static_xdevs[id] != NULL) {
++			continue;
++		}
++
++		// Create the appropriate device type.
++		struct xrt_device *xdev = NULL;
++		if (entry->device_type == XRT_DEVICE_TYPE_HMD) {
++			xdev = ipc_client_hmd_create(icsd->ipc_c, &icsd->tracking_origin_manager, id);
++		} else {
++			xdev = ipc_client_device_create(icsd->ipc_c, &icsd->tracking_origin_manager, id);
++		}
++
++		if (xdev == NULL) {
++			IPC_ERROR(icsd->ipc_c, "Failed to create device %u", id);
++			os_mutex_unlock(&icsd->refresh_mutex);
++			return XRT_ERROR_DEVICE_CREATION_FAILED;
++		}
++
++		// Fill the slot before publishing it via the count below.
++		xsysd->static_xdevs[id] = xdev;
++		if (id + 1 > count) {
++			count = id + 1;
++		}
++	}
++
++	xsysd->static_xdev_count = count;
++
++	os_mutex_unlock(&icsd->refresh_mutex);
++
++	return XRT_SUCCESS;
++}
++
+ xrt_result_t
+ ipc_client_system_devices_create(struct ipc_connection *ipc_c, struct ipc_client_system_devices **out_icsd)
+ {
+@@ -168,6 +241,13 @@ ipc_client_system_devices_create(struct ipc_connection *ipc_c, struct ipc_client
+ 
+ 	icsd->ipc_c = ipc_c;
+ 
++	int ret = os_mutex_init(&icsd->refresh_mutex);
++	if (ret != 0) {
++		IPC_ERROR(ipc_c, "Failed to init refresh mutex");
++		free(icsd);
++		return XRT_ERROR_ALLOCATION;
++	}
++
+ 	// Initialize tracking origin manager
+ 	xrt_result_t xret = ipc_client_tracking_origin_manager_init(&icsd->tracking_origin_manager, ipc_c);
+ 	IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_client_tracking_origin_manager_init", err_free);
+@@ -177,6 +257,7 @@ ipc_client_system_devices_create(struct ipc_connection *ipc_c, struct ipc_client
+ 	return XRT_SUCCESS;
+ 
+ err_free:
++	os_mutex_destroy(&icsd->refresh_mutex);
+ 	free(icsd);
+ 
+ 	return xret;
+diff --git a/src/xrt/ipc/client/ipc_client_system_devices.h b/src/xrt/ipc/client/ipc_client_system_devices.h
+index 9d87d4d72..384952113 100644
+--- a/src/xrt/ipc/client/ipc_client_system_devices.h
++++ b/src/xrt/ipc/client/ipc_client_system_devices.h
+@@ -9,6 +9,8 @@
+ 
+ #pragma once
+ 
++#include "os/os_threading.h"
++
+ #include "b_system_devices.h"
+ #include "ipc_client_tracking_origin.h"
+ 
+@@ -34,8 +36,23 @@ struct ipc_client_system_devices
+ 	struct ipc_client_tracking_origin_manager tracking_origin_manager;
+ 
+ 	struct xrt_reference feature_use[XRT_DEVICE_FEATURE_MAX_ENUM];
++
++	//! Protects device list refreshes (hotplug).
++	struct os_mutex refresh_mutex;
+ };
+ 
++/*!
++ * Fetch the device list from the server and create client proxies for any
++ * device we don't have yet. Devices are placed at the index matching their
++ * server-side ID so that role indices resolve to the right device; existing
++ * proxies are never moved or destroyed (the device list is append-only).
++ *
++ * Called at connect to build the initial list, and from get_roles whenever
++ * the server reports more devices than we know about (hotplug).
++ */
++xrt_result_t
++ipc_client_system_devices_refresh(struct ipc_client_system_devices *icsd);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/xrt/ipc/server/ipc_server_handler.c b/src/xrt/ipc/server/ipc_server_handler.c
+index 5df3612b6..4faa07e3e 100644
+--- a/src/xrt/ipc/server/ipc_server_handler.c
++++ b/src/xrt/ipc/server/ipc_server_handler.c
+@@ -2565,6 +2565,10 @@ ipc_handle_device_is_form_factor_available(volatile struct ipc_client_state *ics
+ xrt_result_t
+ ipc_handle_system_devices_get_list(volatile struct ipc_client_state *ics, struct ipc_device_list *out_list)
+ {
++	// Pick up devices hotplugged after this client connected.
++	xrt_result_t xret = ipc_server_objects_register_xsysd_devices(ics, NULL);
++	IPC_CHK_AND_RET(ics->server, xret, "ipc_server_objects_register_xsysd_devices");
++
+ 	// Count and collect device types
+ 	uint32_t count = 0;
+ 	for (uint32_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
+@@ -2582,9 +2586,21 @@ ipc_handle_system_devices_get_list(volatile struct ipc_client_state *ics, struct
+ }
+ 
+ xrt_result_t
+-ipc_handle_system_devices_get_roles(volatile struct ipc_client_state *ics, struct xrt_system_roles *out_roles)
++ipc_handle_system_devices_get_roles(volatile struct ipc_client_state *ics,
++                                    struct xrt_system_roles *out_roles,
++                                    uint32_t *out_device_count)
+ {
+-	return xrt_system_devices_get_roles(ics->server->xsysd, out_roles);
++	/*
++	 * Register any devices hotplugged after this client connected, and
++	 * report the resulting count so the client knows to refresh its
++	 * device list (with a get_list call) before resolving role indices.
++	 */
++	xrt_result_t xret = xrt_system_devices_get_roles(ics->server->xsysd, out_roles);
++	IPC_CHK_AND_RET(ics->server, xret, "xrt_system_devices_get_roles");
++	xret = ipc_server_objects_register_xsysd_devices(ics, out_device_count);
++	IPC_CHK_AND_RET(ics->server, xret, "ipc_server_objects_register_xsysd_devices");
++
++	return XRT_SUCCESS;
+ }
+ 
+ xrt_result_t
+diff --git a/src/xrt/ipc/server/ipc_server_objects.c b/src/xrt/ipc/server/ipc_server_objects.c
+index 1e8a2fb72..3beb1a0aa 100644
+--- a/src/xrt/ipc/server/ipc_server_objects.c
++++ b/src/xrt/ipc/server/ipc_server_objects.c
+@@ -88,6 +88,59 @@ ipc_server_objects_get_xdev_id_or_add(volatile struct ipc_client_state *ics, str
+ 	return XRT_SUCCESS;
+ }
+ 
++xrt_result_t
++ipc_server_objects_register_xsysd_devices(volatile struct ipc_client_state *ics, uint32_t *out_count)
++{
++	struct xrt_system_devices *xsysd = ics->server->xsysd;
++
++	/*
++	 * Drivers may append devices while we read, but they fill in the
++	 * device slot before bumping the count, so reading the count once
++	 * here is safe; a concurrent append is simply picked up next call.
++	 */
++	uint32_t xsysd_count = __atomic_load_n(&xsysd->static_xdev_count, __ATOMIC_ACQUIRE);
++	if (xsysd_count > XRT_SYSTEM_MAX_DEVICES) {
++		xsysd_count = XRT_SYSTEM_MAX_DEVICES;
++	}
++
++	for (uint32_t i = 0; i < xsysd_count; i++) {
++		struct xrt_device *xdev = xsysd->static_xdevs[i];
++		if (xdev == NULL) {
++			continue;
++		}
++
++		// Populate the tracking origin.
++		uint32_t tracking_origin_id = 0;
++		xrt_result_t xret =
++		    ipc_server_objects_get_xtrack_id_or_add(ics, xdev->tracking_origin, &tracking_origin_id);
++		if (xret != XRT_SUCCESS) {
++			IPC_ERROR(ics->server, "Failed to get/add tracking origin ID for: '%s'",
++			          xdev->tracking_origin->name);
++			return xret;
++		}
++
++		// Populate the device, no-op if already registered.
++		uint32_t device_id = 0;
++		xret = ipc_server_objects_get_xdev_id_or_add(ics, xdev, &device_id);
++		if (xret != XRT_SUCCESS) {
++			IPC_ERROR(ics->server, "Failed to get/add device ID for: '%s'", xdev->str);
++			return xret;
++		}
++	}
++
++	if (out_count != NULL) {
++		uint32_t count = 0;
++		for (uint32_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
++			if (ics->objects.xdevs[i] != NULL) {
++				count++;
++			}
++		}
++		*out_count = count;
++	}
++
++	return XRT_SUCCESS;
++}
++
+ 
+ /*
+  *
+diff --git a/src/xrt/ipc/server/ipc_server_objects.h b/src/xrt/ipc/server/ipc_server_objects.h
+index 7ff4637fc..6a386b219 100644
+--- a/src/xrt/ipc/server/ipc_server_objects.h
++++ b/src/xrt/ipc/server/ipc_server_objects.h
+@@ -64,6 +64,22 @@ ipc_server_objects_get_xdev_and_validate(volatile struct ipc_client_state *ics,
+ xrt_result_t
+ ipc_server_objects_get_xdev_id_or_add(volatile struct ipc_client_state *ics, struct xrt_device *xdev, uint32_t *out_id);
+ 
++/*!
++ * Register all devices currently in the system with this client, must only be
++ * called from the per client thread. Devices already registered are left in
++ * place, so calling this repeatedly is cheap; it is used both at client
++ * connect and to pick up devices hotplugged after the client connected.
++ *
++ * @param ics The client state instance.
++ * @param out_count Optional, set to the number of devices registered for this
++ *                  client (matches what the device list call returns).
++ * @return XRT_SUCCESS on success, some other result on failure.
++ *
++ * @ingroup ipc_server
++ */
++xrt_result_t
++ipc_server_objects_register_xsysd_devices(volatile struct ipc_client_state *ics, uint32_t *out_count);
++
+ 
+ /*
+  *
+diff --git a/src/xrt/ipc/server/ipc_server_process.c b/src/xrt/ipc/server/ipc_server_process.c
+index 9ab982396..71374eef4 100644
+--- a/src/xrt/ipc/server/ipc_server_process.c
++++ b/src/xrt/ipc/server/ipc_server_process.c
+@@ -253,27 +253,9 @@ init_system_shm_state(struct ipc_server *s, volatile struct ipc_client_state *ic
+ 	 * Loop over all of the devices to pre-populate the device IDs,
+ 	 * this also populates the tracking origins.
+ 	 */
+-	for (size_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
+-		struct xrt_device *xdev = s->xsysd->static_xdevs[i];
+-		if (xdev == NULL) {
+-			continue;
+-		}
+-
+-		// Populate the tracking origin.
+-		uint32_t tracking_origin_id = 0;
+-		xret = ipc_server_objects_get_xtrack_id_or_add(ics, xdev->tracking_origin, &tracking_origin_id);
+-		if (xret != XRT_SUCCESS) {
+-			IPC_ERROR(s, "Failed to get/add tracking origin ID for: '%s'", xdev->tracking_origin->name);
+-			continue;
+-		}
+-
+-		// Assign a per-client slot index for IPC lookups (not xrt_device::id).
+-		uint32_t device_id = 0;
+-		xret = ipc_server_objects_get_xdev_id_or_add(ics, xdev, &device_id);
+-		if (xret != XRT_SUCCESS) {
+-			IPC_ERROR(s, "Failed to get/add device ID for: '%s'", xdev->str);
+-			continue;
+-		}
++	xret = ipc_server_objects_register_xsysd_devices(ics, NULL);
++	if (xret != XRT_SUCCESS) {
++		IPC_ERROR(s, "Failed to register devices for client");
+ 	}
+ 
+ 	// Setup the HMD
+diff --git a/src/xrt/ipc/shared/proto/50-system.json b/src/xrt/ipc/shared/proto/50-system.json
+index c954f8cd2..56ab722cd 100644
+--- a/src/xrt/ipc/shared/proto/50-system.json
++++ b/src/xrt/ipc/shared/proto/50-system.json
+@@ -55,7 +55,8 @@
+ 
+ 	"system_devices_get_roles": {
+ 		"out": [
+-			{"name": "system_roles", "type": "struct xrt_system_roles"}
++			{"name": "system_roles", "type": "struct xrt_system_roles"},
++			{"name": "device_count", "type": "uint32_t"}
+ 		]
+ 	},
+ 
+diff --git a/src/xrt/targets/libmonado/monado.c b/src/xrt/targets/libmonado/monado.c
+index 902696b52..7a4fc82a4 100644
+--- a/src/xrt/targets/libmonado/monado.c
++++ b/src/xrt/targets/libmonado/monado.c
+@@ -571,7 +571,8 @@ mnd_root_get_device_from_role(mnd_root_t *root, const char *role_name, int32_t *
+ 	}
+ 
+ 	struct xrt_system_roles roles;
+-	xrt_result_t xret = ipc_call_system_devices_get_roles(&root->ipc_c, &roles);
++	uint32_t device_count = 0;
++	xrt_result_t xret = ipc_call_system_devices_get_roles(&root->ipc_c, &roles, &device_count);
+ 	if (xret != XRT_SUCCESS) {
+ 		PE("Failed to get dynamic roles");
+ 		return MND_ERROR_OPERATION_FAILED;
