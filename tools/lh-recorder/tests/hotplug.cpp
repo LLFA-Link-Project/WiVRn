@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSL-1.0
 #include "b_hand_tracker.h"
+#include "device.hpp"
 #include "interfaces/context.hpp"
 #include "wivrn_ipc.h"
 #include "xrt/xrt_device.h"
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sys/socket.h>
 #include <thread>
 
@@ -93,6 +95,85 @@ static void test_standby_control_packet()
 	main.send(to_monado::standby_lighthouse_trackers{});
 	auto packet = monado.receive();
 	require(packet && std::holds_alternative<to_monado::standby_lighthouse_trackers>(*packet), "standby request crosses existing internal control socket");
+}
+
+// State notifications must survive the stale measurement timestamps seen on
+// real tracker disconnects, while stale coordinates must never enter history.
+static void test_tracker_pose_status(xrt_device * xdev)
+{
+	auto * device = static_cast<Device *>(xdev);
+	constexpr int64_t second = 1000000000;
+	int64_t arrival = 200 * second;
+	vr::DriverPose_t pose{};
+	pose.qRotation.w = pose.qWorldFromDriverRotation.w = pose.qDriverFromHeadRotation.w = 1;
+	pose.deviceIsConnected = pose.poseIsValid = true;
+	pose.result = vr::TrackingResult_Running_OK;
+	pose.vecPosition[0] = 1;
+	auto send = [&] {
+		device->update_pose(pose, 0, arrival);
+		arrival += second;
+	};
+	auto locate = [&] {
+		xrt_space_relation relation{};
+		require(xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_TRACKER_POSE, arrival, &relation) == XRT_SUCCESS, "locate tracker pose");
+		return relation;
+	};
+	constexpr auto valid = XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+	constexpr auto tracked = XRT_SPACE_RELATION_POSITION_TRACKED_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
+	send();
+	require((locate().relation_flags & (valid | tracked)) == (valid | tracked), "normal tracker is valid and tracked");
+
+	// Reject these coordinates, but propagate the current tracking state.
+	pose.poseTimeOffset = -72.870883224;
+	pose.vecPosition[0] = 99;
+	pose.result = vr::TrackingResult_Running_OutOfRange;
+	send();
+	auto held = locate();
+	require((held.relation_flags & valid) == valid, "tracking loss retains a valid last pose");
+	require(!(held.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT), "stale tracking-loss notification clears position tracked");
+	require(held.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT, "rotation-only tracking retains orientation tracked");
+	require(held.pose.position.x == 1, "stale tracking-loss coordinates are rejected");
+
+	// The actual power-off recordings first reported result 101 with a valid pose.
+	pose.result = vr::TrackingResult_Calibrating_OutOfRange;
+	pose.poseTimeOffset = std::numeric_limits<double>::quiet_NaN();
+	send();
+	held = locate();
+	require((held.relation_flags & valid) == valid && !(held.relation_flags & tracked), "nonfinite tracking-loss time retains validity but clears tracking");
+	pose.poseTimeOffset = -72.870883224;
+	pose.deviceIsConnected = false; // Even if the driver leaves poseIsValid set.
+	send();
+	require(locate().relation_flags == 0, "stale disconnect clears all location flags");
+
+	pose.deviceIsConnected = true;
+	pose.poseIsValid = false;
+	pose.poseTimeOffset = std::numeric_limits<double>::quiet_NaN();
+	send();
+	require(locate().relation_flags == 0, "invalid timestamp cannot resurrect a disconnected pose");
+
+	pose.poseIsValid = true;
+	send();
+	require(locate().relation_flags == 0, "reconnect without a usable measurement cannot revive the old pose");
+	pose.result = vr::TrackingResult_Running_OK;
+	pose.poseTimeOffset = 0;
+	pose.vecPosition[0] = 2;
+	send();
+	require((locate().relation_flags & (valid | tracked)) == (valid | tracked), "tracker recovers after reconnect");
+	require(locate().pose.position.x == 2, "reconnected tracker uses the new pose");
+
+	pose.poseIsValid = false;
+	pose.poseTimeOffset = -143.696311;
+	send();
+	require(locate().relation_flags == 0, "stale invalid pose clears location flags while still connected");
+
+	pose.poseIsValid = true;
+	pose.poseTimeOffset = 0;
+	send();
+	require((locate().relation_flags & tracked) == tracked, "tracking recovers after an invalid pose");
+	pose.poseIsValid = false;
+	pose.poseTimeOffset = std::numeric_limits<double>::infinity();
+	send();
+	require(locate().relation_flags == 0, "nonfinite timestamp does not discard invalidation");
 }
 
 static void test_hand_source_switch()
@@ -189,6 +270,7 @@ int main()
 	require(ctx->TrackedDeviceAdded("tracker-A", vr::TrackedDeviceClass_GenericTracker, &tracker), "late tracker accepted");
 	wait_for([&] { return __atomic_load_n(&devices.static_xdev_count, __ATOMIC_ACQUIRE) == 3; });
 	require(devices.static_xdevs[2]->device_type == XRT_DEVICE_TYPE_GENERIC_TRACKER, "tracker stays out of controller roles");
+	test_tracker_pose_status(devices.static_xdevs[2]);
 	require(ctx->get_roles(&devices, &roles) == XRT_SUCCESS && roles.left == 1, "tracker preserves hand roles");
 	// A controller that reports a tracker profile must still be excluded by its
 	// original OpenVR class, as must every normal and powered-off controller.

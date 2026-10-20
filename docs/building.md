@@ -45,6 +45,14 @@ required. When using `FETCHCONTENT_SOURCE_DIR_MONADO`, apply the complete
 `patches/monado` series to that source yourself; CMake skips patching overridden
 sources. Pointing it directly at the unmodified fork is not supported.
 
+Lighthouse pose state is propagated even when a callback's measurement timestamp
+is too old or nonfinite to enter pose history. A disconnected device or an invalid
+pose clears the location flags returned through OpenXR and discards its old pose
+history. Valid but untracked poses retain their validity while losing the relevant
+tracking flags. Recovery after invalidation requires a usable new measurement.
+These flags describe pose availability and tracking; OpenXR does not expose the
+physical power state through this path.
+
 The hardware-independent hotplug regression test can be built and run with:
 
 ```bash
@@ -52,6 +60,9 @@ cmake -B build-server . -DWIVRN_BUILD_TEST=ON -DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 cmake --build build-server --target lh-hotplug-test
 ./build-server/tests/lh-hotplug-test
 ```
+
+This also checks stale tracking-loss and disconnect notifications, nonfinite
+timestamps, rejection of stale coordinates, and pose recovery after reconnection.
 
 For a few dependencies it is possible to select system or embedded versions, check `WIVRN_USE_SYSTEM_xxx` in case you are missing dependencies.
 

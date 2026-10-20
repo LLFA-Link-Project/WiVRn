@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 20 Oct 2026 17:00:00 +0900
+Subject: [PATCH] d/steamvr_lh: propagate pose state independently of measurement age
+
+Tracker power-off callbacks can carry poseTimeOffset values tens of seconds
+in the past. The monotonic relation history rejects these samples, leaving
+a valid last pose visible through OpenXR even after disconnection.
+
+Keep the latest callback flags under the pose history mutex and mask queried
+relations with them, including tracking loss with stale or nonfinite times.
+Clear history when the pose becomes invalid so reconnecting cannot revive
+old coordinates. Disconnection overrides poseIsValid. Keep timestamp checks
+for coordinates and preserve the original raw recording.
+
+---
+
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -874,6 +874,10 @@
+ 			                            out_relation);
+ 		}
+ 	}
++	// A stale measurement timestamp may have kept the latest state notification
++	// out of history. Never report tracking/validity that it has revoked.
++	out_relation->relation_flags = static_cast<xrt_space_relation_flags>(
++	    out_relation->relation_flags & latest_pose_flags);
+ }
+ 
+ xrt_result_t
+@@ -1237,7 +1241,7 @@
+ 
+ 	xrt_space_relation relation = {};
+ 
+-	if (newPose.poseIsValid) {
++	if (newPose.poseIsValid && newPose.deviceIsConnected) {
+ 		// The pose is known to be valid but that alone is not enough to say whether the data comes from
+ 		// inference or if it represents actively tracked position and orientation data. Furthermore we avoid
+ 		// assumptions regarding the validity of time-derivatives until we know that they're based on tracked
+@@ -1356,11 +1360,21 @@
+ 	if (recording_class == vr::TrackedDeviceClass_TrackingReference)
+ 		return;
+ 
++	// Connection and tracking state describe this callback, not the age of
++	// its coordinates. Power-off notifications can carry offsets tens of
++	// seconds in the past, and must still invalidate the published pose.
++	std::lock_guard<std::mutex> lock(pose_history_mutex);
++	latest_pose_flags = relation.relation_flags;
++	if (latest_pose_flags == XRT_SPACE_RELATION_BITMASK_NONE) {
++		// Do not resurrect a pre-disconnect pose on reconnection before a
++		// usable new measurement arrives.
++		m_relation_history_clear(relation_hist);
++		return;
++	}
+ 	if (!valid_time)
+ 		return; // Raw invalid timestamps remain recorded, never cast to int64 or inserted.
+ 
+ 	// Keep the transform tied to the latest accepted history sample.
+-	std::lock_guard<std::mutex> lock(pose_history_mutex);
+ 	if (m_relation_history_push(relation_hist, &relation, ts)) {
+ 		latest_driver_from_head = local;
+ 	}
+diff --git a/src/xrt/drivers/steamvr_lh/device.hpp b/src/xrt/drivers/steamvr_lh/device.hpp
+--- a/src/xrt/drivers/steamvr_lh/device.hpp
++++ b/src/xrt/drivers/steamvr_lh/device.hpp
+@@ -156,6 +156,8 @@
+ 	// Protect history pushes/queries together with their local-transform metadata.
+ 	mutable std::mutex pose_history_mutex;
+ 	mutable xrt_pose latest_driver_from_head = XRT_POSE_IDENTITY;
++	// Latest callback state, independent of whether its measurement time enters history.
++	mutable xrt_space_relation_flags latest_pose_flags = XRT_SPACE_RELATION_BITMASK_NONE;
+ 	vr::ITrackedDeviceServerDriver *driver;
+ 	vr::ETrackedDeviceClass recording_class;
+ 	mutable const char *last_stabilization_state{nullptr};
