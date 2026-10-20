@@ -1,0 +1,785 @@
+From 6c4fc3aa80dada6bd855d1fa90b34393dec41e90 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 20 Oct 2026 16:07:21 +0900
+Subject: [PATCH] d/steamvr_lh: stabilize against selected base station
+
+Opt in with an explicit reference serial and normalize composed poses to the base origin before history insertion. Match sample timestamps and world transforms to bounded reference epochs, hold known corrections for static references, and invalidate unmatched generations. Rotate velocities without introducing correction-switch velocities. Preserve raw recordings and add corrected poses and state diagnostics. Report reference discovery through a startup callback for WiVRn candidate persistence. Test math, generation boundaries, real Device history/prediction, loss and restart behavior.
+---
+ src/xrt/drivers/CMakeLists.txt                |   1 +
+ .../steamvr_lh/base_station_stabilizer.cpp    | 120 ++++++++
+ .../steamvr_lh/base_station_stabilizer.hpp    |  45 +++
+ src/xrt/drivers/steamvr_lh/device.cpp         |  47 ++-
+ src/xrt/drivers/steamvr_lh/device.hpp         |   1 +
+ .../drivers/steamvr_lh/interfaces/context.hpp |   2 +
+ .../drivers/steamvr_lh/reference_recorder.cpp |  24 ++
+ .../drivers/steamvr_lh/reference_recorder.hpp |   6 +
+ src/xrt/drivers/steamvr_lh/steamvr_lh.cpp     |  16 +-
+ .../drivers/steamvr_lh/steamvr_lh_interface.h |   5 +
+ tests/CMakeLists.txt                          |  10 +-
+ tests/tests_steamvr_lh_references.cpp         |  14 +-
+ tests/tests_steamvr_lh_stabilization.cpp      | 272 ++++++++++++++++++
+ 13 files changed, 549 insertions(+), 14 deletions(-)
+ create mode 100644 src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp
+ create mode 100644 src/xrt/drivers/steamvr_lh/base_station_stabilizer.hpp
+ create mode 100644 tests/tests_steamvr_lh_stabilization.cpp
+
+diff --git a/src/xrt/drivers/CMakeLists.txt b/src/xrt/drivers/CMakeLists.txt
+index a2f7cbd7d..c24392015 100644
+--- a/src/xrt/drivers/CMakeLists.txt
++++ b/src/xrt/drivers/CMakeLists.txt
+@@ -640,6 +640,7 @@ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
+ 		steamvr_lh/steamvr_lh.cpp
+ 		steamvr_lh/device.cpp
+ 		steamvr_lh/reference_recorder.cpp
++		steamvr_lh/base_station_stabilizer.cpp
+ 		steamvr_lh/interfaces/driver_manager.cpp
+ 		steamvr_lh/interfaces/iobuffer.cpp
+ 		steamvr_lh/interfaces/resources.cpp
+diff --git a/src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp b/src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp
+new file mode 100644
+index 000000000..4f3136d0b
+--- /dev/null
++++ b/src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp
+@@ -0,0 +1,120 @@
++// Copyright 2026, OpenAI
++// SPDX-License-Identifier: BSL-1.0
++#include "base_station_stabilizer.hpp"
++#include "math/m_api.h"
++#include <algorithm>
++#include <cmath>
++
++namespace {
++bool
++valid_pose(const xrt_pose &p)
++{
++	const auto &q = p.orientation;
++	const float norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
++	return std::isfinite(p.position.x) && std::isfinite(p.position.y) && std::isfinite(p.position.z) &&
++	       std::isfinite(norm) && std::abs(norm - 1.f) < 0.002f;
++}
++float
++position_distance(const xrt_pose &a, const xrt_pose &b)
++{
++	float x = a.position.x - b.position.x, y = a.position.y - b.position.y, z = a.position.z - b.position.z;
++	return std::sqrt(x * x + y * y + z * z);
++}
++float
++quaternion_distance(const xrt_pose &a, const xrt_pose &b)
++{
++	const auto &q = a.orientation;
++	const auto &r = b.orientation;
++	// Antipodal quaternions encode the same rotation.
++	float sign = q.x * r.x + q.y * r.y + q.z * r.z + q.w * r.w < 0 ? -1.f : 1.f;
++	float x = q.x - sign * r.x, y = q.y - sign * r.y, z = q.z - sign * r.z, w = q.w - sign * r.w;
++	return std::sqrt(x * x + y * y + z * z + w * w);
++}
++bool
++same_world(const xrt_pose &a, const xrt_pose &b)
++{
++	// This is an explicit coordinate-generation guard, not a tracking noise filter.
++	return position_distance(a, b) < 1e-5f && quaternion_distance(a, b) < 1e-5f;
++}
++} // namespace
++
++void
++BaseStationStabilizer::observe(
++    const xrt_pose &base, const xrt_pose &world, bool valid, int64_t time_ns, int64_t capture_ns)
++{
++	if (!enabled() || capture_ns < last_observation_ns)
++		return;
++	if (count && time_ns > 0 && time_ns < epochs[(next + epochs.size() - 1) % epochs.size()].time_ns)
++		return;
++	last_observation_ns = capture_ns;
++	reference_valid = valid && time_ns > 0 && valid_pose(base) && valid_pose(world);
++	if (!reference_valid || inconsistent)
++		return;
++	xrt_pose inverse_world, local;
++	math_pose_invert(&world, &inverse_world);
++	math_pose_transform(&inverse_world, &base, &local);
++	if (count == 0) {
++		reference_in_driver = local;
++	} else if (position_distance(reference_in_driver, local) > .05f ||
++	           quaternion_distance(reference_in_driver, local) > .02618f) {
++		// About 5 cm / 3 degrees outside the common world transform: a moved
++		// reference or non-rigid re-estimation must not be silently normalized.
++		inconsistent = true;
++		return;
++	}
++	last_valid_capture_ns = capture_ns;
++	if (count) {
++		const auto &last = epochs[(next + epochs.size() - 1) % epochs.size()];
++		if (time_ns < last.time_ns)
++			return;
++		if (same_world(last.world, world) && position_distance(last.base, base) < 1e-6f &&
++		    quaternion_distance(last.base, base) < 1e-6f)
++			return; // Static bases may announce the same pose very rarely.
++	}
++	auto &epoch = epochs[next];
++	epoch = {world, base, {}, time_ns, capture_ns};
++	// Canonical BS origin/axes: same convention after restart, no per-boot B_ref.
++	math_pose_invert(&base, &epoch.correction);
++	next = (next + 1) % epochs.size();
++	count = std::min(count + 1, epochs.size());
++}
++
++BaseStationStabilizer::Result
++BaseStationStabilizer::apply(xrt_space_relation &relation,
++                             const xrt_pose &world,
++                             int64_t time_ns,
++                             int64_t capture_ns) const
++{
++	Result result;
++	if (!enabled())
++		return result;
++	result.state =
++	    inconsistent ? "reference_changed" : (count ? "waiting_for_matching_reference" : "waiting_for_reference");
++	if (!inconsistent && valid_pose(world) && time_ns > 0) {
++		for (size_t i = 0; i < count; ++i) {
++			const auto &epoch = epochs[(next + epochs.size() - 1 - i) % epochs.size()];
++			if (epoch.time_ns > time_ns || epoch.capture_ns > capture_ns || !same_world(epoch.world, world))
++				continue;
++			// A newer reference observed by this callback supersedes old generations.
++			// Historical samples remain eligible by their own timestamps.
++			const auto &latest = epochs[(next + epochs.size() - 1) % epochs.size()];
++			if (time_ns >= latest.time_ns && !same_world(latest.world, world))
++				break;
++			result.state =
++			    reference_valid && capture_ns - last_valid_capture_ns <= 1000000000LL ? "tracking" : "held";
++			result.applied = true;
++			result.correction = epoch.correction;
++			result.reference_time_ns = epoch.time_ns;
++			math_pose_transform(&epoch.correction, &relation.pose, &relation.pose);
++			math_quat_rotate_vec3(&epoch.correction.orientation, &relation.linear_velocity,
++			                      &relation.linear_velocity);
++			math_quat_rotate_vec3(&epoch.correction.orientation, &relation.angular_velocity,
++			                      &relation.angular_velocity);
++			return result;
++		}
++	}
++	// Never publish a valid uncorrected pose while waiting; no automatic fallback
++	// to a different base or to the unnormalized coordinate system.
++	relation = XRT_SPACE_RELATION_ZERO;
++	return result;
++}
+diff --git a/src/xrt/drivers/steamvr_lh/base_station_stabilizer.hpp b/src/xrt/drivers/steamvr_lh/base_station_stabilizer.hpp
+new file mode 100644
+index 000000000..6cc56d0c4
+--- /dev/null
++++ b/src/xrt/drivers/steamvr_lh/base_station_stabilizer.hpp
+@@ -0,0 +1,45 @@
++// Copyright 2026, OpenAI
++// SPDX-License-Identifier: BSL-1.0
++#pragma once
++#include "xrt/xrt_defines.h"
++#include <array>
++#include <cstdint>
++#include <string>
++#include <utility>
++
++// All calls are serialized by Context::devices_mut. Corrections are applied to
++// samples before history insertion, never to a prediction using today's base pose.
++class BaseStationStabilizer
++{
++public:
++	explicit BaseStationStabilizer(std::string serial = {}) : serial(std::move(serial)) {}
++	const std::string serial;
++	bool
++	enabled() const
++	{
++		return !serial.empty();
++	}
++	struct Result
++	{
++		const char *state{"disabled"};
++		bool applied{false};
++		xrt_pose correction = XRT_POSE_IDENTITY;
++		int64_t reference_time_ns{0};
++	};
++	void
++	observe(const xrt_pose &base, const xrt_pose &world, bool valid, int64_t time_ns, int64_t capture_ns);
++	Result
++	apply(xrt_space_relation &relation, const xrt_pose &world, int64_t time_ns, int64_t capture_ns) const;
++
++private:
++	struct Epoch
++	{
++		xrt_pose world, base, correction;
++		int64_t time_ns, capture_ns;
++	};
++	std::array<Epoch, 64> epochs{};
++	size_t count{0}, next{0};
++	xrt_pose reference_in_driver = XRT_POSE_IDENTITY;
++	bool reference_valid{false}, inconsistent{false};
++	int64_t last_observation_ns{0}, last_valid_capture_ns{0};
++};
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+index 3c889c1bd..d9d2fa81a 100644
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -1130,12 +1130,6 @@ copy_pose(const vr::HmdQuaternion_t &orientation, const double (&position)[3])
+ void
+ Device::init_chaperone(const std::string &steam_install)
+ {
+-	static bool initialized = false;
+-	if (initialized)
+-		return;
+-
+-	initialized = true;
+-
+ 	// Lighthouse driver seems to create a lighthousedb.json and a chaperone_info.vrchap (which is json)
+ 	// We will use the known_universes from the lighthousedb.json to match to a universe from chaperone_info.vrchap
+ 
+@@ -1273,12 +1267,48 @@ Device::update_pose(const vr::DriverPose_t &newPose, uint32_t index, int64_t cap
+ 	math_quat_rotate_vec3(&chaperone.orientation, &relation.linear_velocity, &relation.linear_velocity);
+ 	math_quat_rotate_vec3(&chaperone.orientation, &relation.angular_velocity, &relation.angular_velocity);
+ 
++	const xrt_space_relation uncorrected = relation;
++	const int64_t arrival_ns = capture_ns ? capture_ns : chrono_timestamp_ns();
++	const long double timestamp =
++	    static_cast<long double>(arrival_ns) + static_cast<long double>(newPose.poseTimeOffset) * 1e9L;
++	const bool valid_time = std::isfinite(timestamp) && timestamp > 0 && timestamp < INT64_MAX;
++	const int64_t ts = valid_time ? static_cast<int64_t>(timestamp) : 0;
++	xrt_pose composed_world;
++	math_pose_transform(&chaperone, &world, &composed_world);
++	if (ctx->stabilizer.enabled() && recording_class == vr::TrackedDeviceClass_TrackingReference &&
++	    ctx->stabilizer.serial == serial) {
++		ctx->stabilizer.observe(relation.pose, composed_world,
++		                        valid_time && newPose.deviceIsConnected && newPose.poseIsValid &&
++		                            newPose.result == vr::TrackingResult_Running_OK,
++		                        ts, arrival_ns);
++	}
++	const auto stabilization = ctx->stabilizer.apply(relation, composed_world, ts, arrival_ns);
++	if (ctx->stabilizer.enabled() && stabilization.state != last_stabilization_state) {
++		DEV_INFO("BS stabilization %s: %s (reference %s)", serial, stabilization.state,
++		         ctx->stabilizer.serial.c_str());
++		last_stabilization_state = stabilization.state;
++	}
++
+ 	// Snapshot the exact pre-calibration composition used by this callback. File
+ 	// serialization and compression stay on the recorder's bounded writer queue.
+ 	if (capture_ns) {
+ 		lighthouse_reference::PoseContext metadata{};
+ 		metadata.device_class = int(recording_class);
+-		const auto &p = relation.pose;
++		const auto &p = uncorrected.pose;
++		auto pack = [](const xrt_pose &pose) -> std::array<double, 7> {
++			return {pose.position.x,    pose.position.y,    pose.position.z,   pose.orientation.x,
++			        pose.orientation.y, pose.orientation.z, pose.orientation.w};
++		};
++		metadata.stabilization_state = stabilization.state;
++		metadata.stabilization_applied = stabilization.applied;
++		metadata.stabilized = pack(relation.pose);
++		metadata.correction = pack(stabilization.correction);
++		metadata.reference_time_ns = stabilization.reference_time_ns;
++		metadata.stabilized_flags = relation.relation_flags;
++		metadata.stabilized_linear_velocity = {relation.linear_velocity.x, relation.linear_velocity.y,
++		                                       relation.linear_velocity.z};
++		metadata.stabilized_angular_velocity = {relation.angular_velocity.x, relation.angular_velocity.y,
++		                                        relation.angular_velocity.z};
+ 		metadata.composed = {p.position.x,    p.position.y,    p.position.z,   p.orientation.x,
+ 		                     p.orientation.y, p.orientation.z, p.orientation.w};
+ 		metadata.chaperone = {chaperone.position.x,    chaperone.position.y,    chaperone.position.z,
+@@ -1296,7 +1326,8 @@ Device::update_pose(const vr::DriverPose_t &newPose, uint32_t index, int64_t cap
+ 	if (recording_class == vr::TrackedDeviceClass_TrackingReference)
+ 		return;
+ 
+-	const int64_t ts = chrono_timestamp_ns() + time_s_to_ns(newPose.poseTimeOffset);
++	if (!valid_time)
++		return; // Raw invalid timestamps remain recorded, never cast to int64 or inserted.
+ 
+ 	// Keep the transform tied to the latest accepted history sample.
+ 	std::lock_guard<std::mutex> lock(pose_history_mutex);
+diff --git a/src/xrt/drivers/steamvr_lh/device.hpp b/src/xrt/drivers/steamvr_lh/device.hpp
+index f23ceaf2e..558bb1bf2 100644
+--- a/src/xrt/drivers/steamvr_lh/device.hpp
++++ b/src/xrt/drivers/steamvr_lh/device.hpp
+@@ -139,6 +139,7 @@ private:
+ 	mutable xrt_pose latest_driver_from_head = XRT_POSE_IDENTITY;
+ 	vr::ITrackedDeviceServerDriver *driver;
+ 	vr::ETrackedDeviceClass recording_class;
++	mutable const char *last_stabilization_state{nullptr};
+ 
+ 	void
+ 	init_chaperone(const std::string &steam_install);
+diff --git a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+index fd97c0b13..e461dc561 100644
+--- a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
++++ b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+@@ -22,6 +22,7 @@
+ #include "openvr_driver.h"
+ 
+ #include "settings.hpp"
++#include "../base_station_stabilizer.hpp"
+ #include "resources.hpp"
+ #include "iobuffer.hpp"
+ #include "driver_manager.hpp"
+@@ -46,6 +47,7 @@ class Context final : public xrt_tracking_origin,
+ {
+ public:
+ 	Settings settings;
++	BaseStationStabilizer stabilizer;
+ 
+ 	struct Vec2Components
+ 	{
+diff --git a/src/xrt/drivers/steamvr_lh/reference_recorder.cpp b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+index 6785f727b..354237fcc 100644
+--- a/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
++++ b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+@@ -264,6 +264,30 @@ namespace {
+ 								     "chaperone_before_tracking_origin\""
+ 								  << ",\"universe_id\":"
+ 								  << quoted(std::to_string(s.context.universe).c_str());
++								if (std::strcmp(s.context.stabilization_state,
++								                "disabled")) {
++									o << ",\"stabilization\":{\"state\":"
++									  << quoted(s.context.stabilization_state)
++									  << ",\"applied\":"
++									  << (s.context.stabilization_applied ? "true"
++									                                      : "false")
++									  << ",\"reference_pose_time_ns\":"
++									  << s.context.reference_time_ns
++									  << ",\"correction\":"
++									  << pose_json(s.context.correction)
++									  << ",\"output_pose\":"
++									  << pose_json(s.context.stabilized)
++									  << ",\"relation_flags\":"
++									  << s.context.stabilized_flags
++									  << ",\"linear_velocity_m_s\":"
++									  << vector(s.context.stabilized_linear_velocity
++									                .data())
++									  << ",\"angular_velocity_rad_s\":"
++									  << vector(
++									         s.context.stabilized_angular_velocity
++									             .data())
++									  << "}";
++								}
+ 							}
+ 							o << "}";
+ 							if (emit(poses, o.str()))
+diff --git a/src/xrt/drivers/steamvr_lh/reference_recorder.hpp b/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
+index bd85faff9..87578a38f 100644
+--- a/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
++++ b/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
+@@ -9,6 +9,12 @@ struct PoseContext
+ 	// Position (metres), then orientation (xyzw), before tracking-origin calibration.
+ 	std::array<double, 7> composed{}, chaperone{};
+ 	int device_class{-1};
++	const char *stabilization_state{"disabled"}; // static string literals, valid until writer drain
++	bool stabilization_applied{false};
++	std::array<double, 7> stabilized{}, correction{};
++	std::array<double, 3> stabilized_linear_velocity{}, stabilized_angular_velocity{};
++	int64_t reference_time_ns{0};
++	uint32_t stabilized_flags{0};
+ 	uint64_t universe{0}; // zero: unknown/not provided
+ };
+ // Initialize during startup/discovery, never the high-rate pose callback.
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+index 49561f00a..5ff388d0d 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+@@ -87,6 +87,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(lh_diagnostic_references, "LH_DIAGNOSTIC_REFERENCES",
+ DEBUG_GET_ONCE_FLOAT_OPTION(lh_stick_deadzone, "LH_STICK_DEADZONE", 0)
+ 
+ static constexpr size_t MAX_CONTROLLERS = 16;
++std::atomic<void (*)(const char *)> reference_callback{nullptr};
+ 
+ 
+ // ~/.steam/root is a symlink to where the Steam root is
+@@ -176,8 +177,9 @@ Context::create(const std::string &steam_install,
+ }
+ 
+ Context::Context(const std::string &steam_install, const std::string &steamvr_install, u_logging_level level)
+-    : settings(steam_install, steamvr_install, this), resources(level, steamvr_install), log_level(level),
+-      frame_thread_run(true), frame_thread()
++    : settings(steam_install, steamvr_install, this),
++      stabilizer(getenv("LH_STABILIZE_REFERENCE_SERIAL") ? getenv("LH_STABILIZE_REFERENCE_SERIAL") : ""),
++      resources(level, steamvr_install), log_level(level), frame_thread_run(true), frame_thread()
+ {}
+ 
+ Context::~Context()
+@@ -512,7 +514,9 @@ Context::TrackedDeviceAdded(const char *pchDeviceSerialNumber,
+ 	}
+ 	case vr::TrackedDeviceClass_TrackingReference: {
+ 		CTX_INFO("Found lighthouse base station: %s", pchDeviceSerialNumber);
+-		if (debug_get_bool_option_lh_diagnostic_references())
++		if (auto callback = reference_callback.load())
++			callback(pchDeviceSerialNumber);
++		if (debug_get_bool_option_lh_diagnostic_references() || stabilizer.enabled())
+ 			added = setup_tracking_reference(pchDeviceSerialNumber, pDriver);
+ 		break;
+ 	}
+@@ -1049,6 +1053,12 @@ Context::Log(const char *pchLogMessage)
+ }
+ // NOLINTEND(bugprone-easily-swappable-parameters)
+ 
++extern "C" void
++steamvr_lh_set_reference_callback(void (*callback)(const char *))
++{
++	reference_callback.store(callback);
++}
++
+ extern "C" enum xrt_result
+ steamvr_lh_create_devices(struct xrt_prober *xp, struct xrt_system_devices *xsysd)
+ {
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+index 9eb703285..e55390766 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh_interface.h
+@@ -28,6 +28,11 @@ extern "C" {
+  * @brief @ref drv_steamvr_lh files.
+  */
+ 
++// Set before device discovery; callbacks run outside Context::devices_mut.
++// Pass NULL to unregister after the Lighthouse runtime has stopped.
++void
++steamvr_lh_set_reference_callback(void (*callback)(const char *serial));
++
+ /*!
+  * Creates the steamvr system devices.
+  *
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 09d8999e3..8e040aac8 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -162,5 +162,13 @@ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
+ 	target_include_directories(tests_steamvr_lh_references PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/steamvr_lh)
+ 	add_test(NAME steamvr_lh_references_on COMMAND tests_steamvr_lh_references on)
+ 	add_test(NAME steamvr_lh_references_off COMMAND tests_steamvr_lh_references off)
+-	set_tests_properties(steamvr_lh_references_on steamvr_lh_references_off PROPERTIES TIMEOUT 15 ENVIRONMENT "HOME=/nonexistent-lh-test")
++	add_test(NAME steamvr_lh_references_stabilized COMMAND tests_steamvr_lh_references stabilized)
++	set_tests_properties(steamvr_lh_references_on steamvr_lh_references_off steamvr_lh_references_stabilized PROPERTIES TIMEOUT 15 ENVIRONMENT "HOME=/nonexistent-lh-test")
++endif()
++
++if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
++	add_executable(tests_steamvr_lh_stabilization tests_steamvr_lh_stabilization.cpp)
++	target_include_directories(tests_steamvr_lh_stabilization PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/steamvr_lh ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
++	target_link_libraries(tests_steamvr_lh_stabilization PRIVATE drv_steamvr_lh aux_math aux_vive xrt-external-openvr)
++	add_test(NAME steamvr_lh_stabilization COMMAND tests_steamvr_lh_stabilization)
+ endif()
+diff --git a/tests/tests_steamvr_lh_references.cpp b/tests/tests_steamvr_lh_references.cpp
+index 4bd3cc6d1..7b5ed861d 100644
+--- a/tests/tests_steamvr_lh_references.cpp
++++ b/tests/tests_steamvr_lh_references.cpp
+@@ -1,6 +1,8 @@
+ // Copyright 2026, OpenAI
+ // SPDX-License-Identifier: BSL-1.0
+ #include "interfaces/context.hpp"
++#include "steamvr_lh_interface.h"
++static unsigned reference_announcements{0};
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -136,8 +138,14 @@ struct Provider : vr::IServerTrackedDeviceProvider
+ int
+ main(int argc, char **argv)
+ {
+-	const bool enabled = argc > 1 && std::strcmp(argv[1], "on") == 0;
+-	setenv("LH_DIAGNOSTIC_REFERENCES", enabled ? "1" : "0", 1);
++	const bool stabilized = argc > 1 && std::strcmp(argv[1], "stabilized") == 0;
++	const bool enabled = stabilized || (argc > 1 && std::strcmp(argv[1], "on") == 0);
++	setenv("LH_DIAGNOSTIC_REFERENCES", enabled && !stabilized ? "1" : "0", 1);
++	setenv("LH_STABILIZE_REFERENCE_SERIAL", stabilized ? "reference-0" : "", 1);
++	steamvr_lh_set_reference_callback([](const char *serial) {
++		CHECK(serial && std::strlen(serial) > 0);
++		++reference_announcements;
++	});
+ 	Provider provider;
+ 	Driver drivers[18];
+ 	auto context = Context::create("/nonexistent-lh-test", "/nonexistent-lh-test", {&provider});
+@@ -148,6 +156,7 @@ main(int argc, char **argv)
+ 		return context->TrackedDeviceAdded(serial, vr::TrackedDeviceClass_TrackingReference, &drivers[i]);
+ 	};
+ 	CHECK(add(0, "reference-0") == enabled);
++	CHECK(reference_announcements == 1);
+ 	if (enabled) {
+ 		provider.first = &drivers[0];
+ 		CHECK(drivers[0].index == 17);
+@@ -177,6 +186,7 @@ main(int argc, char **argv)
+ 	}
+ 	context.reset();
+ 	CHECK(provider.cleaned);
++	steamvr_lh_set_reference_callback(nullptr);
+ 	for (int i = 0; i < 18; ++i)
+ 		CHECK(drivers[i].deactivations == unsigned(enabled && (i == 0 || (i >= 2 && i < 16))));
+ }
+diff --git a/tests/tests_steamvr_lh_stabilization.cpp b/tests/tests_steamvr_lh_stabilization.cpp
+new file mode 100644
+index 000000000..6e131be43
+--- /dev/null
++++ b/tests/tests_steamvr_lh_stabilization.cpp
+@@ -0,0 +1,272 @@
++// Copyright 2026, OpenAI
++// SPDX-License-Identifier: BSL-1.0
++#include "base_station_stabilizer.hpp"
++#include "device.hpp"
++#include "math/m_api.h"
++#include "math/m_relation_history.h"
++#include <cmath>
++#include <iostream>
++#include <cstdlib>
++#include <cstring>
++
++#define CHECK(x)                                                                                                       \
++	do {                                                                                                           \
++		if (!(x)) {                                                                                            \
++			std::cerr << __LINE__ << ": " #x "\n";                                                         \
++			std::abort();                                                                                  \
++		}                                                                                                      \
++	} while (0)
++xrt_pose
++compose(xrt_pose a, xrt_pose b)
++{
++	xrt_pose c;
++	math_pose_transform(&a, &b, &c);
++	return c;
++}
++xrt_pose
++inverse(xrt_pose a)
++{
++	xrt_pose b;
++	math_pose_invert(&a, &b);
++	return b;
++}
++xrt_space_relation
++relation(xrt_pose p)
++{
++	xrt_space_relation r{};
++	r.pose = p;
++	r.relation_flags = static_cast<xrt_space_relation_flags>(
++	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
++	    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
++	r.linear_velocity = {1, 2, 3};
++	r.angular_velocity = {3, 1, 2};
++	return r;
++}
++void
++near(float a, float b)
++{
++	CHECK(std::abs(a - b) < 1e-4f);
++}
++void
++same(xrt_pose a, xrt_pose b)
++{
++	near(a.position.x, b.position.x);
++	near(a.position.y, b.position.y);
++	near(a.position.z, b.position.z);
++	const float sign = a.orientation.x * b.orientation.x + a.orientation.y * b.orientation.y +
++	                               a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w <
++	                           0
++	                       ? -1.f
++	                       : 1.f;
++	near(a.orientation.x, sign * b.orientation.x);
++	near(a.orientation.y, sign * b.orientation.y);
++	near(a.orientation.z, sign * b.orientation.z);
++	near(a.orientation.w, sign * b.orientation.w);
++}
++void
++tests()
++{
++	const float h = std::sqrt(.5f);
++	const xrt_pose world{{0, 0, h, h}, {2, 3, 1}}, local_base{{h, 0, 0, h}, {1, 0, 0}},
++	    local_tracker{{0, h, 0, h}, {4, 1, -2}};
++	const auto base = compose(world, local_base), tracker = compose(world, local_tracker);
++	const auto expected = compose(inverse(base), tracker);
++	auto r = relation(tracker);
++	BaseStationStabilizer disabled;
++	CHECK(!disabled.apply(r, world, 101, 101).applied);
++	same(r.pose, tracker);
++	BaseStationStabilizer s("reference-A");
++	r = relation(tracker);
++	CHECK(!s.apply(r, world, 101, 101).applied);
++	CHECK(r.relation_flags == 0);
++	s.observe(base, world, false, 100, 100);
++	r = relation(tracker);
++	CHECK(!s.apply(r, world, 101, 101).applied);
++	s.observe(base, world, true, 100, 100);
++	r = relation(tracker);
++	CHECK(s.apply(r, world, 101, 101).applied);
++	same(r.pose, expected);
++	const auto corrected0 = r;
++	// A pure change of output coordinates must cancel for pose AND both velocities.
++	const xrt_pose change{{0, h, 0, h}, {10, -4, 3}};
++	const auto world2 = compose(change, world), base2 = compose(change, base), tracker2 = compose(change, tracker);
++	r = relation(tracker2);
++	CHECK(!s.apply(r, world2, 190, 190).applied);
++	CHECK(r.relation_flags == 0);
++	s.observe(base2, world2, true, 200, 210);
++	r = relation(tracker2);
++	CHECK(!s.apply(r, world2, 199, 220).applied); // past sample cannot use future base
++	r = relation(tracker);
++	CHECK(s.apply(r, world, 190, 220).applied);
++	same(r.pose, expected); // own old epoch
++	r = relation(tracker);
++	CHECK(!s.apply(r, world, 201, 220).applied); // old generation after switch
++	r = relation(tracker2);
++	auto velocity = r.linear_velocity, angular = r.angular_velocity;
++	math_quat_rotate_vec3(&change.orientation, &velocity, &r.linear_velocity);
++	math_quat_rotate_vec3(&change.orientation, &angular, &r.angular_velocity);
++	CHECK(s.apply(r, world2, 220, 220).applied);
++	same(r.pose, expected);
++	near(r.linear_velocity.x, corrected0.linear_velocity.x);
++	near(r.linear_velocity.y, corrected0.linear_velocity.y);
++	near(r.linear_velocity.z, corrected0.linear_velocity.z);
++	near(r.angular_velocity.x, corrected0.angular_velocity.x);
++	near(r.angular_velocity.y, corrected0.angular_velocity.y);
++	near(r.angular_velocity.z, corrected0.angular_velocity.z);
++	// Interpolation operates on already normalized history and cannot mix coordinate frames.
++	m_relation_history *history{};
++	m_relation_history_create(&history);
++	CHECK(m_relation_history_push(history, &corrected0, 101));
++	CHECK(m_relation_history_push(history, &r, 220));
++	xrt_space_relation interpolated{};
++	m_relation_history_get(history, 150, &interpolated);
++	same(interpolated.pose, expected);
++	m_relation_history_destroy(&history);
++	s.observe(base2, world2, false, 230, 230);
++	r = relation(tracker2);
++	auto held = s.apply(r, world2, 231, 231);
++	CHECK(held.applied && std::strcmp(held.state, "held") == 0);
++	same(r.pose, expected);
++	// Low-rate bases retain their transform without falsely claiming a current observation.
++	s.observe(base2, world2, true, 240, 240);
++	r = relation(tracker2);
++	held = s.apply(r, world2, 2000000241LL, 2000000241LL);
++	CHECK(held.applied && std::strcmp(held.state, "held") == 0);
++	// Restart with same base convention yields the same result (no new B_ref at startup).
++	BaseStationStabilizer restarted("reference-A");
++	restarted.observe(base2, world2, true, 300, 300);
++	r = relation(tracker2);
++	CHECK(restarted.apply(r, world2, 310, 310).applied);
++	same(r.pose, expected);
++	// Reject malformed reference quaternions and future observations.
++	BaseStationStabilizer bad("reference-A");
++	auto malformed = base;
++	malformed.orientation = {0, 0, 0, 0};
++	bad.observe(malformed, world, true, 100, 100);
++	r = relation(tracker);
++	CHECK(!bad.apply(r, world, 110, 110).applied);
++	bad.observe(base, world, true, 300, 300);
++	r = relation(tracker);
++	CHECK(!bad.apply(r, world, 310, 299).applied);
++	// Physical reference movement outside the world transform latches an explicit failure.
++	auto moved_local = local_base;
++	moved_local.position.x += .06f;
++	restarted.observe(compose(world2, moved_local), world2, true, 320, 320);
++	r = relation(tracker2);
++	auto rejected = restarted.apply(r, world2, 330, 330);
++	CHECK(!rejected.applied && std::strcmp(rejected.state, "reference_changed") == 0 && r.relation_flags == 0);
++	restarted.observe(base2, world2, true, 340, 340);
++	r = relation(tracker2);
++	CHECK(!restarted.apply(r, world2, 350, 350).applied);
++	// Quaternion sign changes are the same generation, not reference movement.
++	auto flipped = world;
++	flipped.orientation = {-world.orientation.x, -world.orientation.y, -world.orientation.z, -world.orientation.w};
++	BaseStationStabilizer antipodal("reference-A");
++	antipodal.observe(base, world, true, 100, 100);
++	r = relation(tracker);
++	CHECK(antipodal.apply(r, flipped, 110, 110).applied);
++	same(r.pose, expected);
++	std::cout << "stabilization math, generations, history, velocities, loss, restart and changed-reference checks "
++	             "passed\n";
++}
++// Verify the real Device history and prediction path, not only the math helper.
++class TestDevice final : public Device
++{
++public:
++	explicit TestDevice(const DeviceBuilder &builder) : Device(builder) {}
++	xrt_result_t
++	get_tracked_pose(xrt_input_name, uint64_t t, xrt_space_relation *r) override
++	{
++		get_pose(t, r);
++		return XRT_SUCCESS;
++	}
++};
++void
++device_history_test()
++{
++	setenv("LH_STABILIZE_REFERENCE_SERIAL", "reference-A", 1);
++	auto context = Context::create("/nonexistent-lh-test", "/nonexistent-lh-test", {});
++	CHECK(context);
++	TestDevice device(DeviceBuilder{context, nullptr, "test-tracker", "/nonexistent-lh-test",
++	                                vr::TrackedDeviceClass_GenericTracker});
++	const float h = std::sqrt(.5f);
++	const xrt_pose world{{0, 0, h, h}, {2, 3, 1}}, local_base{{h, 0, 0, h}, {1, 0, 0}},
++	    local_tracker{{0, h, 0, h}, {4, 1, -2}};
++	const xrt_pose change{{0, h, 0, h}, {10, -4, 3}};
++	const auto base = compose(world, local_base), world2 = compose(change, world);
++	const auto expected = compose(inverse(base), compose(world, local_tracker));
++	auto push = [&](xrt_pose w, int64_t t) {
++		vr::DriverPose_t p{};
++		p.qRotation = {local_tracker.orientation.w, local_tracker.orientation.x, local_tracker.orientation.y,
++		               local_tracker.orientation.z};
++		p.vecPosition[0] = local_tracker.position.x;
++		p.vecPosition[1] = local_tracker.position.y;
++		p.vecPosition[2] = local_tracker.position.z;
++		p.qDriverFromHeadRotation.w = 1;
++		p.qWorldFromDriverRotation = {w.orientation.w, w.orientation.x, w.orientation.y, w.orientation.z};
++		p.vecWorldFromDriverTranslation[0] = w.position.x;
++		p.vecWorldFromDriverTranslation[1] = w.position.y;
++		p.vecWorldFromDriverTranslation[2] = w.position.z;
++		p.poseIsValid = p.deviceIsConnected = true;
++		p.result = vr::TrackingResult_Running_OK;
++		std::lock_guard lk(context->devices_mut);
++		device.update_pose(p, 1, t);
++	};
++	context->stabilizer.observe(base, world, true, 1000000000LL, 1000000000LL);
++	push(world, 1001000000LL);
++	push(world2, 1008000000LL); // tracker updates before the new BS
++	context->stabilizer.observe(compose(change, base), world2, true, 1010000000LL, 1010000000LL);
++	push(world2, 1011000000LL);
++	xrt_space_relation r{};
++	device.get_pose(1001000000LL, &r);
++	CHECK(r.relation_flags != 0);
++	same(r.pose, expected);
++	device.get_pose(1009000000LL, &r);
++	CHECK(r.relation_flags == 0);
++	device.get_pose(1012000000LL, &r);
++	CHECK(r.relation_flags != 0);
++	same(r.pose, expected);
++	unsetenv("LH_STABILIZE_REFERENCE_SERIAL");
++}
++void
++read_pose(xrt_pose &p)
++{
++	std::cin >> p.position.x >> p.position.y >> p.position.z >> p.orientation.x >> p.orientation.y >>
++	    p.orientation.z >> p.orientation.w;
++}
++void
++print_pose(const xrt_pose &p)
++{
++	std::cout << ' ' << p.position.x << ' ' << p.position.y << ' ' << p.position.z << ' ' << p.orientation.x << ' '
++	          << p.orientation.y << ' ' << p.orientation.z << ' ' << p.orientation.w;
++}
++int
++main(int argc, char **argv)
++{
++	if (argc == 1) {
++		tests();
++		device_history_test();
++		return 0;
++	}
++	CHECK(argc == 2 && std::strcmp(argv[1], "replay") == 0);
++	BaseStationStabilizer s("reference-A");
++	std::cout.precision(9);
++	int reference, valid;
++	int64_t time, capture;
++	while (std::cin >> reference >> valid >> time >> capture) {
++		xrt_pose p, w;
++		read_pose(p);
++		read_pose(w);
++		CHECK(std::cin.good());
++		auto r = relation(p);
++		if (!valid)
++			r.relation_flags = static_cast<xrt_space_relation_flags>(0);
++		if (reference)
++			s.observe(p, w, valid, time, capture);
++		auto result = s.apply(r, w, time, capture);
++		std::cout << capture << ' ' << reference << ' ' << result.state << ' ' << result.applied << ' '
++		          << r.relation_flags;
++		print_pose(r.pose);
++		std::cout << '\n';
++	}
++}
+-- 
+2.56.0
+

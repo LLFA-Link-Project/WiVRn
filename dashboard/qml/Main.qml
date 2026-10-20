@@ -360,6 +360,17 @@ Kirigami.ApplicationWindow {
                         }
                     }
 
+                    Controls.Button {
+                        Kirigami.FormData.label: i18n("Lighthouse trackers")
+                        text: i18n("Turn off all trackers")
+                        icon.name: "system-shutdown-symbolic"
+                        visible: Settings.steamvr_lh_supported
+                        enabled: root.server_started && WivrnServer.sessionRunning
+                        onClicked: WivrnServer.standby_lighthouse_trackers()
+                        Controls.ToolTip.visible: hovered
+                        Controls.ToolTip.text: i18n("Turns off all Lighthouse trackers. Controllers remain on.")
+                    }
+
                     // USB mode
                     Controls.Button {
                         Kirigami.FormData.label: i18nc("label for USB status or connect button", "USB")

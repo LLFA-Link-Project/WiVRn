@@ -1,0 +1,117 @@
+From: OpenAI Codex <codex@openai.com>
+Subject: [PATCH] d/steamvr_lh: gzip growing reference streams in writer thread
+
+Use standard streaming gzip without adding work to tracking callbacks.
+Report gzip finalization errors before the session manifest is sealed.
+
+diff --git a/src/xrt/drivers/steamvr_lh/reference_recorder.cpp b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+--- a/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
++++ b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+@@ -18,6 +18,7 @@
+ #include <tuple>
+ #include <time.h>
+ #include <unistd.h>
++#include <zlib.h>
+ 
+ namespace lighthouse_reference {
+ namespace {
+@@ -74,6 +75,28 @@
+ 		int64_t t = 0;
+ 		uint32_t index = 0;
+ 		int cls = -1;
++	};
++	// Only the writer thread owns these streams. zlib uses bounded buffers.
++	class GzipOutput
++	{
++		gzFile file = nullptr;
++	public:
++		explicit GzipOutput(const std::string &path) : file(gzopen(path.c_str(), "wb6")) {}
++		~GzipOutput() { close(); }
++		explicit operator bool() const { return file != nullptr; }
++		bool write(const std::string &line)
++		{
++			return file && gzwrite(file, line.data(), line.size()) == int(line.size()) &&
++			       gzwrite(file, "\n", 1) == 1;
++		}
++		bool flush() { return file && gzflush(file, Z_SYNC_FLUSH) == Z_OK; }
++		bool close()
++		{
++			if (!file) return true;
++			auto f = file;
++			file = nullptr;
++			return gzclose(f) == Z_OK;
++		}
+ 	};
+ 	class Recorder
+ 	{
+@@ -92,10 +115,9 @@
+ 		std::map<std::string, int> classes;
+ 		std::map<std::string, std::tuple<bool, bool, int>> states;
+ 		bool
+-		emit(std::ofstream &out, const std::string &line)
+-		{
+-			out << line << '\n';
+-			if (!out) {
++		emit(GzipOutput &out, const std::string &line)
++		{
++			if (!out.write(line)) {
+ 				error = "io_error";
+ 				return false;
+ 			}
+@@ -119,8 +141,8 @@
+ 		run() noexcept
+ 		{
+ 			try {
+-				std::ofstream poses(directory + "/poses.jsonl", std::ios::app),
+-				    events(directory + "/events.jsonl", std::ios::app);
++				GzipOutput poses(directory + "/poses.jsonl.gz"),
++				    events(directory + "/events.jsonl.gz");
+ 				if (!poses || !events)
+ 					error = "open_error";
+ 				status(false);
+@@ -236,19 +258,19 @@
+ 							break;
+ 					}
+ 					if (!have) {
+-						poses.flush();
+-						events.flush();
+-						if (!poses || !events) {
++						const bool poses_flushed = poses.flush();
++						const bool events_flushed = events.flush();
++						if (!poses_flushed || !events_flushed) {
+ 							error = "flush_error";
+ 							accepting = false;
+ 						}
+ 						status(false);
+ 					}
+ 				}
+-				poses.flush();
+-				events.flush();
+-				if (!poses || !events)
+-					error = "flush_error";
++				const bool poses_closed = poses.close();
++				const bool events_closed = events.close();
++				if (!poses_closed || !events_closed)
++					error = "gzip_close_error";
+ 				status(true);
+ 			} catch (...) {
+ 				accepting = false;
+diff --git a/src/xrt/drivers/CMakeLists.txt b/src/xrt/drivers/CMakeLists.txt
+--- a/src/xrt/drivers/CMakeLists.txt
++++ b/src/xrt/drivers/CMakeLists.txt
+@@ -634,6 +634,7 @@
+ endif()
+ 
+ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
++	find_package(ZLIB REQUIRED)
+ 	add_library(
+ 		drv_steamvr_lh STATIC
+ 		steamvr_lh/steamvr_lh.cpp
+@@ -659,6 +660,7 @@
+ 			xrt-external-openvr
+ 			xrt-external-cjson
+ 			xrt-external-vdf
++			ZLIB::ZLIB
+ 			${CMAKE_DL_LIBS}
+ 		)
+ 	list(APPEND ENABLED_HEADSET_DRIVERS steamvr_lh)

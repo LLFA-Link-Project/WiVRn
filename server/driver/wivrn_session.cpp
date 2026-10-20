@@ -84,7 +84,7 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
         xrt_system_devices{
                 .get_roles = method_pointer<&wivrn_session::get_roles>,
                 .create_body_tracker = b_body_tracker_create,
-                .create_hand_tracker = b_hand_tracker_create,
+                .create_hand_tracker = method_pointer<&wivrn_session::create_hand_tracker>,
                 .feature_inc = method_pointer<&wivrn_session::feature_inc>,
                 .feature_dec = method_pointer<&wivrn_session::feature_dec>,
                 .destroy = method_pointer<&wivrn_session::destroy>,
@@ -157,43 +157,7 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 		U_LOG_W("Disregard lighthousedb / chaperone related error messages from the lighthouse driver. These are irrelevant in case of WiVRn.");
 		U_LOG_W("If getting a SIGSEGV right after this, you are likely using an unsupported SteamVR version!");
 		U_LOG_W("=====================");
-		int original_count = static_xdev_count;
-		if (steamvr_lh_create_devices(nullptr, this) == XRT_SUCCESS)
-		{
-			for (int i = original_count; i < static_xdev_count; i++)
-			{
-				auto lhdev = static_xdevs[i];
-				switch (lhdev->device_type)
-				{
-					case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
-						roles.left = i;
-						static_roles.hand_tracking.unobstructed.left = nullptr;
-						static_roles.hand_tracking.conforming.left = lhdev;
-						break;
-					case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER:
-						roles.right = i;
-						static_roles.hand_tracking.unobstructed.right = nullptr;
-						static_roles.hand_tracking.conforming.right = lhdev;
-						break;
-					case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
-						if (roles.left == left_controller_index)
-						{
-							roles.left = i;
-							static_roles.hand_tracking.unobstructed.left = nullptr;
-							static_roles.hand_tracking.conforming.left = lhdev;
-						}
-						else if (roles.right == right_controller_index)
-						{
-							roles.right = i;
-							static_roles.hand_tracking.unobstructed.right = nullptr;
-							static_roles.hand_tracking.conforming.right = lhdev;
-						}
-						break;
-					default:
-						break;
-				}
-			}
-		}
+		lighthouse_enabled = steamvr_lh_create_devices(nullptr, this) == XRT_SUCCESS;
 	}
 #endif
 	if (get_info().eye_gaze || is_forced_extension("EXT_eye_gaze_interaction"))
@@ -289,6 +253,10 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 
 wivrn_session::~wivrn_session()
 {
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+	if (lighthouse_enabled)
+		steamvr_lh_stop(this);
+#endif
 #if WIVRN_FEATURE_SOLARXR
 	solarxr_device_clear_feeder_devices(static_roles.body);
 #endif
@@ -347,6 +315,10 @@ xrt_result_t wivrn::wivrn_session::create_session(std::unique_ptr<wivrn_connecti
 	        false,
 	        out_xspovrs);
 	self->space_overseer = *out_xspovrs;
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+	if (self->lighthouse_enabled)
+		steamvr_lh_set_device_added_callback(self.get(), &wivrn_session::lighthouse_device_added, self.get());
+#endif
 
 	if (self->eye_tracker)
 	{
@@ -378,6 +350,10 @@ void wivrn_session::start(ipc_server * server)
 
 void wivrn_session::stop()
 {
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+	if (lighthouse_enabled)
+		steamvr_lh_stop(this);
+#endif
 	net_thread = std::jthread();
 	worker_thread = std::jthread();
 }
@@ -1006,6 +982,11 @@ void wivrn_session::operator()(to_monado::set_bitrate && data)
 	compositor.set_bitrate(data.bitrate_bps);
 }
 
+void wivrn_session::operator()(to_monado::standby_lighthouse_trackers &&)
+{
+	standby_lighthouse_trackers();
+}
+
 void wivrn_session::operator()(to_headset::stream_tab_change && data)
 {
 	send_control(std::move(data));
@@ -1401,10 +1382,66 @@ void wivrn_session::poll_session_loss()
 	}
 }
 
+void wivrn_session::lighthouse_device_added(xrt_device * device, void * userdata)
+{
+	auto * session = static_cast<wivrn_session *>(userdata);
+	auto result = xrt_space_overseer_add_device(session->space_overseer, device);
+	if (result != XRT_SUCCESS)
+		U_LOG_E("Failed to add hotplugged Lighthouse device %s: %s", device->str, u_str_xrt_result(result));
+}
+
+xrt_result_t wivrn_session::hand_tracking_devices(xrt_input_name input, xrt_system_devices * devices, void *, uint32_t capacity, xrt_device ** out_devices, uint32_t * out_count)
+{
+	auto * self = static_cast<wivrn_session *>(devices);
+	xrt_system_roles current{};
+	self->get_roles(&current);
+	bool left = input == XRT_INPUT_HT_UNOBSTRUCTED_LEFT || input == XRT_INPUT_HT_CONFORMING_LEFT;
+	bool conforming = input == XRT_INPUT_HT_CONFORMING_LEFT || input == XRT_INPUT_HT_CONFORMING_RIGHT;
+	int index = left ? current.left : current.right;
+	bool lighthouse = index >= 0 && index != self->left_controller_index && index != self->right_controller_index &&
+	                  index != self->left_hand_interaction_index && index != self->right_hand_interaction_index;
+	*out_count = 0;
+	// Headset controllers provide both sources; Lighthouse provides conforming tracking only.
+	if (capacity > 0 && (!lighthouse || conforming))
+	{
+		out_devices[0] = lighthouse ? self->static_xdevs[index] : static_cast<xrt_device *>(left ? &self->left_controller : &self->right_controller);
+		*out_count = 1;
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t wivrn_session::create_hand_tracker(const xrt_hand_tracker_create_info * info, xrt_hand_tracker ** out_tracker)
+{
+	return b_hand_tracker_create_with_cb(this, info, &wivrn_session::hand_tracking_devices, nullptr, out_tracker);
+}
+
 xrt_result_t wivrn_session::get_roles(xrt_system_roles * out_roles)
 {
+	xrt_system_roles lighthouse_roles = XRT_SYSTEM_ROLES_INIT;
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+	if (lighthouse_enabled)
+		steamvr_lh_get_roles(this, &lighthouse_roles);
+#endif
 	std::lock_guard lock(roles_mutex);
-	*out_roles = roles;
+	auto selected = roles;
+	if (lighthouse_roles.left >= 0)
+	{
+		selected.left = lighthouse_roles.left;
+		selected.left_profile = lighthouse_roles.left_profile;
+	}
+	if (lighthouse_roles.right >= 0)
+	{
+		selected.right = lighthouse_roles.right;
+		selected.right_profile = lighthouse_roles.right_profile;
+	}
+	if (selected.left != effective_roles.left || selected.right != effective_roles.right ||
+	    selected.gamepad != effective_roles.gamepad || selected.left_profile != effective_roles.left_profile ||
+	    selected.right_profile != effective_roles.right_profile || selected.gamepad_profile != effective_roles.gamepad_profile)
+	{
+		selected.generation_id = effective_roles.generation_id + 1;
+		effective_roles = selected;
+	}
+	*out_roles = effective_roles;
 	return XRT_SUCCESS;
 }
 

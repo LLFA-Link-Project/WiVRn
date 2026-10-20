@@ -159,6 +159,12 @@ Only available when built with `WIVRN_FEATURE_STEAMVR_LIGHTHOUSE`.
 
 Enables the driver to load SteamVR Lighthouse devices.
 
+While a runtime session is running, the dashboard's **Turn off all trackers**
+button sends `EnterStandby()` to all Lighthouse trackers, including devices added
+after startup. Controllers and base stations are excluded. The action also works
+while the session is waiting for the headset to reconnect. It requests standby;
+the individual device's driver determines whether the hardware powers off.
+
 ## `lh-max-extrapolation`
 Default value: unset
 

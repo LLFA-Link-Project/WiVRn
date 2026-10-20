@@ -29,6 +29,41 @@ Lighthouse driver support for use with lighthouse-tracked devices
 -DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON
 ```
 
+With Lighthouse enabled in the dashboard (or `WIVRN_USE_STEAMVR_LH=1`), controllers and
+trackers can be powered on after a WiVRn session has started. Reconnecting a known
+serial reuses its device slot. Lighthouse controllers take precedence over the
+headset's controller input; the headset input remains available until Lighthouse
+controllers are discovered. Existing applications receive updated controller roles
+and device lists through IPC.
+
+This backports the hotplug path from the local `monado-1` fork onto the pinned
+Monado revision, alongside WiVRn's prediction and recording patches. UDCAP,
+screenshots, controller freeze, and room-setup reload are outside this backport.
+Rebuild and install both the server and its OpenXR runtime library together: the
+hotplug patch changes their private IPC protocol. A headset client rebuild is not
+required. When using `FETCHCONTENT_SOURCE_DIR_MONADO`, apply the complete
+`patches/monado` series to that source yourself; CMake skips patching overridden
+sources. Pointing it directly at the unmodified fork is not supported.
+
+Lighthouse pose state is propagated even when a callback's measurement timestamp
+is too old or nonfinite to enter pose history. A disconnected device or an invalid
+pose clears the location flags returned through OpenXR and discards its old pose
+history. Valid but untracked poses retain their validity while losing the relevant
+tracking flags. Recovery after invalidation requires a usable new measurement.
+These flags describe pose availability and tracking; OpenXR does not expose the
+physical power state through this path.
+
+The hardware-independent hotplug regression test can be built and run with:
+
+```bash
+cmake -B build-server . -DWIVRN_BUILD_TEST=ON -DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON
+cmake --build build-server --target lh-hotplug-test
+./build-server/tests/lh-hotplug-test
+```
+
+This also checks stale tracking-loss and disconnect notifications, nonfinite
+timestamps, rejection of stale coordinates, and pose recovery after reconnection.
+
 For a few dependencies it is possible to select system or embedded versions, check `WIVRN_USE_SYSTEM_xxx` in case you are missing dependencies.
 
 For more advanced options, check [CMakeLists.txt](../CMakeLists.txt).

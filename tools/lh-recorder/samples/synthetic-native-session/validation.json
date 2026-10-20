@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "full_content_validation": true,
+  "validation_scope": "pose values/structure, USB framing/timestamps, clock mapping and file hashes",
+  "valid": true,
+  "issues": [],
+  "warnings": [],
+  "pose_count": 120,
+  "device_ids": [
+    "synthetic-tracker"
+  ],
+  "nonfinite_pose_fields": 0,
+  "usb_packet_count": 120,
+  "usb_incomplete_payloads": 0,
+  "usb_pcap_truncated_packets": 0,
+  "unaligned_usb_packets": 0,
+  "usb_unobserved_devices": [],
+  "usb_unobserved_report_truncated": false,
+  "timestamp_alignment_complete": true,
+  "clock_sync": {
+    "sample_count": 4,
+    "clock_jump_intervals": [],
+    "clock_jump_count": 0,
+    "clock_jump_report_truncated": false,
+    "max_read_uncertainty_ns": 40,
+    "error_model": "read brackets + observed interval offset variation + 1000ns USB quantization; not a guaranteed bound",
+    "unsampled_steps_detectable": false
+  },
+  "max_estimated_usb_alignment_error_ns": 1055,
+  "hardware_tracking_quality_test": "not_run",
+  "libsurvive_replay": "reader_verified_twice_with_pinned_patched_cli; synthetic_reports_only_no_pose_solve"
+}

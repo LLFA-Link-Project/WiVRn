@@ -96,6 +96,7 @@ FetchContent_MakeAvailable(monado)
 if (WIVRN_BUILD_SERVER)
 	add_executable(wivrn-server
 			accept_connection.cpp
+			lighthouse_recording.cpp
 			active_runtime.cpp
 			avahi_publisher.cpp
 			hostname.cpp
@@ -329,4 +330,46 @@ if (WIVRN_BUILD_SERVER_LIBRARY)
 		LIBRARY
 		DESTINATION ${CMAKE_INSTALL_LIBDIR}/wivrn
 		COMPONENT Runtime)
+endif()
+
+if(WIVRN_BUILD_SERVER)
+	execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${PROJECT_SOURCE_DIR} OUTPUT_VARIABLE LH_WIVRN_REV OUTPUT_STRIP_TRAILING_WHITESPACE)
+	execute_process(COMMAND git -C ${monado_SOURCE_DIR} rev-parse HEAD OUTPUT_VARIABLE LH_MONADO_ACTUAL_REV OUTPUT_STRIP_TRAILING_WHITESPACE)
+	if(NOT LH_MONADO_ACTUAL_REV)
+		set(LH_MONADO_ACTUAL_REV "${MONADO_REV}")
+	endif()
+	target_compile_definitions(wivrn-server PRIVATE
+		WIVRN_LH_MONADO_REV="${LH_MONADO_ACTUAL_REV}"
+		WIVRN_LH_WIVRN_REV="${LH_WIVRN_REV}")
+	if(WIVRN_FEATURE_STEAMVR_LIGHTHOUSE)
+		pkg_check_modules(LH_PCAP REQUIRED IMPORTED_TARGET libpcap)
+		find_package(ZLIB REQUIRED)
+		target_sources(wivrn-server PRIVATE lighthouse_capture.cpp)
+		target_link_libraries(wivrn-server PRIVATE PkgConfig::LH_PCAP ZLIB::ZLIB xrt-external-openvr)
+	endif()
+	# Offline validation, alignment and archival; recording never invokes these programs.
+	install(PROGRAMS ${PROJECT_SOURCE_DIR}/tools/lh-recorder/lh-recorder DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/wivrn)
+	configure_file(${PROJECT_SOURCE_DIR}/tools/lh-recorder/launcher.in ${CMAKE_CURRENT_BINARY_DIR}/lh-recorder-cli @ONLY)
+	install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/lh-recorder-cli DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME lh-recorder)
+endif()
+
+if(WIVRN_BUILD_TEST AND WIVRN_BUILD_SERVER AND WIVRN_FEATURE_STEAMVR_LIGHTHOUSE)
+    add_executable(lh-recording-startup-test
+        ../tools/lh-recorder/tests/startup_harness.cpp
+        lighthouse_recording.cpp lighthouse_capture.cpp driver/configuration.cpp hostname.cpp
+        ../tools/lh-recorder/tests/mock_usb_capture.cpp)
+    set_target_properties(lh-recording-startup-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    target_include_directories(lh-recording-startup-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${monado_SOURCE_DIR}/src/xrt/drivers/steamvr_lh)
+    target_link_libraries(lh-recording-startup-test PRIVATE
+        drv_steamvr_lh xrt-external-openvr aux_util wivrn-common wivrn-common-base wivrn-external PkgConfig::glib2 nlohmann_json::nlohmann_json PkgConfig::LH_PCAP ZLIB::ZLIB)
+    target_compile_definitions(lh-recording-startup-test PRIVATE
+        WIVRN_LH_RECORDING_TEST=1
+        WIVRN_LH_MONADO_REV="${LH_MONADO_ACTUAL_REV}"
+        WIVRN_LH_WIVRN_REV="${LH_WIVRN_REV}")
+
+    add_executable(lh-hotplug-test ../tools/lh-recorder/tests/hotplug.cpp)
+    target_compile_features(lh-hotplug-test PRIVATE cxx_std_20)
+    set_target_properties(lh-hotplug-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    target_include_directories(lh-hotplug-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${monado_SOURCE_DIR}/src/xrt/drivers/steamvr_lh ${monado_SOURCE_DIR}/src/xrt/drivers ${monado_SOURCE_DIR}/src/xrt/base)
+    target_link_libraries(lh-hotplug-test PRIVATE drv_steamvr_lh xrt-external-openvr aux_util xrt-interfaces base wivrn-common wivrn-external)
 endif()

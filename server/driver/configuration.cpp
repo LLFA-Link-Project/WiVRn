@@ -20,6 +20,7 @@
 #define JSON_DISABLE_ENUM_SERIALIZATION 1
 
 #include "configuration.h"
+#include "lighthouse_reference_settings.h"
 
 #include <algorithm>
 #include <chrono>
@@ -199,6 +200,21 @@ configuration::configuration()
 
 		if (auto it = json.find("use-steamvr-lh"); it != json.end())
 			use_steamvr_lh = *it;
+
+		if (auto it = json.find("lighthouse-reference-serial"); it != json.end() && it->is_string())
+		{
+			auto serial = it->get<std::string>();
+			if (valid_lighthouse_serial(serial))
+				lighthouse_reference_serial = std::move(serial);
+		}
+
+		if (auto it = json.find("lighthouse-recording"); it != json.end() && it->is_object())
+		{
+			if (auto enabled = it->find("enabled"); enabled != it->end() && enabled->is_boolean())
+				lighthouse_recording_enabled = *enabled;
+			if (auto output = it->find("output-directory"); output != it->end() && output->is_string())
+				lighthouse_recording_output = output->get<std::string>();
+		}
 
 		if (auto it = json.find("lh-max-extrapolation"); it != json.end())
 			lh_max_extrapolation = *it;

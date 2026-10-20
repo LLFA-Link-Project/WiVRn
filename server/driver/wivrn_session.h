@@ -85,6 +85,10 @@ class wivrn_session : public xrt_system_devices
 	        .gamepad = -1,
 	};
 
+	// Headset roles remain available while Lighthouse controllers are being discovered.
+	bool lighthouse_enabled = false;
+	xrt_system_roles effective_roles = XRT_SYSTEM_ROLES_INIT;
+
 	tracking_control control;
 
 	wivrn_hmd hmd;
@@ -120,6 +124,9 @@ class wivrn_session : public xrt_system_devices
 	thread_safe<std::exception_ptr> net_exception;
 
 	wivrn_session(std::unique_ptr<wivrn_connection> connection, b_system &);
+	static void lighthouse_device_added(xrt_device *, void *);
+	static xrt_result_t hand_tracking_devices(xrt_input_name, xrt_system_devices *, void *, uint32_t, xrt_device **, uint32_t *);
+	xrt_result_t create_hand_tracker(const xrt_hand_tracker_create_info *, xrt_hand_tracker **);
 
 public:
 	using base_t = xrt_system_devices;
@@ -193,6 +200,7 @@ public:
 	void operator()(to_monado::stop &&);
 	void operator()(to_monado::disconnect &&);
 	void operator()(to_monado::set_bitrate &&);
+	void operator()(to_monado::standby_lighthouse_trackers &&);
 	void operator()(to_headset::stream_tab_change &&);
 
 	bool has_stream()

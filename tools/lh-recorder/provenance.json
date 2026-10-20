@@ -1,0 +1,33 @@
+{
+  "wivrn_base_revision": "34afe754f8750e8a98e2e6db8e0c25b44502e72a",
+  "monado_base_revision": "09741cbcb45236f4f4f79790ea133cd90d68d5eb",
+  "monado_patch_base": "WiVRn patches/monado/0001 through 0015",
+  "libsurvive_revision": "23f03665070549f0c13a6e768dfaf7764f75c417",
+  "libsurvive_version": "0.3",
+  "monado_inspected_local_revision": "ad7610a5561325a9b368cda5d45fe195d67f4c3b",
+  "recorder_version": "2.1.0",
+  "hardware_validation": "not performed",
+  "patches_sha256": {
+    "patches/monado/0001-c-multi-early-wake-of-compositor.patch": "d097a6a339a226526f6e49345bc1f97f4fd7fee65916ce9f08c306c0736beafd",
+    "patches/monado/0002-Use-extern-socket-fd.patch": "a731d13a0bfabc012339bcd10d24fcd94acda1b5b4ea9b0c875b9f3c132f717b",
+    "patches/monado/0003-change-environment-blend-mode-selection-logic.patch": "fd27a9d48539094111d900abc16196d7edbad6bfcd592e99e03fda4502e11095",
+    "patches/monado/0004-st-oxr-forward-0-refresh-rate.patch": "8cb6e994106c20fbe192aeba6af21812dd666151a16c223c76f4ae4b37cdaf3c",
+    "patches/monado/0005-d-steamvr_lh-prevent-crash-on-vive-pro2-WiVRn.patch": "e79575c1092b788f67e88a712846fcea3b32b289516179f80f91140cf7f69896",
+    "patches/monado/0006-st-oxr-push-XrEventDataInteractionProfileChanged-whe.patch": "86d7a78929bf6d281d47766a30e1b57dc494b24042889468f37a9df4eb6e93ee",
+    "patches/monado/0007-don-t-verify-GL-stuff.patch": "54a15256a3558871c697087fb153bc30ce339465de04770f2e3538c3ed15d03a",
+    "patches/monado/0008-configure-u_git_tag-in-WiVRn.patch": "aa827b1ec4c6d5be7a0db852634ca82f9e6fcf499be443cd3349e6892b431b88",
+    "patches/monado/0009-ipc-join-client-threads-before-teardown.patch": "ed0c25bacc2516afbb12a9f42788f9e17f198dc56b35f0a256f9b90781ec1b5c",
+    "patches/monado/0010-a-math-Add-m_relation_history_get_clamped.patch": "056801f2cbf5d9b343c5714ca06907ac293b439a5b0b43e85d48eb12407d0e1d",
+    "patches/monado/0011-d-steamvr_lh-Add-LH_MAX_EXTRAPOLATION_MS.patch": "80f4f8e4d6006999af84a9bd2bf740c23068034c9bf3e7f6dede77a1ebed761b",
+    "patches/monado/0012-frame-controller-interaction.patch": "f216314459dcc52d95f516c90edcca4e613b35ce431b59c143e292bba9fd57b9",
+    "patches/monado/0013-d-steamvr_lh-align-skeletal-root-with-controller-pose.patch": "6c368cf5e52c818778ce19394a4f8c9cfd05ff7c1d164bd368bf816c4112a65b",
+    "patches/monado/0014-d-steamvr_lh-fix-pose-time-offset-units.patch": "ffd802f7f716ddd8dec7c0cb5c3b255b69de8130c8232db81c4e8554a0e77e56",
+    "patches/monado/0015-d-steamvr_lh-predict-raw-reference-first.patch": "0daacfe2d70c73a59dfbdd2f60cd24ba0565a126778a799773440841fd731985",
+    "patches/monado/0016-d-steamvr_lh-record-valve-reference-poses.patch": "a7aff10e4cc817ec6a555abb2ecb0623734fa88c9ec26cff0df73dfd29aa4edd",
+    "patches/libsurvive/0001-usbmon-safe-passive-recording.patch": "a86275ec6768adc46cfdf15bdf34ccc5b951724197739a15fd19c744aa393e2f",
+    "patches/monado/0017-d-steamvr_lh-finalize-reference-recorder.patch": "f52fd484fe139ff87ec58694ae440511868bba8df658613acf0fb4673455474d",
+    "patches/monado/0018-d-steamvr_lh-compress-reference-streams.patch": "204d1654fdea5566b0ecc1d8c9dc92d6c5d97a72dbb2a155e0926d04b1c035a5"
+  },
+  "native_recording_base_revision": "dad7b6a29a52ec6624b8895d5d7892f73147059a",
+  "compression_base_revision": "bd799f4feef31f79d5aaf5bd2e3971829c10fa02"
+}

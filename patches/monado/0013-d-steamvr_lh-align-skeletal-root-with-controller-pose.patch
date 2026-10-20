@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Mon, 5 Oct 2026 21:38:18 +0900
+Subject: [PATCH] d/steamvr_lh: resolve skeletal root through controller pose history
+
+Skeletal samples retain a hand_pose captured when the skeleton was updated.
+Predicting this root independently of the controller relation history can
+produce a different global root for hand joints and their controller base
+space. In WiVRn, controller prediction also follows LH_MAX_EXTRAPOLATION_MS,
+which the skeletal root previously bypassed.
+
+Resolve the returned hand_pose through Device::get_pose at the requested time,
+so both paths share controller history and prediction policy. Keep local joint
+poses, radii and output timestamps unchanged. No smoothing or diagnostics.
+
+Based on WiVRn's pinned Monado plus existing patches 0001-0012. Tested diagnostic
+equivalent at clamp=0 ms: wrist probe and VRChat fly-out resolved by user report.
+Nonzero-clamp behavior remains outside this validation.
+
+---
+ src/xrt/drivers/steamvr_lh/device.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -772,6 +772,10 @@
+ 		*out_timestamp_ns = desired_timestamp_ns;
+ 	}
+ 
++	// Resolve the skeletal root through the same history and prediction policy
++	// as the controller pose used as the base space for hand joints.
++	Device::get_pose(desired_timestamp_ns, &out_value->hand_pose);
++
+ 	return XRT_SUCCESS;
+ }
+ 

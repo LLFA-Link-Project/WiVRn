@@ -1,0 +1,3 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+exec "@CMAKE_INSTALL_FULL_LIBEXECDIR@/wivrn/lh-recorder" "$@"

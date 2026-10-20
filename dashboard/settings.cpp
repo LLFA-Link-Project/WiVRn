@@ -17,6 +17,9 @@
  */
 
 #include "settings.h"
+#include "lighthouse_recording_defaults.h"
+#include "lighthouse_reference_settings.h"
+#include <QUrl>
 
 #include "escape_string.h"
 #include "gui_config.h"
@@ -121,6 +124,10 @@ void Settings::emitAllChanged()
 	openvrChanged();
 	debugGuiChanged();
 	steamVrLhChanged();
+	lighthouseRecordingEnabledChanged();
+	lighthouseRecordingOutputChanged();
+	lighthouseReferenceSerialChanged();
+	lighthouseReferenceCandidatesChanged();
 	lhMaxExtrapolationEnabledChanged();
 	lhMaxExtrapolationChanged();
 	lhStickDeadzoneChanged();
@@ -131,10 +138,14 @@ void Settings::emitAllChanged()
 
 void Settings::load(const wivrn_server * server)
 {
+	loadJson(server->jsonConfiguration());
+}
+
+void Settings::loadJson(const QString & conf)
+{
 	// Encoders configuration
 	try
 	{
-		auto conf = server->jsonConfiguration();
 		m_jsonSettings = nlohmann::json::parse(conf.toUtf8());
 		m_originalSettings = m_jsonSettings;
 		if (not m_jsonSettings.is_object())
@@ -419,6 +430,79 @@ void Settings::set_steamVrLh(const bool & value)
 		steamVrLhChanged();
 }
 
+QString Settings::lighthouseReferenceSerial() const
+{
+	auto it = m_jsonSettings.find("lighthouse-reference-serial");
+	if (it != m_jsonSettings.end() && it->is_string() && wivrn::valid_lighthouse_serial(it->get<std::string>()))
+		return QString::fromStdString(it->get<std::string>());
+	return {};
+}
+
+QStringList Settings::lighthouseReferenceCandidates() const
+{
+	QStringList result;
+	for (const auto & serial: wivrn::lighthouse_reference_candidates(m_jsonSettings))
+		result.append(QString::fromStdString(serial));
+	return result;
+}
+
+void Settings::set_lighthouseReferenceSerial(const QString & value)
+{
+	const auto serial = value.trimmed();
+	if (!serial.isEmpty() && !wivrn::valid_lighthouse_serial(serial.toStdString()))
+		return;
+	const auto old = lighthouseReferenceSerial();
+	// Remember the old choice even when disabling or switching to a different base.
+	wivrn::remember_lighthouse_reference(m_jsonSettings, old.toStdString());
+	if (serial.isEmpty())
+		m_jsonSettings.erase("lighthouse-reference-serial");
+	else
+	{
+		m_jsonSettings["lighthouse-reference-serial"] = serial.toStdString();
+		wivrn::remember_lighthouse_reference(m_jsonSettings, serial.toStdString());
+	}
+	if (old != serial)
+		lighthouseReferenceSerialChanged();
+	lighthouseReferenceCandidatesChanged();
+}
+
+bool Settings::lighthouseRecordingEnabled() const
+{
+	auto it = m_jsonSettings.find("lighthouse-recording");
+	return it != m_jsonSettings.end() && it->is_object() && it->contains("enabled") && (*it)["enabled"].is_boolean() && (*it)["enabled"].get<bool>();
+}
+
+void Settings::set_lighthouseRecordingEnabled(const bool & value)
+{
+	auto old = lighthouseRecordingEnabled();
+	if (!m_jsonSettings["lighthouse-recording"].is_object())
+		m_jsonSettings["lighthouse-recording"] = nlohmann::json::object();
+	m_jsonSettings["lighthouse-recording"]["enabled"] = value;
+	if (old != value) lighthouseRecordingEnabledChanged();
+}
+
+QString Settings::lighthouseRecordingOutput() const
+{
+	auto it = m_jsonSettings.find("lighthouse-recording");
+	if (it != m_jsonSettings.end() && it->is_object() && it->contains("output-directory") && (*it)["output-directory"].is_string())
+		return QString::fromStdString((*it)["output-directory"].get<std::string>());
+	return QString::fromStdString(wivrn::default_lighthouse_recording_directory().string());
+}
+
+void Settings::set_lighthouseRecordingOutput(const QString & value)
+{
+	auto old = lighthouseRecordingOutput();
+	if (!m_jsonSettings["lighthouse-recording"].is_object())
+		m_jsonSettings["lighthouse-recording"] = nlohmann::json::object();
+	m_jsonSettings["lighthouse-recording"]["output-directory"] = value.toStdString();
+	if (old != value) lighthouseRecordingOutputChanged();
+}
+
+QString Settings::recordingDirectoryFromUrl(const QUrl & url) const
+{
+	return url.toLocalFile();
+}
+
 bool Settings::lhMaxExtrapolationEnabled() const
 {
 	auto it = m_jsonSettings.find("lh-max-extrapolation");
@@ -577,9 +661,24 @@ bool Settings::can10bit() const
 	return ::can10bit(codec());
 }
 
+QString Settings::saveJson() const
+{
+	return QString::fromStdString(m_jsonSettings.dump(2));
+}
+
 void Settings::save(wivrn_server * server)
 {
-	server->setJsonConfiguration(QString::fromStdString(m_jsonSettings.dump(2)));
+	try
+	{
+		auto current = nlohmann::json::parse(server->jsonConfiguration().toStdString());
+		for (const auto & serial: wivrn::lighthouse_reference_candidates(current))
+			wivrn::remember_lighthouse_reference(m_jsonSettings, serial);
+	}
+	catch (const std::exception & e)
+	{
+		qWarning() << "Cannot merge Lighthouse candidates:" << e.what();
+	}
+	server->setJsonConfiguration(saveJson());
 	if (m_jsonSettings != m_originalSettings)
 		settingsChanged();
 }
@@ -591,6 +690,7 @@ void Settings::restore_defaults()
 	m_jsonSettings.erase("hid-forwarding");
 	m_jsonSettings.erase("debug-gui");
 	m_jsonSettings.erase("use-steamvr-lh");
+	m_jsonSettings.erase("lighthouse-recording");
 	m_jsonSettings.erase("lh-stick-deadzone");
 	m_jsonSettings.erase("tcp-only");
 	m_jsonSettings.erase("application");

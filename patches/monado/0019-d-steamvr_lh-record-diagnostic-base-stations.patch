@@ -1,0 +1,763 @@
+From 3e2322368fd7b6c74ea730fa23c53200864bdc4d Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 20 Oct 2026 16:07:21 +0900
+Subject: [PATCH] d/steamvr_lh: record diagnostic base stations
+
+Opt in with LH_DIAGNOSTIC_REFERENCES to activate tracking references in a separate index range. Keep driver calls outside the device lock, retain routing until Cleanup, and retire failed activation slots. Record raw and composed poses with the actual chaperone and universe metadata on the existing asynchronous recorder. Add fake-provider lifecycle and callback tests.
+---
+ src/xrt/drivers/steamvr_lh/device.cpp         |  33 +++-
+ src/xrt/drivers/steamvr_lh/device.hpp         |  27 ++-
+ .../drivers/steamvr_lh/interfaces/context.hpp |  18 +-
+ .../drivers/steamvr_lh/reference_recorder.cpp |  41 +++-
+ .../drivers/steamvr_lh/reference_recorder.hpp |  14 +-
+ src/xrt/drivers/steamvr_lh/steamvr_lh.cpp     | 127 ++++++++----
+ tests/CMakeLists.txt                          |   9 +
+ tests/tests_steamvr_lh_references.cpp         | 182 ++++++++++++++++++
+ 8 files changed, 395 insertions(+), 56 deletions(-)
+ create mode 100644 tests/tests_steamvr_lh_references.cpp
+
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+index c1842eca0..3c889c1bd 100644
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -36,6 +36,7 @@
+ #include "openvr_driver.h"
+ 
+ #include "device.hpp"
++#include "reference_recorder.hpp"
+ 
+ #include <cmath>
+ #include <functional>
+@@ -314,7 +315,9 @@ Device::~Device()
+ 	m_relation_history_destroy(&relation_hist);
+ }
+ 
+-Device::Device(const DeviceBuilder &builder) : xrt_device({}), ctx(builder.ctx), driver(builder.driver)
++Device::Device(const DeviceBuilder &builder)
++    : xrt_device({}), ctx(builder.ctx), chaperone(ctx->chaperone), driver(builder.driver),
++      recording_class(builder.device_class)
+ {
+ 	u_device_id_assign(this);
+ 
+@@ -375,7 +378,8 @@ Device::Device(const DeviceBuilder &builder) : xrt_device({}), ctx(builder.ctx),
+ 		delete dev;
+ 	};
+ 
+-	init_chaperone(builder.steam_install);
++	// Keep the shared chaperone immutable while tracking callbacks are running.
++	std::call_once(ctx->chaperone_once, [&] { init_chaperone(builder.steam_install); });
+ }
+ 
+ // NOTE: No operations that would force inputs_vec or finger_inputs_vec to reallocate (such as insertion)
+@@ -1205,7 +1209,7 @@ operator|=(xrt_space_relation_flags &a, xrt_space_relation_flags b)
+ }
+ 
+ void
+-Device::update_pose(const vr::DriverPose_t &newPose) const
++Device::update_pose(const vr::DriverPose_t &newPose, uint32_t index, int64_t capture_ns) const
+ {
+ 	xrt_space_relation relation = {};
+ 
+@@ -1269,6 +1273,29 @@ Device::update_pose(const vr::DriverPose_t &newPose) const
+ 	math_quat_rotate_vec3(&chaperone.orientation, &relation.linear_velocity, &relation.linear_velocity);
+ 	math_quat_rotate_vec3(&chaperone.orientation, &relation.angular_velocity, &relation.angular_velocity);
+ 
++	// Snapshot the exact pre-calibration composition used by this callback. File
++	// serialization and compression stay on the recorder's bounded writer queue.
++	if (capture_ns) {
++		lighthouse_reference::PoseContext metadata{};
++		metadata.device_class = int(recording_class);
++		const auto &p = relation.pose;
++		metadata.composed = {p.position.x,    p.position.y,    p.position.z,   p.orientation.x,
++		                     p.orientation.y, p.orientation.z, p.orientation.w};
++		metadata.chaperone = {chaperone.position.x,    chaperone.position.y,    chaperone.position.z,
++		                      chaperone.orientation.x, chaperone.orientation.y, chaperone.orientation.z,
++		                      chaperone.orientation.w};
++		auto universe = properties.find(vr::Prop_CurrentUniverseId_Uint64);
++		if (universe != properties.end() && universe->second.tag == vr::k_unUint64PropertyTag &&
++		    universe->second.buffer.size() == sizeof(uint64_t)) {
++			std::memcpy(&metadata.universe, universe->second.buffer.data(), sizeof(metadata.universe));
++		}
++		lighthouse_reference::pose(serial, index, newPose, capture_ns, &metadata);
++	}
++
++	// References are recorded at their callback time and are never predicted or published.
++	if (recording_class == vr::TrackedDeviceClass_TrackingReference)
++		return;
++
+ 	const int64_t ts = chrono_timestamp_ns() + time_s_to_ns(newPose.poseTimeOffset);
+ 
+ 	// Keep the transform tied to the latest accepted history sample.
+diff --git a/src/xrt/drivers/steamvr_lh/device.hpp b/src/xrt/drivers/steamvr_lh/device.hpp
+index 41cd4f1e4..f23ceaf2e 100644
+--- a/src/xrt/drivers/steamvr_lh/device.hpp
++++ b/src/xrt/drivers/steamvr_lh/device.hpp
+@@ -41,12 +41,15 @@ struct DeviceBuilder
+ 	vr::ITrackedDeviceServerDriver *driver;
+ 	const char *serial;
+ 	const std::string &steam_install;
++	vr::ETrackedDeviceClass device_class;
+ 
+ 	DeviceBuilder(const ContextPtr &p_ctx,
+ 	              vr::ITrackedDeviceServerDriver *p_driver,
+ 	              const char *p_serial,
+-	              const std::string &p_stream_install)
+-	    : ctx{p_ctx}, driver{p_driver}, serial{p_serial}, steam_install{p_stream_install}
++	              const std::string &p_stream_install,
++	              vr::ETrackedDeviceClass p_device_class)
++	    : ctx{p_ctx}, driver{p_driver}, serial{p_serial}, steam_install{p_stream_install},
++	      device_class{p_device_class}
+ 	{}
+ 
+ 	// no copies!
+@@ -78,7 +81,7 @@ public:
+ 	get_input_from_name(std::string_view name);
+ 
+ 	void
+-	update_pose(const vr::DriverPose_t &newPose) const;
++	update_pose(const vr::DriverPose_t &newPose, uint32_t index, int64_t capture_ns) const;
+ 
+ 	//! Helper to use the @ref m_relation_history member.
+ 	void
+@@ -113,7 +116,7 @@ protected:
+ 	std::unordered_map<vr::ETrackedDeviceProperty, Property> properties;
+ 	std::unordered_map<std::string_view, xrt_input *> inputs_map;
+ 	std::vector<xrt_input> inputs_vec;
+-	inline static xrt_pose chaperone = XRT_POSE_IDENTITY;
++	xrt_pose &chaperone;
+ 	const InputClass *input_class;
+ 	std::string manufacturer;
+ 	std::string model;
+@@ -135,6 +138,7 @@ private:
+ 	mutable std::mutex pose_history_mutex;
+ 	mutable xrt_pose latest_driver_from_head = XRT_POSE_IDENTITY;
+ 	vr::ITrackedDeviceServerDriver *driver;
++	vr::ETrackedDeviceClass recording_class;
+ 
+ 	void
+ 	init_chaperone(const std::string &steam_install);
+@@ -291,3 +295,18 @@ private:
+ 	vr::ETrackedPropertyError
+ 	handle_property_write(const vr::PropertyWrite_t &prop) override;
+ };
++
++// Diagnostic-only: no controller profile, inputs, or OpenXR device registration.
++// Context owns these and supplies a non-owning ContextPtr in the builder.
++class TrackingReferenceDevice final : public Device
++{
++public:
++	vr::ITrackedDeviceServerDriver *reference_driver;
++	bool activated{false};
++	TrackingReferenceDevice(const DeviceBuilder &builder) : Device(builder), reference_driver(builder.driver) {}
++	xrt_result_t
++	get_tracked_pose(xrt_input_name, uint64_t, xrt_space_relation *) override
++	{
++		return XRT_ERROR_INPUT_UNSUPPORTED;
++	}
++};
+diff --git a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+index a069426da..fd97c0b13 100644
+--- a/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
++++ b/src/xrt/drivers/steamvr_lh/interfaces/context.hpp
+@@ -9,6 +9,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <condition_variable>
+ #include <unordered_map>
+ #include <memory>
+@@ -33,6 +34,7 @@
+ struct xrt_input;
+ class Device;
+ class ControllerDevice;
++class TrackingReferenceDevice;
+ class Context final : public xrt_tracking_origin,
+                       public vr::IVRDriverContext,
+                       public vr::IVRServerDriverHost,
+@@ -100,7 +102,17 @@ private:
+ 	setup_hmd(const char *serial, vr::ITrackedDeviceServerDriver *driver);
+ 
+ 	bool
+-	setup_controller(const char *serial, vr::ITrackedDeviceServerDriver *driver);
++	setup_controller(const char *serial,
++	                 vr::ITrackedDeviceServerDriver *driver,
++	                 vr::ETrackedDeviceClass device_class);
++	bool
++	setup_tracking_reference(const char *serial, vr::ITrackedDeviceServerDriver *driver);
++	// Indices 0..16 remain reserved for the HMD and controllers. Failed slots are
++	// retired for this Context's lifetime so late callbacks cannot target a new device.
++	static constexpr uint32_t reference_index_begin = 17;
++	static constexpr size_t max_tracking_references = 16;
++	std::array<std::unique_ptr<TrackingReferenceDevice>, max_tracking_references> references{};
++	size_t next_reference_slot{0};
+ 	std::vector<vr::IServerTrackedDeviceProvider *> providers;
+ 
+ public:
+@@ -111,6 +123,10 @@ public:
+ 	class HmdDevice *hmd{nullptr};
+ 	class ControllerDevice *controller[16]{nullptr};
+ 
++	// One immutable chaperone snapshot shared by this Context's devices.
++	std::once_flag chaperone_once;
++	xrt_pose chaperone = XRT_POSE_IDENTITY;
++
+ 	bool in_setup{true};
+ 	const u_logging_level log_level;
+ 
+diff --git a/src/xrt/drivers/steamvr_lh/reference_recorder.cpp b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+index e4e3b4157..6785f727b 100644
+--- a/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
++++ b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+@@ -71,6 +71,8 @@ namespace {
+ 	{
+ 		char serial[256]{};
+ 		vr::DriverPose_t p{};
++		PoseContext context{};
++		bool has_context{false};
+ 		uint64_t seq = 0;
+ 		int64_t t = 0;
+ 		uint32_t index = 0;
+@@ -194,7 +196,10 @@ namespace {
+ 							o << ",\"stream\":\"valve_driver_pose\",\"source\":\"steamvr_"
+ 							     "lh\",\"driver_index\":"
+ 							  << s.index << ",\"device_class\":"
+-							  << (classes.count(id) ? std::to_string(classes[id]) : "null")
++							  << (s.has_context && s.context.device_class >= 0
++							          ? std::to_string(s.context.device_class)
++								  : (classes.count(id) ? std::to_string(classes[id])
++								                       : "null"))
+ 							  << ",\"coordinate_frame\":\"valve_driver_world_tracking_"
+ 							     "reference\",\"quaternion_order\":\"xyzw\""
+ 							  << ",\"pose_time_offset_s\":" << number(p.poseTimeOffset)
+@@ -243,7 +248,24 @@ namespace {
+ 							  << ",\"driver_from_head_orientation_xyzw\":"
+ 							  << quat(p.qDriverFromHeadRotation)
+ 							  << ",\"driver_from_head_translation_m\":"
+-							  << vector(p.vecDriverFromHeadTranslation) << "}";
++							  << vector(p.vecDriverFromHeadTranslation);
++							if (s.has_context) {
++								auto pose_json = [](const std::array<double, 7> &v) {
++									return "{\"position_m\":" + vector(v.data()) +
++									       ",\"orientation_xyzw\":[" +
++									       number(v[3]) + "," + number(v[4]) + "," +
++									       number(v[5]) + "," + number(v[6]) + "]}";
++								};
++								o << ",\"composed_pose\":"
++								  << pose_json(s.context.composed)
++								  << ",\"chaperone_transform\":"
++								  << pose_json(s.context.chaperone)
++								  << ",\"composed_coordinate_frame\":\"lighthouse_"
++								     "chaperone_before_tracking_origin\""
++								  << ",\"universe_id\":"
++								  << quoted(std::to_string(s.context.universe).c_str());
++							}
++							o << "}";
+ 							if (emit(poses, o.str()))
+ 								++written;
+ 							else
+@@ -323,7 +345,12 @@ namespace {
+ 			return configured;
+ 		}
+ 		void
+-		push(const char *serial, uint32_t index, const vr::DriverPose_t *p, int cls, int64_t t) noexcept
++		push(const char *serial,
++		     uint32_t index,
++		     const vr::DriverPose_t *p,
++		     int cls,
++		     int64_t t,
++		     const PoseContext *context = nullptr) noexcept
+ 		{
+ 			if (!enabled())
+ 				return;
+@@ -342,6 +369,10 @@ namespace {
+ 			std::strncpy(s.serial, serial, sizeof(s.serial) - 1);
+ 			if (p)
+ 				s.p = *p;
++			if (context) {
++				s.context = *context;
++				s.has_context = true;
++			}
+ 			s.index = index;
+ 			s.cls = cls;
+ 			s.t = t;
+@@ -387,10 +418,10 @@ device(const char *serial, int cls) noexcept
+ 		r->push(serial, 0, nullptr, cls, now());
+ }
+ void
+-pose(const char *serial, uint32_t index, const vr::DriverPose_t &p, int64_t t) noexcept
++pose(const char *serial, uint32_t index, const vr::DriverPose_t &p, int64_t t, const PoseContext *context) noexcept
+ {
+ 	auto r = instance.load(std::memory_order_acquire);
+ 	if (t && r)
+-		r->push(serial, index, &p, -1, t);
++		r->push(serial, index, &p, -1, t, context);
+ }
+ } // namespace lighthouse_reference
+diff --git a/src/xrt/drivers/steamvr_lh/reference_recorder.hpp b/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
+index c5deb2cda..bd85faff9 100644
+--- a/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
++++ b/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
+@@ -2,7 +2,15 @@
+ #pragma once
+ #include "openvr_driver.h"
+ #include <cstdint>
++#include <array>
+ namespace lighthouse_reference {
++struct PoseContext
++{
++	// Position (metres), then orientation (xyzw), before tracking-origin calibration.
++	std::array<double, 7> composed{}, chaperone{};
++	int device_class{-1};
++	uint64_t universe{0}; // zero: unknown/not provided
++};
+ // Initialize during startup/discovery, never the high-rate pose callback.
+ // Finish after Valve callbacks are stopped, before session metadata is finalized.
+ void
+@@ -14,5 +22,9 @@ capture_time() noexcept; // zero when disabled
+ void
+ device(const char *serial, int device_class) noexcept;
+ void
+-pose(const char *serial, uint32_t index, const vr::DriverPose_t &pose, int64_t capture_ns) noexcept;
++pose(const char *serial,
++     uint32_t index,
++     const vr::DriverPose_t &pose,
++     int64_t capture_ns,
++     const PoseContext *context = nullptr) noexcept;
+ } // namespace lighthouse_reference
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+index 2264858d5..49561f00a 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+@@ -83,6 +83,7 @@ namespace {
+ DEBUG_GET_ONCE_LOG_OPTION(lh_log, "LIGHTHOUSE_LOG", U_LOGGING_INFO)
+ DEBUG_GET_ONCE_BOOL_OPTION(lh_load_slimevr, "LH_LOAD_SLIMEVR", false)
+ DEBUG_GET_ONCE_NUM_OPTION(lh_discover_wait_ms, "LH_DISCOVER_WAIT_MS", 3000)
++DEBUG_GET_ONCE_BOOL_OPTION(lh_diagnostic_references, "LH_DIAGNOSTIC_REFERENCES", false)
+ DEBUG_GET_ONCE_FLOAT_OPTION(lh_stick_deadzone, "LH_STICK_DEADZONE", 0)
+ 
+ static constexpr size_t MAX_CONTROLLERS = 16;
+@@ -185,8 +186,18 @@ Context::~Context()
+ 	this->frame_thread_event.release();
+ 	if (this->frame_thread.joinable())
+ 		this->frame_thread.join();
++	// Stop each reference while its callback routing and properties still exist.
++	// Never hold devices_mut across a driver call.
++	for (auto &reference : references) {
++		if (reference && reference->activated) {
++			reference->reference_driver->Deactivate();
++		}
++	}
+ 	for (vr::IServerTrackedDeviceProvider *const &provider : providers)
+ 		provider->Cleanup();
++	// Cleanup has joined the driver's callback threads.
++	for (auto &reference : references)
++		reference.reset();
+ }
+ 
+ /***** IVRDriverContext methods *****/
+@@ -237,7 +248,8 @@ Context::GetDriverHandle()
+ bool
+ Context::setup_hmd(const char *serial, vr::ITrackedDeviceServerDriver *driver)
+ {
+-	auto *hmd = new HmdDevice(DeviceBuilder{this->shared_from_this(), driver, serial, STEAM_INSTALL_DIR});
++	auto *hmd = new HmdDevice(
++	    DeviceBuilder{this->shared_from_this(), driver, serial, STEAM_INSTALL_DIR, vr::TrackedDeviceClass_HMD});
+ 
+ 	{
+ 		// Publish the device before activating it: the driver writes its properties and creates its
+@@ -321,7 +333,9 @@ Context::setup_hmd(const char *serial, vr::ITrackedDeviceServerDriver *driver)
+ }
+ 
+ bool
+-Context::setup_controller(const char *serial, vr::ITrackedDeviceServerDriver *driver)
++Context::setup_controller(const char *serial,
++                          vr::ITrackedDeviceServerDriver *driver,
++                          vr::ETrackedDeviceClass device_class)
+ {
+ 	size_t device_idx = 0;
+ 	ControllerDevice *device = nullptr;
+@@ -345,8 +359,8 @@ Context::setup_controller(const char *serial, vr::ITrackedDeviceServerDriver *dr
+ 		// Create the new controller and claim its slot before activating it: the driver writes its
+ 		// properties and creates its input components from within Activate, and those callbacks have to
+ 		// be able to find it.
+-		device = new ControllerDevice(
+-		    device_idx + 1, DeviceBuilder{this->shared_from_this(), driver, serial, STEAM_INSTALL_DIR});
++		device = new ControllerDevice(device_idx + 1, DeviceBuilder{this->shared_from_this(), driver, serial,
++		                                                            STEAM_INSTALL_DIR, device_class});
+ 		controller[device_idx] = device;
+ 	}
+ 
+@@ -378,6 +392,53 @@ Context::setup_controller(const char *serial, vr::ITrackedDeviceServerDriver *dr
+ 	return true;
+ }
+ 
++bool
++Context::setup_tracking_reference(const char *serial, vr::ITrackedDeviceServerDriver *driver)
++{
++	static_assert(reference_index_begin == MAX_CONTROLLERS + 1);
++	static_assert(reference_index_begin + max_tracking_references <= vr::k_unMaxTrackedDeviceCount);
++	if (!serial || !driver || std::strlen(serial) >= XRT_DEVICE_NAME_LEN)
++		return false;
++	uint32_t slot;
++	TrackingReferenceDevice *device;
++	{
++		std::lock_guard lk(devices_mut);
++		for (const auto &reference : references) {
++			if (reference &&
++			    (std::strcmp(reference->serial, serial) == 0 || reference->reference_driver == driver)) {
++				CTX_WARN("Duplicate tracking reference: %s", serial);
++				return false;
++			}
++		}
++		if (next_reference_slot == references.size()) {
++			CTX_WARN("Tracking reference limit reached (%zu)", references.size());
++			return false;
++		}
++		slot = next_reference_slot++;
++		// Context owns the reference. Borrowing it here avoids a shared_ptr cycle.
++		auto borrowed_context = std::shared_ptr<Context>(this, [](Context *) {});
++		references[slot] = std::make_unique<TrackingReferenceDevice>(DeviceBuilder{
++		    borrowed_context, driver, serial, STEAM_INSTALL_DIR, vr::TrackedDeviceClass_TrackingReference});
++		device = references[slot].get();
++	}
++	// The reference is visible to synchronous and worker-thread callbacks in Activate.
++	const auto error = driver->Activate(reference_index_begin + slot);
++	if (error != vr::VRInitError_None) {
++		CTX_WARN("Activating tracking reference %s failed: %u", serial, error);
++		// OpenVR only requires Deactivate after successful activation. Serialize
++		// removal against callbacks; never reuse this failed index.
++		std::lock_guard lk(devices_mut);
++		references[slot].reset();
++		return false;
++	}
++	{
++		std::lock_guard lk(devices_mut);
++		device->activated = true;
++	}
++	CTX_INFO("Activated diagnostic base station %s at index %u", serial, reference_index_begin + slot);
++	return true;
++}
++
+ void
+ Context::wait_for_discover()
+ {
+@@ -446,16 +507,18 @@ Context::TrackedDeviceAdded(const char *pchDeviceSerialNumber,
+ 	}
+ 	case vr::TrackedDeviceClass_Controller: {
+ 		CTX_INFO("Found lighthouse controller: %s", pchDeviceSerialNumber);
+-		added = setup_controller(pchDeviceSerialNumber, pDriver);
++		added = setup_controller(pchDeviceSerialNumber, pDriver, eDeviceClass);
+ 		break;
+ 	}
+ 	case vr::TrackedDeviceClass_TrackingReference: {
+ 		CTX_INFO("Found lighthouse base station: %s", pchDeviceSerialNumber);
++		if (debug_get_bool_option_lh_diagnostic_references())
++			added = setup_tracking_reference(pchDeviceSerialNumber, pDriver);
+ 		break;
+ 	}
+ 	case vr::TrackedDeviceClass_GenericTracker: {
+ 		CTX_INFO("Found lighthouse tracker: %s", pchDeviceSerialNumber);
+-		added = setup_controller(pchDeviceSerialNumber, pDriver);
++		added = setup_controller(pchDeviceSerialNumber, pDriver, eDeviceClass);
+ 		break;
+ 	}
+ 	default: {
+@@ -477,31 +540,13 @@ void
+ Context::TrackedDevicePoseUpdated(uint32_t unWhichDevice, const vr::DriverPose_t &newPose, uint32_t unPoseStructSize)
+ {
+ 	const int64_t capture_ns = lighthouse_reference::capture_time();
+-	assert(sizeof(newPose) == unPoseStructSize);
+ 
+-	// Check for valid device index, allowing for the HMD plus up to MAX_CONTROLLERS controllers
+-	if (unWhichDevice > MAX_CONTROLLERS)
++	if (unPoseStructSize != sizeof(newPose))
+ 		return;
+-
+-	Device *dev = nullptr;
+-
+ 	std::lock_guard lk(this->devices_mut);
+-
+-	// If unWhichDevice is 0, it refers to the HMD; otherwise, it refers to one of the controllers
+-	if (unWhichDevice == 0) {
+-		dev = static_cast<Device *>(this->hmd);
+-	} else {
+-		// unWhichDevice - 1 will give the index into the controller array
+-		dev = static_cast<Device *>(this->controller[unWhichDevice - 1]);
+-	}
+-
+-	// This means the device was destroyed by Monado after we created it.
+-	if (dev == nullptr) {
+-		return;
+-	}
+-
+-	lighthouse_reference::pose(dev->serial, unWhichDevice, newPose, capture_ns);
+-	dev->update_pose(newPose);
++	Device *dev = prop_container_to_device(uint64_t(unWhichDevice) + 1);
++	if (dev)
++		dev->update_pose(newPose, unWhichDevice, capture_ns);
+ }
+ 
+ void
+@@ -811,10 +856,9 @@ Context::CreateHapticComponent(vr::PropertyContainerHandle_t ulContainer,
+ 		return vr::VRInputError_InvalidHandle;
+ 	}
+ 
+-	// Assuming HMDs won't have haptics.
+-	// Maybe a wrong assumption.
+-	if (d == hmd) {
+-		CTX_WARN("Didn't expect HMD with haptics.");
++	// HMDs and diagnostic references cannot be cast to controller devices.
++	if (dynamic_cast<ControllerDevice *>(d) == nullptr) {
++		CTX_WARN("Haptics requested for a non-controller device.");
+ 		return vr::VRInputError_InvalidHandle;
+ 	}
+ 
+@@ -850,7 +894,9 @@ Context::CreateSkeletonComponent(vr::PropertyContainerHandle_t ulContainer,
+ 
+ 	std::lock_guard lk(this->devices_mut);
+ 
+-	auto *device = static_cast<ControllerDevice *>(prop_container_to_device(ulContainer));
++	auto *device = dynamic_cast<ControllerDevice *>(prop_container_to_device(ulContainer));
++	if (!device)
++		return vr::VRInputError_InvalidHandle;
+ 	path.remove_prefix(skeleton_pfx.size());
+ 	xrt_hand hand;
+ 	if (path == "left") {
+@@ -977,6 +1023,9 @@ Context::prop_container_to_device(vr::PropertyContainerHandle_t handle)
+ 		// If the handle corresponds to a controller
+ 		if (handle >= 2 && handle <= MAX_CONTROLLERS + 1) {
+ 			return controller[handle - 2];
++		} else if (handle >= reference_index_begin + 1 &&
++		           handle < reference_index_begin + 1 + references.size()) {
++			return references[handle - reference_index_begin - 1].get();
+ 		} else {
+ 			return nullptr;
+ 		}
+@@ -988,15 +1037,9 @@ Context::prop_container_to_device(vr::PropertyContainerHandle_t handle)
+ vr::PropertyContainerHandle_t
+ Context::TrackedDeviceToPropertyContainer(vr::TrackedDeviceIndex_t nDevice)
+ {
+-	size_t container = nDevice + 1;
+-	if (nDevice == 0 && this->hmd) {
+-		return container;
+-	}
+-	if (nDevice >= 1 && nDevice <= MAX_CONTROLLERS && this->controller[nDevice - 1]) {
+-		return container;
+-	}
+-
+-	return vr::k_ulInvalidPropertyContainer;
++	std::lock_guard lk(devices_mut);
++	const uint64_t container = uint64_t(nDevice) + 1;
++	return prop_container_to_device(container) ? container : vr::k_ulInvalidPropertyContainer;
+ }
+ 
+ void
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index bd1932916..09d8999e3 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -155,3 +155,12 @@ if(TARGET ipc_server)
+ 	target_link_libraries(tests_ipc_thread_shutdown PRIVATE ipc_shared aux_os base)
+ 	set_tests_properties(tests_ipc_thread_shutdown PROPERTIES TIMEOUT 10)
+ endif()
++
++if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
++	add_executable(tests_steamvr_lh_references tests_steamvr_lh_references.cpp)
++	target_link_libraries(tests_steamvr_lh_references PRIVATE drv_steamvr_lh aux_util aux_vive xrt-external-openvr)
++	target_include_directories(tests_steamvr_lh_references PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/steamvr_lh)
++	add_test(NAME steamvr_lh_references_on COMMAND tests_steamvr_lh_references on)
++	add_test(NAME steamvr_lh_references_off COMMAND tests_steamvr_lh_references off)
++	set_tests_properties(steamvr_lh_references_on steamvr_lh_references_off PROPERTIES TIMEOUT 15 ENVIRONMENT "HOME=/nonexistent-lh-test")
++endif()
+diff --git a/tests/tests_steamvr_lh_references.cpp b/tests/tests_steamvr_lh_references.cpp
+new file mode 100644
+index 000000000..4bd3cc6d1
+--- /dev/null
++++ b/tests/tests_steamvr_lh_references.cpp
+@@ -0,0 +1,182 @@
++// Copyright 2026, OpenAI
++// SPDX-License-Identifier: BSL-1.0
++#include "interfaces/context.hpp"
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <thread>
++
++#define CHECK(condition)                                                                                               \
++	do {                                                                                                           \
++		if (!(condition)) {                                                                                    \
++			std::cerr << __LINE__ << ": " #condition "\n";                                                 \
++			std::abort();                                                                                  \
++		}                                                                                                      \
++	} while (0)
++
++struct Driver : vr::ITrackedDeviceServerDriver
++{
++	Context *host{};
++	uint32_t index{vr::k_unTrackedDeviceIndexInvalid};
++	unsigned activations{}, deactivations{};
++	bool fail{};
++	vr::EVRInitError
++	Activate(uint32_t idx) override
++	{
++		++activations;
++		index = idx;
++		const auto container = host->TrackedDeviceToPropertyContainer(idx);
++		CHECK(container == idx + 1);
++		uint64_t universe = 1234567890123456789ULL;
++		vr::PropertyWrite_t write{};
++		write.prop = vr::Prop_CurrentUniverseId_Uint64;
++		write.writeType = vr::PropertyWrite_Set;
++		write.unTag = vr::k_unUint64PropertyTag;
++		write.pvBuffer = &universe;
++		write.unBufferSize = sizeof(universe);
++		CHECK(host->WritePropertyBatch(container, &write, 1) == vr::TrackedProp_Success);
++		uint64_t value{};
++		vr::PropertyRead_t read{};
++		read.prop = write.prop;
++		read.pvBuffer = &value;
++		read.unBufferSize = sizeof(value);
++		CHECK(host->ReadPropertyBatch(container, &read, 1) == vr::TrackedProp_Success);
++		CHECK(value == universe);
++		CHECK(read.unTag == write.unTag);
++		vr::DriverPose_t pose{};
++		pose.qRotation.w = pose.qWorldFromDriverRotation.w = pose.qDriverFromHeadRotation.w = 1;
++		pose.poseIsValid = pose.deviceIsConnected = true;
++		pose.result = vr::TrackingResult_Running_OK;
++		pose.qRotation.z = pose.qRotation.w = std::sqrt(0.5);
++		pose.qWorldFromDriverRotation.y = pose.qWorldFromDriverRotation.w = std::sqrt(0.5);
++		pose.vecPosition[0] = 2;
++		pose.vecDriverFromHeadTranslation[0] = 1;
++		pose.vecWorldFromDriverTranslation[0] = 10;
++		pose.vecWorldFromDriverTranslation[1] = 20;
++		pose.vecWorldFromDriverTranslation[2] = 30;
++		host->TrackedDevicePoseUpdated(idx, pose, sizeof(pose));
++		// Joining this thread deadlocks if Activate was called with devices_mut held.
++		std::thread callback([&] {
++			CHECK(host->TrackedDeviceToPropertyContainer(idx) == container);
++			host->TrackedDevicePoseUpdated(idx, pose, sizeof(pose));
++		});
++		callback.join();
++		vr::VRInputComponentHandle_t handle{};
++		CHECK(host->CreateHapticComponent(container, "/output/haptic", &handle) ==
++		      vr::VRInputError_InvalidHandle);
++		CHECK(host->CreateSkeletonComponent(container, "/skeleton/hand/left", "/skeleton/hand/left", "",
++		                                    vr::VRSkeletalTracking_Full, nullptr, 0,
++		                                    &handle) == vr::VRInputError_InvalidHandle);
++		return fail ? vr::VRInitError_Driver_Failed : vr::VRInitError_None;
++	}
++	void
++	Deactivate() override
++	{
++		++deactivations;
++		CHECK(host->TrackedDeviceToPropertyContainer(index) == index + 1);
++	}
++	void
++	EnterStandby() override
++	{}
++	void *
++	GetComponent(const char *) override
++	{
++		return nullptr;
++	}
++	void
++	DebugRequest(const char *, char *, uint32_t) override
++	{}
++	vr::DriverPose_t
++	GetPose() override
++	{
++		return {};
++	}
++};
++
++struct Provider : vr::IServerTrackedDeviceProvider
++{
++	Context *host{};
++	Driver *first{};
++	bool cleaned{};
++	vr::EVRInitError
++	Init(vr::IVRDriverContext *context) override
++	{
++		host = dynamic_cast<Context *>(context);
++		CHECK(host);
++		return vr::VRInitError_None;
++	}
++	void
++	Cleanup() override
++	{
++		CHECK(!first || first->deactivations == 1);
++		cleaned = true;
++	}
++	const char *const *
++	GetInterfaceVersions() override
++	{
++		return nullptr;
++	}
++	void
++	RunFrame() override
++	{}
++	bool
++	ShouldBlockStandbyMode() override
++	{
++		return false;
++	}
++	void
++	EnterStandby() override
++	{}
++	void
++	LeaveStandby() override
++	{}
++};
++
++int
++main(int argc, char **argv)
++{
++	const bool enabled = argc > 1 && std::strcmp(argv[1], "on") == 0;
++	setenv("LH_DIAGNOSTIC_REFERENCES", enabled ? "1" : "0", 1);
++	Provider provider;
++	Driver drivers[18];
++	auto context = Context::create("/nonexistent-lh-test", "/nonexistent-lh-test", {&provider});
++	CHECK(context);
++	for (auto &driver : drivers)
++		driver.host = context.get();
++	auto add = [&](int i, const char *serial) {
++		return context->TrackedDeviceAdded(serial, vr::TrackedDeviceClass_TrackingReference, &drivers[i]);
++	};
++	CHECK(add(0, "reference-0") == enabled);
++	if (enabled) {
++		provider.first = &drivers[0];
++		CHECK(drivers[0].index == 17);
++		CHECK(!add(1, "reference-0"));
++		CHECK(drivers[1].activations == 0);
++		drivers[1].fail = true;
++		CHECK(!add(1, "failed-reference"));
++		CHECK(drivers[1].index == 18);
++		CHECK(context->TrackedDeviceToPropertyContainer(18) == vr::k_ulInvalidPropertyContainer);
++		vr::DriverPose_t ignored{};
++		context->TrackedDevicePoseUpdated(18, ignored, sizeof(ignored));
++		context->TrackedDevicePoseUpdated(UINT32_MAX, ignored, sizeof(ignored));
++		context->TrackedDevicePoseUpdated(17, ignored, 1);
++		for (int i = 2; i < 16; ++i)
++			CHECK(add(i, ("reference-" + std::to_string(i)).c_str()));
++		CHECK(drivers[15].index == 32);
++		CHECK(!add(16, "over-capacity"));
++		CHECK(drivers[16].activations == 0);
++		for (uint32_t i = 0; i <= 16; ++i)
++			CHECK(context->TrackedDeviceToPropertyContainer(i) == vr::k_ulInvalidPropertyContainer);
++		context->in_setup = false;
++		CHECK(!add(17, "late-reference"));
++		CHECK(drivers[17].activations == 0);
++	} else {
++		CHECK(drivers[0].activations == 0);
++		CHECK(context->TrackedDeviceToPropertyContainer(17) == vr::k_ulInvalidPropertyContainer);
++	}
++	context.reset();
++	CHECK(provider.cleaned);
++	for (int i = 0; i < 18; ++i)
++		CHECK(drivers[i].deactivations == unsigned(enabled && (i == 0 || (i >= 2 && i < 16))));
++}
+-- 
+2.56.0
+

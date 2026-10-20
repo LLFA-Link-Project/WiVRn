@@ -19,10 +19,27 @@
 
 #include "wivrn_ipc.h"
 #include "driver/wivrn_connection.h"
+#include "wivrn_config.h"
+
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+#include "steamvr_lh_interface.h"
+#endif
 
 std::unique_ptr<wivrn::wivrn_connection> connection;
 
 std::optional<to_monado::packets> receive_from_main()
 {
 	return wivrn_ipc_socket_monado->receive();
+}
+
+void standby_lighthouse_trackers()
+{
+#if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+	if (steamvr_lh_standby_trackers(nullptr))
+		return;
+#endif
+	send_to_main(from_monado::server_error{
+	        .where = "Turn off Lighthouse trackers",
+	        .message = "SteamVR tracked devices support is not active in this session.",
+	});
 }

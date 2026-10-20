@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Offline Lighthouse dataset utilities (Python standard library only)."""
+import argparse
+import io
+import gzip
+import hashlib
+import json
+import math
+import lzma
+import tarfile
+import os
+from pathlib import Path
+import secrets
+import shutil
+import struct
+import sqlite3
+import tempfile
+import sys
+import time
+
+VERSION = '2.1.0'
+
+
+def dump(path, value):
+    tmp = path.with_name(path.name + '.tmp')
+    with tmp.open('w') as f:
+        json.dump(value, f, ensure_ascii=True, allow_nan=False, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def read(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def stream_path(path):
+    """Read both current gzip streams and historical uncompressed sessions."""
+    compressed = path.with_name(path.name + '.gz')
+    return compressed if compressed.exists() else path
+
+
+def lines(path):
+    path = stream_path(path)
+    with (gzip.open(path, 'rt', encoding='utf-8') if path.suffix == '.gz' else path.open(encoding='utf-8')) as f:
+        for n, line in enumerate(f, 1):
+            yield json.loads(line, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x)))
+
+
+def clock_sample(phase):
+    before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    realtime = time.clock_gettime_ns(time.CLOCK_REALTIME)
+    after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    raw_before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    raw = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    raw_after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    return dict(schema_version=1, phase=phase, monotonic_before_ns=before,
+                realtime_ns=realtime, monotonic_after_ns=after,
+                offset_realtime_minus_monotonic_ns=realtime-(before+after)//2,
+                uncertainty_ns=(after-before+1)//2, raw_ns=raw,
+                raw_monotonic_before_ns=raw_before, raw_monotonic_after_ns=raw_after,
+                clocks=['CLOCK_REALTIME', 'CLOCK_MONOTONIC', 'CLOCK_MONOTONIC_RAW'])
+
+
+class ClockMap:
+    """Bracketing interpolation; estimates are explicitly not accuracy guarantees."""
+    def __init__(self, samples, jump_ns=1_000_000):
+        self.samples = samples
+        self.intervals = []
+        self.database = None
+        self.jumps = []
+        for a, b in zip(samples, samples[1:]):
+            dt = b['monotonic_before_ns']-a['monotonic_after_ns']
+            change = abs(b['offset_realtime_minus_monotonic_ns']-a['offset_realtime_minus_monotonic_ns'])
+            limit = jump_ns + max(dt, 0)*0.0005 + a['uncertainty_ns']+b['uncertainty_ns']
+            valid = dt > 0 and b['realtime_ns'] > a['realtime_ns'] and change <= limit
+            self.intervals.append((a, b, valid))
+            if not valid:
+                self.jumps.append(dict(monotonic_start_ns=a['monotonic_before_ns'],
+                                       monotonic_end_ns=b['monotonic_after_ns'], offset_change_ns=change))
+
+    def convert(self, realtime_ns):
+        # Overlapping realtime ranges after a backward step are ambiguous.
+        if self.database is not None:
+            rows = self.database.execute('SELECT a,b,valid FROM intervals WHERE lo BETWEEN ? AND ? AND hi >= ? LIMIT 2', (realtime_ns-self.max_interval_span, realtime_ns, realtime_ns))
+            intervals = [(json.loads(a), json.loads(b), bool(ok)) for a, b, ok in rows]
+        else:
+            intervals = [(a, b, ok) for a, b, ok in self.intervals
+                         if min(a['realtime_ns'], b['realtime_ns']) <= realtime_ns <= max(a['realtime_ns'], b['realtime_ns'])]
+        if len(intervals) != 1 or not intervals[0][2]:
+            return dict(monotonic_estimate_ns=None, estimated_error_ns=None, alignment='unbracketed_or_clock_jump')
+        a, b, _ = intervals[0]
+        fraction = (realtime_ns-a['realtime_ns'])/(b['realtime_ns']-a['realtime_ns'])
+        off_a, off_b = (a['offset_realtime_minus_monotonic_ns'], b['offset_realtime_minus_monotonic_ns'])
+        offset = off_a + round(fraction*(off_b-off_a))
+        # Include observed offset variation rather than claiming half the read bracket
+        # measures kernel capture/clock drift accuracy. USB timestamp quantization: 1 us.
+        estimate = max(a['uncertainty_ns'], b['uncertainty_ns'])+abs(off_b-off_a)+1000
+        return dict(monotonic_estimate_ns=realtime_ns-offset, estimated_error_ns=estimate,
+                    alignment='interpolated_estimate', estimate_clock='CLOCK_MONOTONIC')
+
+    @classmethod
+    def from_file(cls, path):
+        result = cls([])
+        # Temporary SQLite file, 2MiB page cache; originals remain in clock_sync.jsonl.
+        result.temp = tempfile.TemporaryDirectory(prefix='lh-clock-index-')
+        result.database = sqlite3.connect(str(Path(result.temp.name)/'clock.sqlite'))
+        result.database.execute('PRAGMA cache_size=-2048')
+        result.database.execute('CREATE TABLE intervals(lo INTEGER, hi INTEGER, a TEXT, b TEXT, valid INTEGER)')
+        result.sample_count = 0
+        result.max_uncertainty = None
+        result.jump_count = 0
+        result.max_interval_span = 0
+        result.first = result.last = None
+        previous = None
+        for current in lines(path):
+            result.sample_count += 1
+            result.max_uncertainty = max(result.max_uncertainty or 0, current['uncertainty_ns'])
+            if result.first is None:
+                result.first = current
+            if previous is not None:
+                interval = cls([previous, current])
+                a, b, valid = interval.intervals[0]
+                result.max_interval_span = max(result.max_interval_span, abs(b['realtime_ns']-a['realtime_ns']))
+                result.database.execute('INSERT INTO intervals VALUES(?,?,?,?,?)',
+                                        (min(a['realtime_ns'], b['realtime_ns']), max(a['realtime_ns'], b['realtime_ns']), json.dumps(a), json.dumps(b), int(valid)))
+                result.jump_count += len(interval.jumps)
+                if len(result.jumps) < 1000:
+                    result.jumps.extend(interval.jumps)
+                if result.sample_count % 1000 == 0:
+                    result.database.commit()
+            previous = current
+        result.last = previous
+        result.database.execute('CREATE INDEX realtime_intervals ON intervals(lo,hi)')
+        result.database.commit()
+        return result
+
+    def close(self):
+        if self.database is not None:
+            self.database.close()
+            self.database = None
+            self.temp.cleanup()
+
+    def __del__(self):
+        if getattr(self, 'database', None) is not None:
+            self.close()
+
+    def report(self):
+        if self.database is not None:
+            return dict(sample_count=self.sample_count, clock_jump_intervals=self.jumps, clock_jump_count=self.jump_count,
+                        clock_jump_report_truncated=self.jump_count > len(self.jumps), max_read_uncertainty_ns=self.max_uncertainty,
+                        error_model='read brackets + observed interval offset variation + 1000ns USB quantization; not a guaranteed bound',
+                        unsampled_steps_detectable=False)
+        return dict(sample_count=len(self.samples), clock_jump_intervals=self.jumps,
+                    max_read_uncertainty_ns=max((s['uncertainty_ns'] for s in self.samples), default=None),
+                    error_model='read brackets + observed interval offset variation + 1000ns USB quantization; not a guaranteed bound',
+                    unsampled_steps_detectable=False)
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(1024*1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def pcap_records(path):
+    """Read original DLT_USB_LINUX_MMAPPED bytes without modifying the replay file."""
+    with gzip.open(path, 'rb') as f:
+        hdr = f.read(24)
+        formats = {b'\xd4\xc3\xb2\xa1': ('<', 1000), b'\xa1\xb2\xc3\xd4': ('>', 1000),
+                   b'\x4d\x3c\xb2\xa1': ('<', 1), b'\xa1\xb2\x3c\x4d': ('>', 1)}
+        if len(hdr) != 24 or hdr[:4] not in formats:
+            raise ValueError('Invalid classic pcap header')
+        endian, scale = formats[hdr[:4]]
+        _, major, minor, _, _, snaplen, linktype = struct.unpack(endian+'IHHIIII', hdr)
+        if (major, minor, linktype) != (2, 4, 220):
+            raise ValueError('Expected pcap 2.4 DLT_USB_LINUX_MMAPPED (220)')
+        index = 0
+        while True:
+            ph = f.read(16)
+            if not ph:
+                break
+            if len(ph) != 16:
+                raise ValueError('Truncated packet header')
+            sec, fraction, caplen, length = struct.unpack(endian+'IIII', ph)
+            if caplen > snaplen or caplen > 16*1024*1024 or caplen < 64 or caplen > length:
+                raise ValueError('Invalid USB packet capture length')
+            packet = f.read(caplen)
+            if len(packet) != caplen:
+                raise ValueError('Truncated packet')
+            urb, event, transfer, endpoint, address, bus, setup_flag, data_flag, ts_sec, ts_us, status, urb_len, data_len = struct.unpack_from(endian+'QBBBBHBBqiiII', packet)
+            if not 0 <= ts_us < 1_000_000:
+                raise ValueError('Invalid USB timestamp fraction')
+            available = caplen-64
+            has_data = data_flag == 0
+            payload_incomplete = has_data and (data_len > available or urb_len > available)
+            yield dict(schema_version=1, packet_index=index, bus=bus, address=address,
+                       endpoint=endpoint & 0x7f, direction='in' if endpoint & 0x80 else 'out',
+                       transfer_type=transfer, urb_id=f'{urb:016x}', event=chr(event), urb_status=status,
+                       pcap_timestamp_ns=sec*1_000_000_000+fraction*scale,
+                       usb_timestamp_ns=ts_sec*1_000_000_000+ts_us*1000,
+                       capture_clock='CLOCK_REALTIME', clock_basis='Linux mon_bin ktime_get_real_ts64; validate epoch against clock_sync',
+                       captured_length=caplen, original_length=length, urb_length=urb_len,
+                       data_length=data_len, data_flag=data_flag, setup_flag=setup_flag,
+                       payload_available=has_data, payload_captured_bytes=available,
+                       payload_incomplete=payload_incomplete, pcap_truncated=caplen < length,
+                       payload_location='usb.pcap.gz: original packet after 64-byte header; iso descriptors retained')
+            index += 1
+
+
+def validate(session, write=True):
+    issues, warnings = set(), set()
+    manifest = read(session/'manifest.json', {})
+    if manifest.get('status') == 'abnormal':
+        issues.add('session_ended_abnormally')
+    if write and manifest.get('status') != 'complete':
+        issues.add('manifest_not_finalized_normally')
+    mapping = ClockMap.from_file(session/'clock_sync.jsonl') if stream_path(session/'clock_sync.jsonl').exists() else ClockMap([])
+    sync_count = getattr(mapping, 'sample_count', 0)
+    pose_count = 0
+    ids = set()
+    last_time = {}
+    last_seq = -1
+    invalid_components = 0
+    if stream_path(session/'poses.jsonl').exists():
+        try:
+            for p in lines(session/'poses.jsonl'):
+                pose_count += 1
+                if p['stream'] != 'valve_driver_pose' or p['capture_clock'] != 'CLOCK_MONOTONIC':
+                    issues.add('wrong_pose_stream_or_clock'); break
+                dev, t, seq = p['device_id'], p['capture_time_ns'], p['sequence']
+                ids.add(dev)
+                if seq <= last_seq:
+                    # Concurrent callbacks can acquire queue lock out of capture order.
+                    warnings.add('callback_queue_order_differs_from_sequence')
+                last_seq = seq
+                if t < last_time.get(dev, 0):
+                    warnings.add('per_device_capture_order_differs')
+                last_time[dev] = t
+                if sync_count and not mapping.first['monotonic_before_ns'] <= t <= mapping.last['monotonic_after_ns']:
+                    issues.add('pose_outside_sync_session')
+                for key, size in [('position_m', 3), ('orientation_xyzw', 4)]:
+                    v = p[key]
+                    if len(v) != size:
+                        issues.add('invalid_vector_size'); continue
+                    if any(x is None or not isinstance(x, (int, float)) or not math.isfinite(x) for x in v):
+                        invalid_components += 1
+                        if p['pose_is_valid']:
+                            issues.add('nonfinite_valid_pose')
+                    elif key == 'orientation_xyzw' and p['pose_is_valid'] and abs(sum(x*x for x in v)-1) > 0.02:
+                        issues.add('nonunit_valid_quaternion')
+        except (ValueError, KeyError, TypeError) as e:
+            issues.add(f'pose_parse_error: {e}')
+    if not pose_count:
+        issues.add('no_reference_poses')
+    packet_count = incomplete = unaligned = pcap_truncated = 0
+    max_alignment_error = None
+    observed = set()
+    if (session/'usb.pcap.gz').exists():
+        try:
+            for p in pcap_records(session/'usb.pcap.gz'):
+                packet_count += 1
+                observed.add((p['bus'], p['address']))
+                incomplete += int(p['payload_incomplete'])
+                pcap_truncated += int(p['pcap_truncated'])
+                aligned = mapping.convert(p['usb_timestamp_ns'])
+                unaligned += aligned['monotonic_estimate_ns'] is None
+                if aligned['estimated_error_ns'] is not None:
+                    max_alignment_error = max(max_alignment_error or 0, aligned['estimated_error_ns'])
+        except (OSError, EOFError, ValueError, struct.error) as e:
+            issues.add(f'usb_parse_error: {e}')
+    if not packet_count:
+        issues.add('no_usb_packets')
+    if not (session/'usb.pcap.gz.usbdevs').exists():
+        issues.add('missing_usbdevs')
+    pose_status = read(session/'pose_status.json', {})
+    usb_status = read(session/'usb_stats.json', {})
+    if not pose_status.get('stopped'):
+        issues.add('pose_writer_not_finalized')
+    if pose_status.get('error'):
+        issues.add('pose_writer_error: '+pose_status['error'])
+    if pose_status.get('dropped', 0):
+        warnings.add('pose_records_dropped')
+    if usb_status.get('write_error'):
+        issues.add('usb_write_error')
+    if not usb_status.get('stats_available'):
+        warnings.add('usb_capture_loss_unknown')
+    elif usb_status.get('dropped', 0) or usb_status.get('interface_dropped', 0):
+        warnings.add('usb_capture_records_dropped')
+    if pcap_truncated:
+        warnings.add('usb_pcap_packets_truncated')
+    if incomplete:
+        warnings.add('usb_payload_incomplete')
+    if unaligned:
+        warnings.add('usb_timestamps_not_aligned')
+    if packet_count and unaligned == packet_count:
+        issues.add('no_usb_timestamps_in_verified_clock_intervals')
+    if sync_count < 2:
+        issues.add('insufficient_clock_samples')
+    if mapping.jumps:
+        warnings.add('clock_jump_intervals')
+    for name, expected in manifest.get('files_sha256', {}).items():
+        if Path(name).is_absolute() or '..' in Path(name).parts or not (session/name).is_file() or sha(session/name) != expected:
+            issues.add('hash_mismatch: '+name)
+    unobserved = [d for d in read(session/'devices.json', [])
+                  if (d['bus'], d['address']) not in observed]
+    unseen_keys = {(d['bus'], d['address']) for d in unobserved}
+    unseen_truncated = False
+    if stream_path(session/'usb_devices.jsonl').exists():
+        for snapshot in lines(session/'usb_devices.jsonl'):
+            for d in snapshot['devices']:
+                key = (d['bus'], d['address'])
+                if key not in observed and key not in unseen_keys:
+                    if len(unobserved) < 4096:
+                        unobserved.append(d); unseen_keys.add(key)
+                    else:
+                        unseen_truncated = True
+    if unobserved:
+        warnings.add('usb_target_devices_not_observed')
+    result = dict(schema_version=1, full_content_validation=True, validation_scope='pose values/structure, USB framing/timestamps, clock mapping and file hashes', valid=not issues, issues=sorted(set(issues)), warnings=sorted(set(warnings)),
+                  pose_count=pose_count, device_ids=sorted(ids), nonfinite_pose_fields=invalid_components,
+                  usb_packet_count=packet_count, usb_incomplete_payloads=incomplete, usb_pcap_truncated_packets=pcap_truncated, unaligned_usb_packets=unaligned,
+                  usb_unobserved_devices=unobserved, usb_unobserved_report_truncated=unseen_truncated, timestamp_alignment_complete=bool(packet_count) and not unaligned, clock_sync=mapping.report(), max_estimated_usb_alignment_error_ns=max_alignment_error,
+                  hardware_tracking_quality_test='not_run', libsurvive_replay=manifest.get('libsurvive_replay', 'not_run'))
+    if write:
+        dump(session/'validation.json', result)
+    return result
+
+
+def align(session):
+    mapping = ClockMap.from_file(session/'clock_sync.jsonl')
+    with gzip.open(session/'usb_timestamps.jsonl.gz', 'wt', encoding='utf-8', compresslevel=6) as output:
+        for packet in pcap_records(session/'usb.pcap.gz'):
+            packet.update(mapping.convert(packet['usb_timestamp_ns']))
+            output.write(json.dumps(packet, allow_nan=False)+'\n')
+    return mapping.report()
+
+
+def export_public(source, dest):
+    # USB configuration payloads contain identities; retaining them cannot promise anonymity.
+    dest.mkdir(mode=0o700, parents=True, exist_ok=False)
+    salt = secrets.token_bytes(32)
+    def identity(value):
+        return hashlib.sha256(salt+value.encode()).hexdigest()
+    for name in ('poses.jsonl', 'events.jsonl'):
+        with gzip.open(dest/(name+'.gz'), 'wt', encoding='utf-8', compresslevel=6) as f:
+            for record in lines(source/name):
+                record['device_id'] = identity(record['device_id'])
+                # Diagnostic metadata includes a stable universe identity and room calibration.
+                record.pop('universe_id', None)
+                record.pop('chaperone_transform', None)
+                f.write(json.dumps(record, allow_nan=False)+'\n')
+    with gzip.open(dest/'clock_sync.jsonl.gz', 'wb', compresslevel=6) as output:
+        path = stream_path(source/'clock_sync.jsonl')
+        with (gzip.open(path, 'rb') if path.suffix == '.gz' else path.open('rb')) as input_file:
+            shutil.copyfileobj(input_file, output, 1024*1024)
+    dump(dest/'manifest.json', dict(schema_version=1, public_export=True,
+                                    anonymization='session salted SHA256 device IDs; salt discarded; raw USB, serials, calibration and host paths excluded',
+                                    usb_replay_available=False, logger_version=VERSION))
+
+
+def compress_sessions(source, output):
+    """One standard tar.xz per finalized session, recompressing gzip contents."""
+    source, output = source.resolve(), output.resolve()
+    sessions = [source] if (source/'manifest.json').is_file() else sorted(
+        p for p in source.iterdir() if p.is_dir() and (p/'manifest.json').is_file())
+    if not sessions:
+        raise ValueError('No sessions found')
+    for session in sessions:
+        if output == session or session in output.parents:
+            raise ValueError('Archive output must be outside the session')
+    output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    results = []
+    for session in sessions:
+        manifest = read(session/'manifest.json', {})
+        if manifest.get('status') not in ('complete', 'abnormal') or manifest.get('end_realtime_ns') is None:
+            raise ValueError(f'Session is still recording or not finalized: {session}')
+        target = output/(session.name+'.tar.xz')
+        if target.exists():
+            raise FileExistsError(target)
+        # Streaming tar/xz, no data-set-sized memory buffer. Preset 9e is deliberately
+        # expensive (~674 MiB encoder memory); recording uses lightweight gzip instead.
+        def inventory():
+            result = {}
+            for path in [session, *sorted(session.rglob('*'))]:
+                if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                    raise ValueError(f'Only regular files and directories can be archived: {path}')
+                stat = path.stat()
+                result[path] = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            return result
+        before = inventory()
+        entries, hashes, gzip_files = {}, {}, {}
+        for path in before:
+            name = str(path.relative_to(session))
+            archived_name = name[:-3] if path.is_file() and name.endswith('.gz') else name
+            if archived_name in entries:
+                raise ValueError(f'Archive name collision: {archived_name}')
+            entries[archived_name] = path
+            if name in manifest.get('files_sha256', {}) and sha(path) != manifest['files_sha256'][name]:
+                raise ValueError(f'Source hash mismatch: {name}')
+            if archived_name != name:
+                gzip_files[archived_name] = name
+        with tempfile.TemporaryDirectory(prefix='.lh-compress-', dir=output) as staging:
+            temp = Path(staging)/target.name
+            with lzma.open(temp, 'wb', format=lzma.FORMAT_XZ,
+                           preset=9 | lzma.PRESET_EXTREME) as compressed:
+                with tarfile.open(fileobj=compressed, mode='w|', format=tarfile.PAX_FORMAT) as archive:
+                    for name, path in entries.items():
+                        if name == 'manifest.json':
+                            continue
+                        arcname = str(Path(session.name)/name)
+                        if name in gzip_files:
+                            # Tar requires the expanded size up front. Two bounded
+                            # reads verify the gzip CRC and avoid staging full logs.
+                            size, digest = 0, hashlib.sha256()
+                            with gzip.open(path, 'rb') as input_file:
+                                for block in iter(lambda: input_file.read(1024*1024), b''):
+                                    size += len(block); digest.update(block)
+                            info = archive.gettarinfo(str(path), arcname=arcname)
+                            info.size = size
+                            with gzip.open(path, 'rb') as input_file:
+                                archive.addfile(info, input_file)
+                            if gzip_files[name] in manifest.get('files_sha256', {}):
+                                hashes[name] = digest.hexdigest()
+                        else:
+                            archive.add(path, arcname=arcname, recursive=False)
+                            if name in manifest.get('files_sha256', {}):
+                                hashes[name] = sha(path)
+                    archived_manifest = dict(manifest)
+                    archived_manifest['files_sha256'] = hashes
+                    archived_manifest['archive_recompression'] = dict(
+                        gzip_files=gzip_files, source_files_sha256=manifest.get('files_sha256', {}),
+                        format='tar.xz', preset='9e')
+                    if 'stream_compression' in archived_manifest:
+                        archived_manifest['stream_compression'] = dict(format='none', level=None,
+                            jsonl_streams=[name for name in entries if name.endswith('.jsonl')])
+                    data = (json.dumps(archived_manifest, allow_nan=False, indent=2)+'\n').encode()
+                    info = tarfile.TarInfo(str(Path(session.name)/'manifest.json'))
+                    info.size, info.mode = len(data), 0o600
+                    archive.addfile(info, io.BytesIO(data))
+            if inventory() != before:
+                raise ValueError(f'Session changed during compression: {session}')
+            # Exclusive publish: existing archives are never overwritten.
+            os.link(temp, target)
+        results.append(str(target))
+    return results
+
+
+def decompress_sessions(source, output):
+    """Restore standard tar.xz archives with bounded streaming extraction."""
+    source, output = source.resolve(), output.resolve()
+    archives = sorted(source.glob('*.tar.xz')) if source.is_dir() else [source]
+    if not archives:
+        raise ValueError('No .tar.xz archives found')
+    output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    results = []
+    for path in archives:
+        if not path.name.endswith('.tar.xz'):
+            raise ValueError('Expected .tar.xz archive')
+        session_name = path.name[:-7]
+        if session_name in ('', '.', '..'):
+            raise ValueError('Invalid session name')
+        target = output/session_name
+        if target.exists():
+            raise FileExistsError(target)
+        with tempfile.TemporaryDirectory(prefix='.lh-extract-', dir=output) as staging:
+            staging = Path(staging)
+            seen = set()
+            # Explicit extraction supports Python 3.9 and rejects links, special
+            # files, traversal and duplicate entries without relying on tar defaults.
+            with lzma.open(path, 'rb') as compressed:
+                with tarfile.open(fileobj=compressed, mode='r|') as archive:
+                    for member in archive:
+                        name = Path(member.name)
+                        if (name.is_absolute() or '..' in name.parts or not name.parts or
+                                name.parts[0] != session_name or member.name in seen or
+                                not (member.isdir() or member.isfile())):
+                            raise ValueError(f'Unsafe archive entry: {member.name}')
+                        seen.add(member.name)
+                        dest = staging/name
+                        if member.isdir():
+                            dest.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        else:
+                            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            with archive.extractfile(member) as input_file, dest.open('xb') as output_file:
+                                shutil.copyfileobj(input_file, output_file, 1024*1024)
+                            dest.chmod(0o600)
+                # Tar EOF precedes the xz trailer; drain to verify CRC and truncation.
+                while compressed.read(1024*1024):
+                    pass
+            restored = staging/session_name
+            if not (restored/'manifest.json').is_file():
+                raise ValueError('Archive contains no session manifest')
+            manifest = read(restored/'manifest.json')
+            if not isinstance(manifest, dict):
+                raise ValueError('Invalid session manifest')
+            recompression = manifest.get('archive_recompression', {})
+            if not isinstance(recompression, dict):
+                raise ValueError('Invalid archive recompression metadata')
+            gzip_files = recompression.get('gzip_files', {})
+            if not isinstance(gzip_files, dict):
+                raise ValueError('Invalid gzip correspondence')
+            for name, destination in gzip_files.items():
+                relative = Path(name)
+                if (relative.is_absolute() or '..' in relative.parts or destination != name+'.gz' or
+                        not (restored/relative).is_file()):
+                    raise ValueError('Invalid gzip correspondence')
+            old_hashes = manifest.get('files_sha256', {})
+            for name, expected in old_hashes.items():
+                relative = Path(name)
+                if (relative.is_absolute() or '..' in relative.parts or not (restored/relative).is_file() or
+                        sha(restored/relative) != expected):
+                    raise ValueError(f'Archive content hash mismatch: {name}')
+            renamed = {}
+            for original in sorted(restored.rglob('*')):
+                if not original.is_file():
+                    continue
+                name = str(original.relative_to(restored))
+                if name.endswith('.gz'):
+                    destination = original
+                elif name in gzip_files or name.endswith(('.jsonl', '.pcap')):
+                    destination = original.with_name(original.name+'.gz')
+                    if destination.exists():
+                        raise ValueError(f'Restored name collision: {destination.name}')
+                else:
+                    continue
+                # Normalize old archives and new expanded tar members to level 6.
+                with tempfile.TemporaryDirectory(prefix='.lh-gzip-', dir=restored) as scratch:
+                    temp = Path(scratch)/'stream.gz'
+                    with (gzip.open(original, 'rb') if name.endswith('.gz') else original.open('rb')) as input_file:
+                        with temp.open('wb') as output_file:
+                            with gzip.GzipFile(filename='', mode='wb', fileobj=output_file,
+                                               compresslevel=6, mtime=0) as gzip_file:
+                                shutil.copyfileobj(input_file, gzip_file, 1024*1024)
+                    temp.replace(destination)
+                if destination != original:
+                    original.unlink()
+                renamed[name] = str(destination.relative_to(restored))
+            manifest['files_sha256'] = {renamed.get(name, name): sha(restored/renamed.get(name, name))
+                                        for name in old_hashes}
+            manifest['stream_compression'] = dict(format='gzip', level=6,
+                jsonl_streams=sorted(str(p.relative_to(restored)) for p in restored.rglob('*.jsonl.gz')))
+            manifest['archive_restore'] = dict(format='gzip', level=6, archive=path.name,
+                source_files_sha256=recompression.get('source_files_sha256', {}))
+            manifest.pop('archive_recompression', None)
+            dump(restored/'manifest.json', manifest)
+            if (restored/'validation.json').is_file():
+                validate(restored)
+            if target.exists():
+                raise FileExistsError(target)
+            restored.rename(target)
+        results.append(str(target))
+    return results
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Offline Lighthouse dataset validation, clock alignment, public export and tar.xz archival. Recording is built into wivrn-server.')
+    sub = parser.add_subparsers(dest='command', required=True)
+    for name in ('validate', 'align'):
+        p = sub.add_parser(name); p.add_argument('session', type=Path)
+    p = sub.add_parser('export-public'); p.add_argument('session', type=Path); p.add_argument('output', type=Path)
+    for name in ('compress', 'decompress'):
+        p = sub.add_parser(name)
+        p.add_argument('source', type=Path, help='Session/archive, or directory containing sessions/archives')
+        p.add_argument('--output', required=True, type=Path, help='Destination directory (existing data is never overwritten)')
+    args = parser.parse_args(argv)
+    if args.command == 'compress':
+        print(json.dumps(compress_sessions(args.source, args.output), indent=2)); return 0
+    if args.command == 'decompress':
+        print(json.dumps(decompress_sessions(args.source, args.output), indent=2)); return 0
+    if args.command == 'validate':
+        result = validate(args.session); print(json.dumps(result, indent=2)); return int(not result['valid'])
+    if args.command == 'align':
+        print(json.dumps(align(args.session), indent=2)); return 0
+    if args.command == 'export-public':
+        export_public(args.session, args.output); return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, EOFError, ValueError, KeyError, tarfile.TarError, lzma.LZMAError) as error:
+        print(f'lh-recorder: {error}', file=sys.stderr)
+        sys.exit(1)

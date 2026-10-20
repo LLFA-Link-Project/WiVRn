@@ -1,0 +1,441 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Mon, 12 Oct 2026 12:00:00 +0900
+Subject: [PATCH] d/steamvr_lh: passively record raw Valve reference poses
+
+---
+
+diff --git a/src/xrt/drivers/CMakeLists.txt b/src/xrt/drivers/CMakeLists.txt
+index 5ec99108b..1046cdf87 100644
+--- a/src/xrt/drivers/CMakeLists.txt
++++ b/src/xrt/drivers/CMakeLists.txt
+@@ -638,6 +638,7 @@ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
+ 		drv_steamvr_lh STATIC
+ 		steamvr_lh/steamvr_lh.cpp
+ 		steamvr_lh/device.cpp
++		steamvr_lh/reference_recorder.cpp
+ 		steamvr_lh/interfaces/driver_manager.cpp
+ 		steamvr_lh/interfaces/iobuffer.cpp
+ 		steamvr_lh/interfaces/resources.cpp
+diff --git a/src/xrt/drivers/steamvr_lh/reference_recorder.cpp b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+new file mode 100644
+index 000000000..cf372e5c5
+--- /dev/null
++++ b/src/xrt/drivers/steamvr_lh/reference_recorder.cpp
+@@ -0,0 +1,362 @@
++// SPDX-License-Identifier: BSL-1.0
++#include "reference_recorder.hpp"
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <condition_variable>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <map>
++#include <locale>
++#include <memory>
++#include <mutex>
++#include <sstream>
++#include <thread>
++#include <tuple>
++#include <time.h>
++#include <unistd.h>
++
++namespace lighthouse_reference {
++namespace {
++	int64_t
++	now()
++	{
++		timespec t{};
++		clock_gettime(CLOCK_MONOTONIC, &t);
++		return int64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
++	}
++	std::string
++	quoted(const char *s)
++	{
++		std::ostringstream o;
++		o.imbue(std::locale::classic());
++		o << '"';
++		for (const unsigned char *p = reinterpret_cast<const unsigned char *>(s); *p; ++p) {
++			if (*p == '"' || *p == '\\')
++				o << '\\' << char(*p);
++			else if (*p < 32 || *p >= 127)
++				o << "\\u00" << std::hex << std::setw(2) << std::setfill('0') << unsigned(*p)
++				  << std::dec;
++			else
++				o << char(*p);
++		}
++		o << '"';
++		return o.str();
++	}
++	std::string
++	number(double v)
++	{
++		if (!std::isfinite(v))
++			return "null";
++		std::ostringstream o;
++		o.imbue(std::locale::classic());
++		o << std::setprecision(17) << v;
++		return o.str();
++	}
++	std::string
++	vector(const double *v)
++	{
++		return "[" + number(v[0]) + "," + number(v[1]) + "," + number(v[2]) + "]";
++	}
++	std::string
++	quat(vr::HmdQuaternion_t q)
++	{
++		return "[" + number(q.x) + "," + number(q.y) + "," + number(q.z) + "," + number(q.w) + "]";
++	}
++	struct Sample
++	{
++		char serial[256]{};
++		vr::DriverPose_t p{};
++		uint64_t seq = 0;
++		int64_t t = 0;
++		uint32_t index = 0;
++		int cls = -1;
++	};
++	class Recorder
++	{
++		static constexpr size_t capacity = 4096;
++		std::unique_ptr<std::array<Sample, capacity>> queue;
++		size_t head = 0, tail = 0, count = 0;
++		std::mutex mutex;
++		std::condition_variable wake;
++		std::atomic<bool> accepting{false}, shutdown{false};
++		bool configured = false;
++		std::atomic<uint64_t> sequence{0}, dropped{0};
++		std::thread writer;
++		std::string directory;
++		uint64_t written = 0;
++		std::string error;
++		std::map<std::string, int> classes;
++		std::map<std::string, std::tuple<bool, bool, int>> states;
++		bool
++		emit(std::ofstream &out, const std::string &line)
++		{
++			out << line << '\n';
++			if (!out) {
++				error = "io_error";
++				return false;
++			}
++			return true;
++		}
++		void
++		status(bool stopped)
++		{
++			std::ofstream o(directory + "/pose_status.json.tmp");
++			o.imbue(std::locale::classic());
++			o << "{\"schema_version\":1,\"pid\":" << getpid()
++			  << ",\"stopped\":" << (stopped ? "true" : "false") << ",\"attempted\":" << sequence.load()
++			  << ",\"written\":" << written << ",\"dropped\":" << dropped.load()
++			  << ",\"queue_capacity\":" << capacity << ",\"error\":" << quoted(error.c_str()) << "}\n";
++			o.close();
++			if (o)
++				rename((directory + "/pose_status.json.tmp").c_str(),
++				       (directory + "/pose_status.json").c_str());
++		}
++		void
++		run() noexcept
++		{
++			try {
++				std::ofstream poses(directory + "/poses.jsonl", std::ios::app),
++				    events(directory + "/events.jsonl", std::ios::app);
++				if (!poses || !events)
++					error = "open_error";
++				status(false);
++				for (;;) {
++					Sample s;
++					bool have = false;
++					{
++						std::unique_lock<std::mutex> lock(mutex);
++						if (!count && !shutdown)
++							wake.wait_for(lock, std::chrono::milliseconds(100));
++						if (count) {
++							s = (*queue)[tail];
++							tail = (tail + 1) % capacity;
++							--count;
++							have = true;
++						}
++					}
++					if (have) {
++						std::string id = s.serial;
++						std::ostringstream o;
++						o.imbue(std::locale::classic());
++						o << "{\"schema_version\":1,\"device_id\":" << quoted(s.serial)
++						  << ",\"sequence\":" << s.seq << ",\"capture_time_ns\":" << s.t
++						  << ",\"capture_clock\":\"CLOCK_MONOTONIC\"";
++						if (s.cls >= 0) {
++							classes[id] = s.cls;
++							o << ",\"event\":\"device_announced\",\"device_class\":"
++							  << s.cls << "}";
++							if (!emit(events, o.str()))
++								++dropped;
++						} else {
++							auto &p = s.p;
++							auto state = std::make_tuple(p.deviceIsConnected, p.poseIsValid,
++							                             int(p.result));
++							if (!states.count(id) || states[id] != state) {
++								std::ostringstream e;
++								e.imbue(std::locale::classic());
++								e << o.str()
++								  << ",\"event\":\"driver_state_changed\",\"device_is_"
++								     "connected\":"
++								  << (std::get<0>(state) ? "true" : "false")
++								  << ",\"pose_is_valid\":"
++								  << (std::get<1>(state) ? "true" : "false")
++								  << ",\"tracking_result\":" << std::get<2>(state)
++								  << "}";
++								emit(events, e.str());
++								states[id] = state;
++							}
++							o << ",\"stream\":\"valve_driver_pose\",\"source\":\"steamvr_"
++							     "lh\",\"driver_index\":"
++							  << s.index << ",\"device_class\":"
++							  << (classes.count(id) ? std::to_string(classes[id]) : "null")
++							  << ",\"coordinate_frame\":\"valve_driver_world_tracking_"
++							     "reference\",\"quaternion_order\":\"xyzw\""
++							  << ",\"pose_time_offset_s\":" << number(p.poseTimeOffset)
++							  << ",\"pose_time_estimate_ns\":" << ([&]() -> std::string {
++								     long double v =
++								         static_cast<long double>(s.t) +
++								         static_cast<long double>(p.poseTimeOffset) *
++								             1e9L;
++								     return std::isfinite(v) && v >= 0 &&
++								                    v < 9223372036854775807.L
++								                ? std::to_string(
++								                      static_cast<int64_t>(v))
++										: "null";
++							     })()
++							  << ",\"pose_time_estimate_clock\":\"CLOCK_MONOTONIC\",\"pose_"
++							     "time_estimate_basis\":\"callback_entry_plus_driver_"
++							     "offset; driver_call_to_callback_delay_unknown\""
++							  << ",\"generation_time_ns\":null,\"reference_time_ns\":null,"
++							     "\"prediction_horizon_s\":null"
++							  << ",\"tracking_result\":" << int(p.result)
++							  << ",\"pose_is_valid\":" << (p.poseIsValid ? "true" : "false")
++							  << ",\"position_valid\":null,\"orientation_valid\":null,"
++							     "\"linear_velocity_valid\":null,\"angular_velocity_"
++							     "valid\":null"
++							  << ",\"device_is_connected\":"
++							  << (p.deviceIsConnected ? "true" : "false")
++							  << ",\"will_drift_in_yaw\":"
++							  << (p.willDriftInYaw ? "true" : "false")
++							  << ",\"should_apply_head_model\":"
++							  << (p.shouldApplyHeadModel ? "true" : "false")
++							  << ",\"position_m\":" << vector(p.vecPosition)
++							  << ",\"orientation_xyzw\":" << quat(p.qRotation)
++							  << ",\"linear_velocity_m_s\":" << vector(p.vecVelocity)
++							  << ",\"angular_velocity_rad_s\":"
++							  << vector(p.vecAngularVelocity)
++							  << ",\"linear_acceleration_driver\":"
++							  << vector(p.vecAcceleration)
++							  << ",\"linear_acceleration_unit\":\"openvr_header_says_m_s_"
++							     "ambiguous\""
++							  << ",\"angular_acceleration_rad_s2\":"
++							  << vector(p.vecAngularAcceleration)
++							  << ",\"world_from_driver_orientation_xyzw\":"
++							  << quat(p.qWorldFromDriverRotation)
++							  << ",\"world_from_driver_translation_m\":"
++							  << vector(p.vecWorldFromDriverTranslation)
++							  << ",\"driver_from_head_orientation_xyzw\":"
++							  << quat(p.qDriverFromHeadRotation)
++							  << ",\"driver_from_head_translation_m\":"
++							  << vector(p.vecDriverFromHeadTranslation) << "}";
++							if (emit(poses, o.str()))
++								++written;
++							else
++								++dropped;
++						}
++					}
++					if (shutdown || !error.empty())
++						accepting = false;
++					if (!accepting) {
++						std::lock_guard<std::mutex> lock(mutex);
++						if (!count)
++							break;
++					}
++					if (!have) {
++						poses.flush();
++						events.flush();
++						if (!poses || !events) {
++							error = "flush_error";
++							accepting = false;
++						}
++						status(false);
++					}
++				}
++				poses.flush();
++				events.flush();
++				if (!poses || !events)
++					error = "flush_error";
++				status(true);
++			} catch (...) {
++				accepting = false;
++				error = "writer_exception";
++				try {
++					status(true);
++				} catch (...) {
++				}
++			}
++		}
++
++	public:
++		Recorder() noexcept
++		{
++			const char *enabled = getenv("LH_RECORDER_ENABLE"), *out = getenv("LH_RECORDER_OUTPUT");
++			if (!enabled || std::strcmp(enabled, "1") || !out)
++				return;
++			try {
++				directory = out;
++				queue = std::make_unique<std::array<Sample, capacity>>();
++				accepting = true;
++				writer = std::thread([this] { run(); });
++				configured = true;
++			} catch (...) {
++				accepting = false;
++			}
++		}
++		~Recorder()
++		{
++			accepting = false;
++			shutdown = true;
++			wake.notify_one();
++			if (writer.joinable())
++				writer.join();
++			if (configured) {
++				try {
++					status(true);
++				} catch (...) {
++				}
++			}
++		}
++		bool
++		enabled() const
++		{
++			return configured;
++		}
++		void
++		push(const char *serial, uint32_t index, const vr::DriverPose_t *p, int cls, int64_t t) noexcept
++		{
++			if (!enabled())
++				return;
++			auto seq = sequence.fetch_add(1);
++			if (!accepting.load(std::memory_order_relaxed)) {
++				++dropped;
++				return;
++			}
++			std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
++			if (!lock || !accepting || count == capacity) {
++				++dropped;
++				return;
++			}
++			auto &s = (*queue)[head];
++			s = Sample{};
++			std::strncpy(s.serial, serial, sizeof(s.serial) - 1);
++			if (p)
++				s.p = *p;
++			s.index = index;
++			s.cls = cls;
++			s.t = t;
++			s.seq = seq;
++			head = (head + 1) % capacity;
++			++count;
++			wake.notify_one();
++		}
++	};
++	Recorder &
++	recorder()
++	{
++		static Recorder r;
++		return r;
++	}
++	// Set only during discovery before Valve activation; callbacks merely read it.
++	std::atomic<Recorder *> instance{nullptr};
++} // namespace
++void
++initialize() noexcept
++{
++	instance.store(&recorder(), std::memory_order_release);
++}
++int64_t
++capture_time() noexcept
++{
++	auto r = instance.load(std::memory_order_acquire);
++	return r && r->enabled() ? now() : 0;
++}
++void
++device(const char *serial, int cls) noexcept
++{
++	initialize();
++	auto r = instance.load();
++	if (r->enabled())
++		r->push(serial, 0, nullptr, cls, now());
++}
++void
++pose(const char *serial, uint32_t index, const vr::DriverPose_t &p, int64_t t) noexcept
++{
++	auto r = instance.load(std::memory_order_acquire);
++	if (t && r)
++		r->push(serial, index, &p, -1, t);
++}
++} // namespace lighthouse_reference
+diff --git a/src/xrt/drivers/steamvr_lh/reference_recorder.hpp b/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
+new file mode 100644
+index 000000000..5209f83c2
+--- /dev/null
++++ b/src/xrt/drivers/steamvr_lh/reference_recorder.hpp
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: BSL-1.0
++#pragma once
++#include "openvr_driver.h"
++#include <cstdint>
++namespace lighthouse_reference {
++// Initialization belongs to discovery, never the high-rate pose callback.
++void
++initialize() noexcept;
++int64_t
++capture_time() noexcept; // zero when disabled
++void
++device(const char *serial, int device_class) noexcept;
++void
++pose(const char *serial, uint32_t index, const vr::DriverPose_t &pose, int64_t capture_ns) noexcept;
++} // namespace lighthouse_reference
+diff --git a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+index d918d127c..ca7b6235c 100644
+--- a/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
++++ b/src/xrt/drivers/steamvr_lh/steamvr_lh.cpp
+@@ -1,3 +1,4 @@
++#include "reference_recorder.hpp"
+ // Copyright 2023, Shawn Wallace
+ // Copyright 2026, NVIDIA CORPORATION.
+ // SPDX-License-Identifier: BSL-1.0
+@@ -434,6 +435,7 @@ Context::TrackedDeviceAdded(const char *pchDeviceSerialNumber,
+ 
+ 	bool added = false;
+ 
++	lighthouse_reference::device(pchDeviceSerialNumber, int(eDeviceClass));
+ 	CTX_INFO("New device added: %s", pchDeviceSerialNumber);
+ 	switch (eDeviceClass) {
+ 	case vr::TrackedDeviceClass_HMD: {
+@@ -473,6 +475,7 @@ Context::TrackedDeviceAdded(const char *pchDeviceSerialNumber,
+ void
+ Context::TrackedDevicePoseUpdated(uint32_t unWhichDevice, const vr::DriverPose_t &newPose, uint32_t unPoseStructSize)
+ {
++	const int64_t capture_ns = lighthouse_reference::capture_time();
+ 	assert(sizeof(newPose) == unPoseStructSize);
+ 
+ 	// Check for valid device index, allowing for the HMD plus up to MAX_CONTROLLERS controllers
+@@ -496,6 +499,7 @@ Context::TrackedDevicePoseUpdated(uint32_t unWhichDevice, const vr::DriverPose_t
+ 		return;
+ 	}
+ 
++	lighthouse_reference::pose(dev->serial, unWhichDevice, newPose, capture_ns);
+ 	dev->update_pose(newPose);
+ }
+ 
