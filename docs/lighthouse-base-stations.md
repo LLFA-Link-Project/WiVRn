@@ -7,7 +7,8 @@ WiVRn HMD の座標や motoc の校正 offset は変更しません。既定で�
 
 `patches/monado/0019-d-steamvr_lh-record-diagnostic-base-stations.patch` を、
 `monado-rev` と既存のパッチ 0001–0018 に追加して適用します。
-安定化処理は `0020-d-steamvr_lh-stabilize-against-selected-base-station.patch` に含まれます。
+安定化処理は `0020-d-steamvr_lh-stabilize-against-selected-base-station.patch` に、
+複数 BS 環境でのデバイス別ローカル座標への対応は `0024-d-steamvr_lh-allow-per-device-driver-frames.patch` に含まれます。
 通常の WiVRn ビルドでは CMake がこのパッチも適用します。
 
 ## 設定画面から有効にする
@@ -42,22 +43,24 @@ WiVRn HMD の座標や motoc の校正 offset は変更しません。既定で�
 速度は補正の回転だけで変換し、補正の切り替えを移動速度にはしません。
 補正済みサンプルを履歴に入れ、その後で既存の予測処理を使います。過去の pose に現在の BS 値を掛け直しません。
 
-原 DriverPose の world transform が BS と一致し、かつ BS の pose 推定時刻・受信時刻が将来にない組を使います。
-world transform の一致は並進および quaternion 成分の距離がそれぞれ 1e-5 未満で判定し、quaternion の符号反転は同一の回転として扱います。
-BS 値は低頻度なので保持しますが、別の world transform のデバイスに古い値を適用しません。
-直近64回分の補正区間を保持します。
+基準 BS とデバイスはそれぞれの `world_from_driver` と chaperone を合成して共通の座標へ変換し、
+その座標で `inverse(B) × P` を計算します。DriverPose のローカル座標はデバイスごとに異なるため、
+`world_from_driver` の一致は要求しません。複数の BS がある場合も選択したシリアルだけを基準にします。
+BS の pose 推定時刻・受信時刻がデバイスサンプルの将来にない、最新の基準値を使います。
+BS 値は低頻度なので保持し、直近64回分の補正区間を保持します。
 
 | 記録・ログの状態 | 動作 |
 | --- | --- |
 | `waiting_for_reference` | 有効な基準が未取得。補正対象の pose は無効 |
 | `tracking` | 対応する有効な基準を使って補正 |
-| `held` | 最後の基準から1秒超、または基準の無効通知を受信。同じ world transform なら最後の補正を保持 |
-| `waiting_for_matching_reference` | world transform の切り替わり、未来の基準しかない等。対応する BS 更新が届くまで pose は無効 |
+| `held` | 最後の基準から1秒超、または基準の無効通知を受信。最後の補正を保持 |
+| `waiting_for_matching_reference` | 未来の基準しかない、またはデバイスの world transform が不正。利用可能な基準・デバイス更新が届くまで pose は無効 |
 | `reference_changed` | world transform 外で基準 pose が初回から5 cm超または約3°超変化。再起動まで pose を無効化 |
 
 指定した BS が見つからなくても、無補正や別の BS に自動では戻りません。
 `held` に保持時間の上限はありません。低頻度の固定基準を保持している状態であり、現在も観測できているという意味ではありません。
-world transform がデバイスごとに異なるドライバ構成では、一致条件を満たさず pose が無効になる可能性があります。
+共通座標の変更が BS とデバイスから非同期に届く区間では、新旧の座標が混在して一時的なずれが出る可能性があります。
+デバイスごとの `world_from_driver` の変化だけでは共通座標の変更を判定できないため、基準 BS の更新までは前の補正を保持します。
 
 `reference_changed` は基準の移動や非共通の再推定を疑うための検出です。
 単一の BS では、その物理移動が共通の world transform として表現された場合と座標系の変更を区別できません。
@@ -193,6 +196,7 @@ LH_REFERENCE_HARNESS=/tmp/lh-reference-build/tests/tests_steamvr_lh_references \
 模擬ドライバは Activate 中の同期・別スレッドのコールバック、プロパティ、
 失敗した index の後始末、重複・上限・遅延検出、Deactivate/Cleanup の順序を検証します。
 記録試験は回転・並進を含む local/world 合成を照合します。
+安定化試験は複数 BS とコントローラで異なる DriverPose ローカル座標を使い、選択シリアル、補正後 pose、履歴・予測を検証します。
 解析試験は共通の回転・並進に対する相対 pose の不変性、トラッカーだけのジャンプ、無効・古い基準を検証します。
 Valve の非公開ドライバが実機で返す pose の妥当性は、これらの試験からは判断できません。
 

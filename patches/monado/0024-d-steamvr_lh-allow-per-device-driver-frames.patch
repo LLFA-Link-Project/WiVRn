@@ -1,0 +1,206 @@
+From: OpenAI Codex <codex@openai.com>
+Date: Fri, 23 Oct 2026 23:00:00 +0900
+Subject: [PATCH] d/steamvr_lh: allow per-device driver frames in BS stabilization
+
+DriverPose world_from_driver converts a device-local frame to the common
+world space; it is not a shared coordinate-generation identifier. With
+multiple BS 2.0 stations, requiring it to match the selected reference
+leaves controllers and other stations waiting_for_matching_reference.
+
+Apply the selected reference correction to composed poses regardless of
+their local-frame decomposition. Retain sample/capture timestamp bounds,
+reference validity and movement checks, and explicit serial selection.
+Hold the last correction until an eligible reference update arrives;
+asynchronous common-world changes cannot be detected from equality of
+per-device transforms.
+
+Exercise multiple stations and controllers through Device callbacks,
+history and prediction with different local origins, rotations and head
+offsets. Cover local-frame re-expression, low-rate references, serial
+selection, velocities and future-sample exclusion.
+---
+ .../drivers/steamvr_lh/base_station_stabilizer.cpp | 12 ++-
+ tests/tests_steamvr_lh_stabilization.cpp           | 94 ++++++++++++++++++++--
+ 2 files changed, 93 insertions(+), 13 deletions(-)
+
+diff --git a/src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp b/src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp
+index 4f3136d0b..0c7e3dc56 100644
+--- a/src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp
++++ b/src/xrt/drivers/steamvr_lh/base_station_stabilizer.cpp
+@@ -33,7 +33,7 @@ quaternion_distance(const xrt_pose &a, const xrt_pose &b)
+ bool
+ same_world(const xrt_pose &a, const xrt_pose &b)
+ {
+-	// This is an explicit coordinate-generation guard, not a tracking noise filter.
++	// Compare successive updates of the selected reference only.
+ 	return position_distance(a, b) < 1e-5f && quaternion_distance(a, b) < 1e-5f;
+ }
+ } // namespace
+@@ -93,13 +93,11 @@ BaseStationStabilizer::apply(xrt_space_relation &relation,
+ 	if (!inconsistent && valid_pose(world) && time_ns > 0) {
+ 		for (size_t i = 0; i < count; ++i) {
+ 			const auto &epoch = epochs[(next + epochs.size() - 1 - i) % epochs.size()];
+-			if (epoch.time_ns > time_ns || epoch.capture_ns > capture_ns || !same_world(epoch.world, world))
++			if (epoch.time_ns > time_ns || epoch.capture_ns > capture_ns)
+ 				continue;
+-			// A newer reference observed by this callback supersedes old generations.
+-			// Historical samples remain eligible by their own timestamps.
+-			const auto &latest = epochs[(next + epochs.size() - 1) % epochs.size()];
+-			if (time_ns >= latest.time_ns && !same_world(latest.world, world))
+-				break;
++			// Driver-local frames are per device: equal world_from_driver values
++			// are not required for poses to share the composed world space.
++			// Use the latest reference available at both sample and capture time.
+ 			result.state =
+ 			    reference_valid && capture_ns - last_valid_capture_ns <= 1000000000LL ? "tracking" : "held";
+ 			result.applied = true;
+diff --git a/tests/tests_steamvr_lh_stabilization.cpp b/tests/tests_steamvr_lh_stabilization.cpp
+index 6e131be43..5040a7db9 100644
+--- a/tests/tests_steamvr_lh_stabilization.cpp
++++ b/tests/tests_steamvr_lh_stabilization.cpp
+@@ -87,20 +87,31 @@ tests()
+ 	CHECK(s.apply(r, world, 101, 101).applied);
+ 	same(r.pose, expected);
+ 	const auto corrected0 = r;
++	// The same composed pose and velocities are independent of local-frame metadata.
++	r = relation(tracker);
++	CHECK(s.apply(r, XRT_POSE_IDENTITY, 102, 102).applied);
++	same(r.pose, corrected0.pose);
++	near(r.linear_velocity.x, corrected0.linear_velocity.x);
++	near(r.linear_velocity.y, corrected0.linear_velocity.y);
++	near(r.linear_velocity.z, corrected0.linear_velocity.z);
++	near(r.angular_velocity.x, corrected0.angular_velocity.x);
++	near(r.angular_velocity.y, corrected0.angular_velocity.y);
++	near(r.angular_velocity.z, corrected0.angular_velocity.z);
+ 	// A pure change of output coordinates must cancel for pose AND both velocities.
+ 	const xrt_pose change{{0, h, 0, h}, {10, -4, 3}};
+ 	const auto world2 = compose(change, world), base2 = compose(change, base), tracker2 = compose(change, tracker);
+ 	r = relation(tracker2);
+-	CHECK(!s.apply(r, world2, 190, 190).applied);
+-	CHECK(r.relation_flags == 0);
++	CHECK(s.apply(r, world2, 190, 190).applied); // hold until reference update
+ 	s.observe(base2, world2, true, 200, 210);
+ 	r = relation(tracker2);
+-	CHECK(!s.apply(r, world2, 199, 220).applied); // past sample cannot use future base
++	CHECK(s.apply(r, world2, 199, 220).applied); // past sample uses old base
++	same(r.pose, compose(inverse(base), tracker2));
+ 	r = relation(tracker);
+ 	CHECK(s.apply(r, world, 190, 220).applied);
+ 	same(r.pose, expected); // own old epoch
+ 	r = relation(tracker);
+-	CHECK(!s.apply(r, world, 201, 220).applied); // old generation after switch
++	CHECK(s.apply(r, world, 201, 220).applied); // device-local world is independent
++	same(r.pose, compose(inverse(base2), tracker));
+ 	r = relation(tracker2);
+ 	auto velocity = r.linear_velocity, angular = r.angular_velocity;
+ 	math_quat_rotate_vec3(&change.orientation, &velocity, &r.linear_velocity);
+@@ -113,7 +124,7 @@ tests()
+ 	near(r.angular_velocity.x, corrected0.angular_velocity.x);
+ 	near(r.angular_velocity.y, corrected0.angular_velocity.y);
+ 	near(r.angular_velocity.z, corrected0.angular_velocity.z);
+-	// Interpolation operates on already normalized history and cannot mix coordinate frames.
++	// Interpolation operates on already normalized history.
+ 	m_relation_history *history{};
+ 	m_relation_history_create(&history);
+ 	CHECK(m_relation_history_push(history, &corrected0, 101));
+@@ -147,6 +158,8 @@ tests()
+ 	CHECK(!bad.apply(r, world, 110, 110).applied);
+ 	bad.observe(base, world, true, 300, 300);
+ 	r = relation(tracker);
++	CHECK(!bad.apply(r, world, 299, 310).applied); // no future pose estimate
++	r = relation(tracker);
+ 	CHECK(!bad.apply(r, world, 310, 299).applied);
+ 	// Physical reference movement outside the world transform latches an explicit failure.
+ 	auto moved_local = local_base;
+@@ -222,12 +235,80 @@ device_history_test()
+ 	CHECK(r.relation_flags != 0);
+ 	same(r.pose, expected);
+ 	device.get_pose(1009000000LL, &r);
+-	CHECK(r.relation_flags == 0);
++	CHECK(r.relation_flags != 0); // hold the previous BS correction until its update
+ 	device.get_pose(1012000000LL, &r);
+ 	CHECK(r.relation_flags != 0);
+ 	same(r.pose, expected);
+ 	unsetenv("LH_STABILIZE_REFERENCE_SERIAL");
+ }
++// BS 2.0 and controllers may use different driver-local origins and axes.
++// Exercise the real callback, selected-serial filtering, history and prediction.
++void
++multi_device_frames_test()
++{
++	setenv("LH_STABILIZE_REFERENCE_SERIAL", "reference-A", 1);
++	auto context = Context::create("/nonexistent-lh-test", "/nonexistent-lh-test", {});
++	CHECK(context);
++	TestDevice reference(DeviceBuilder{context, nullptr, "reference-A", "/nonexistent-lh-test",
++	                                   vr::TrackedDeviceClass_TrackingReference});
++	TestDevice other_reference(DeviceBuilder{context, nullptr, "reference-B", "/nonexistent-lh-test",
++	                                         vr::TrackedDeviceClass_TrackingReference});
++	TestDevice left(DeviceBuilder{context, nullptr, "left", "/nonexistent-lh-test",
++	                              vr::TrackedDeviceClass_Controller});
++	TestDevice right(DeviceBuilder{context, nullptr, "right", "/nonexistent-lh-test",
++	                               vr::TrackedDeviceClass_Controller});
++	const float h = std::sqrt(.5f);
++	const xrt_pose base{{h, 0, 0, h}, {2, 3, 1}}, other{{0, h, 0, h}, {-2, 1, 4}},
++	    target{{0, 0, h, h}, {4, 1, -2}}, driver_offset{{0, h, 0, h}, {1, 2, 3}};
++	auto submit = [&](TestDevice &device, xrt_pose composed, xrt_pose world, int64_t t,
++	                  xrt_pose local = XRT_POSE_IDENTITY) {
++		const auto raw = compose(compose(inverse(world), composed), inverse(local));
++		vr::DriverPose_t p{};
++		auto pack = [](xrt_pose pose, vr::HmdQuaternion_t &q, double (&v)[3]) {
++			q = {pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z};
++			v[0] = pose.position.x;
++			v[1] = pose.position.y;
++			v[2] = pose.position.z;
++		};
++		pack(raw, p.qRotation, p.vecPosition);
++		pack(world, p.qWorldFromDriverRotation, p.vecWorldFromDriverTranslation);
++		pack(local, p.qDriverFromHeadRotation, p.vecDriverFromHeadTranslation);
++		p.poseIsValid = p.deviceIsConnected = true;
++		p.result = vr::TrackingResult_Running_OK;
++		std::lock_guard lk(context->devices_mut);
++		device.update_pose(p, 1, t);
++	};
++	constexpr int64_t start = 1000000000LL;
++	// A different BS must not satisfy the explicitly selected reference.
++	submit(other_reference, other, other, start);
++	submit(left, target, XRT_POSE_IDENTITY, start + 1000000);
++	xrt_space_relation r{};
++	left.get_pose(start + 1000000, &r);
++	CHECK(r.relation_flags == 0);
++	submit(reference, base, base, start + 2000000);
++	const auto expected = compose(inverse(base), target);
++	for (int i = 0; i < 3; ++i) {
++		const int64_t t = start + 3000000 + i * 10000000;
++		// Include a re-expression in another local frame with unchanged world pose.
++		submit(left, target, i == 1 ? driver_offset : xrt_pose XRT_POSE_IDENTITY, t);
++		submit(right, target, other, t, driver_offset);
++		submit(other_reference, other, other, t + 1000);
++		for (auto *device : {&left, &right}) {
++			device->get_pose(t, &r);
++			CHECK(r.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
++			same(r.pose, expected);
++			device->get_pose(t + 1000000, &r);
++			CHECK(r.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT);
++			same(r.pose, expected);
++		}
++	}
++	// Static low-rate reference continues to work after a second has elapsed.
++	submit(left, target, driver_offset, start + 2000000000LL);
++	left.get_pose(start + 2000000000LL, &r);
++	CHECK(r.relation_flags != 0);
++	same(r.pose, expected);
++	unsetenv("LH_STABILIZE_REFERENCE_SERIAL");
++}
+ void
+ read_pose(xrt_pose &p)
+ {
+@@ -244,6 +325,7 @@ int
+ main(int argc, char **argv)
+ {
+ 	if (argc == 1) {
++		multi_device_frames_test();
+ 		tests();
+ 		device_history_test();
+ 		return 0;
+-- 
+2.52.0
