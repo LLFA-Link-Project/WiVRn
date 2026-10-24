@@ -1054,3 +1054,21 @@ msgstr "Lighthouse バックエンド:"
 #: dashboard/qml/SettingsPage.qml
 msgid "Restart the internal Monado runtime to apply backend changes. SteamVR requires SteamVR to be installed. An external tool such as motoc is needed for calibration."
 msgstr "バックエンドの変更を適用するには、内部の Monado ランタイムを再起動してください。SteamVR バックエンドには SteamVR のインストールが必要です。キャリブレーションには motoc などの外部ツールが必要です。"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Clamp extrapolation for Lighthouse tracked devices"
+msgstr "Lighthouse トラッキングデバイスの予測時間に上限を設ける"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Lighthouse max pose extrapolation"
+msgstr "Lighthouse の最大姿勢予測時間"
+
+#: dashboard/qml/SettingsPage.qml
+msgctxt "value display for Lighthouse max pose extrapolation"
+msgid "%1ms"
+msgid_plural "%1ms"
+msgstr[0] "%1ms"
+
+#: dashboard/qml/SettingsPage.qml
+msgid "Maximum time in milliseconds that poses may be extrapolated ahead for Lighthouse tracked devices. Tune this value if you experience jittery or wobbly tracking."
+msgstr "Lighthouse トラッキングデバイスの姿勢を先読みする最大時間（ミリ秒）です。トラッキングに細かな揺れやふらつきがある場合に調整してください。"

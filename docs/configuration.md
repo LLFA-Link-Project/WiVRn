@@ -189,8 +189,8 @@ providing the `survive` pkg-config package. Keep
 that initial build, switching backends only requires saving the dashboard setting
 and restarting the internal Monado runtime. The selector also offers **Disabled**
 and only lists backends included in the build. SteamVR-specific recording,
-base station stabilization, extrapolation and joystick settings do not apply to
-libsurvive. Its pose extrapolation is currently clamped to 50 ms.
+base station stabilization and joystick settings do not apply to libsurvive.
+The maximum pose extrapolation setting is shared by both backends.
 
 The environment variable `WIVRN_USE_SURVIVE` also enables this backend when set,
 including when the dashboard option is disabled. If both backends are requested
@@ -199,12 +199,46 @@ The dashboard always saves mutually exclusive `use-steamvr-lh` and `use-survive`
 values. Only the selected driver is initialized, so both drivers never claim the
 USB receivers together.
 
+To follow a local libsurvive repository's committed `llfa-main` branch while
+leaving its working tree untouched, run:
+
+```sh
+tools/update-libsurvive-backend.sh ~/libsurvive build-survive-check/_deps
+```
+
+This maintains a separate checkout, builds the library and its plugins, and
+installs them under `build-survive-check/_deps/libsurvive-llfa-main-install`.
+Run it again to fetch and fast-forward that independent checkout to the latest
+local `llfa-main`. It records the exact revision in
+`build-survive-check/_deps/libsurvive-llfa-main-revision.txt`.
+Point WiVRn's `PKG_CONFIG_PATH` at that installation's `lib/pkgconfig` directory
+when configuring, then rebuild WiVRn. If changing an existing build to a different
+installation, clear its cached discovery paths during configuration:
+
+```sh
+PKG_CONFIG_PATH="$PWD/build-survive-check/_deps/libsurvive-llfa-main-install/lib/pkgconfig" \
+cmake -S . -B build-survive-check \
+    -DWIVRN_FEATURE_SURVIVE=ON -DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON \
+    -U 'SURVIVE_*' -U 'LH_SURVIVE_*' \
+    -U '__pkg_config_checked_*SURVIVE' -U 'pkgcfg_lib_*SURVIVE*'
+cmake --build build-survive-check --target wivrn-server wivrn-dashboard
+```
+
 ## `lh-max-extrapolation`
-Default value: unset
+Default value: `50` ms (also used when unset)
 
-Only available when built with `WIVRN_FEATURE_STEAMVR_LIGHTHOUSE`.
+Available with `WIVRN_FEATURE_STEAMVR_LIGHTHOUSE` or `WIVRN_FEATURE_SURVIVE`.
 
-Maximum time in milliseconds that poses may be extrapolated ahead for SteamVR Lighthouse devices.
+Maximum time in milliseconds that poses may be extrapolated ahead for Lighthouse
+devices. Both backends use the same setting and `LH_MAX_EXTRAPOLATION_MS`
+environment variable. `0` disables forward prediction; `-1` removes the time
+limit. In the dashboard, uncheck **Clamp extrapolation for Lighthouse tracked
+devices** to save `-1`. The choice persists when switching backends and takes
+effect after restarting the internal Monado runtime.
+
+The libsurvive adapter applies the limit to controller/tracker poses and emulated
+hand poses. There is no separate fixed 50 ms cap. Its two-second inactivity
+handling for silent/disconnected devices is independent of prediction clamping.
 
 ## `lh-stick-deadzone`
 Default value: `0`

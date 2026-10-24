@@ -195,27 +195,27 @@ Kirigami.ScrollablePage {
             }
             Controls.CheckBox {
                 id: lh_max_extrapolation_enabled
-                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
-                text: i18n("Clamp extrapolation for SteamVR tracked devices")
+                visible: lighthouse_backend.currentValue === "steamvr" || lighthouse_backend.currentValue === "survive"
+                text: i18n("Clamp extrapolation for Lighthouse tracked devices")
             }
             RowLayout {
-                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr" && lh_max_extrapolation_enabled.checked
-                Kirigami.FormData.label: i18n("SteamVR max pose extrapolation")
+                visible: (lighthouse_backend.currentValue === "steamvr" || lighthouse_backend.currentValue === "survive") && lh_max_extrapolation_enabled.checked
+                Kirigami.FormData.label: i18n("Lighthouse max pose extrapolation")
                 Controls.Slider {
                     id: lh_max_extrapolation
                     Layout.fillWidth: true
                     from: 0.0
                     to: 100.0
                     stepSize: 1.0
-                    value: Settings.lhMaxExtrapolation
+                    value: Settings.lhMaxExtrapolationEnabled ? Settings.lhMaxExtrapolation : 50
                 }
                 Controls.Label {
-                    text: i18ncp("value display for SteamVR max pose extrapolation", "%1ms", "%1ms", lh_max_extrapolation.value)
+                    text: i18ncp("value display for Lighthouse max pose extrapolation", "%1ms", "%1ms", lh_max_extrapolation.value)
                     Layout.preferredWidth: 35
                     Layout.alignment: Qt.AlignRight
                 }
                 Kirigami.ContextualHelpButton {
-                    toolTipText: i18n("Maximum time in milliseconds that poses may be extrapolated ahead for SteamVR tracked devices. Tune this value if you experience jittery or wobbly tracking.")
+                    toolTipText: i18n("Maximum time in milliseconds that poses may be extrapolated ahead for Lighthouse tracked devices. Tune this value if you experience jittery or wobbly tracking.")
                 }
             }
             RowLayout {
@@ -420,7 +420,7 @@ Kirigami.ScrollablePage {
         lighthouse_recording_enabled.checked = Settings.lighthouseRecordingEnabled;
         lighthouse_recording_output.text = Settings.lighthouseRecordingOutput;
         lh_max_extrapolation_enabled.checked = Settings.lhMaxExtrapolationEnabled;
-        lh_max_extrapolation.value = Settings.lhMaxExtrapolation;
+        lh_max_extrapolation.value = Settings.lhMaxExtrapolationEnabled ? Settings.lhMaxExtrapolation : 50;
         lh_stick_deadzone.value = Settings.lhStickDeadzone;
         hid_forwarding.checked = Settings.hidForwarding;
 

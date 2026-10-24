@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: BSL-1.0
 // Exercise the real Monado adapter with a synthetic libsurvive event source.
+#include "math/m_relation_history.h"
 #include "os/os_time.h"
 #include "survive_api.h"
 #include "survive_interface.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_system.h"
+#include "survive_internal.h"
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -119,7 +122,65 @@ static void added(xrt_device * device, void * userdata)
 		require(system.static_xdevs[i] != device, "callback precedes publication");
 	++publication.count;
 }
-int main()
+static int test_prediction_limit(double expected_seconds)
+{
+	SurviveSimpleObject left{R"({"model_number":"Knuckles Left","device_serial_number":"LHR-LEFT"})"};
+	SurviveSimpleObject tracker{R"({"model_number":"VIVE Tracker 3.0 MV","device_serial_number":"LHR-TRACKER"})"};
+	config(left);
+	config(tracker);
+	xrt_system_devices system{};
+	auto * survive = survive_create_devices(&system);
+	require(survive != nullptr && system.static_xdev_count == 2, "prediction fixtures created");
+	Publication publication{&system};
+	survive_start(survive, added, &publication);
+	double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+	for (int sample = 0; sample < 2; ++sample)
+		for (auto * object: {&left, &tracker})
+		{
+			SurviveSimpleEvent event{};
+			event.event_type = SurviveSimpleEventType_PoseUpdateEvent;
+			auto & p = event.d.__private_pose_event;
+			p.object = object;
+			p.time = now - 0.02 + sample * 0.01;
+			p.pose.Rot[0] = 1;
+			p.velocity.Pos[0] = 1; // 1 m/s along X: distance equals prediction seconds.
+			enqueue(event);
+		}
+	for (size_t i = 0; i < system.static_xdev_count; ++i)
+	{
+		auto * device = system.static_xdevs[i];
+		auto * adapter = reinterpret_cast<survive_device *>(device);
+		wait_for([&] { return m_relation_history_get_size(adapter->relation_hist) == 2; });
+		int64_t latest_ns;
+		xrt_space_relation latest{};
+		require(m_relation_history_get_latest(adapter->relation_hist, &latest_ns, &latest), "latest sample available");
+		auto input = device->device_type == XRT_DEVICE_TYPE_GENERIC_TRACKER ? XRT_INPUT_GENERIC_TRACKER_POSE : XRT_INPUT_INDEX_GRIP_POSE;
+		xrt_space_relation base{}, predicted{};
+		xrt_device_get_tracked_pose(device, input, latest_ns, &base);
+		xrt_device_get_tracked_pose(device, input, latest_ns + 1'000'000'000, &predicted);
+		require(std::abs(predicted.pose.position.x - base.pose.position.x - expected_seconds) < 1e-5,
+		        "controller and tracker prediction use the shared limit");
+		if (device->supported.hand_tracking)
+		{
+			xrt_hand_joint_set base_hand{}, predicted_hand{};
+			int64_t timestamp;
+			xrt_device_get_hand_tracking(device, XRT_INPUT_HT_CONFORMING_LEFT, latest_ns, &base_hand, &timestamp);
+			xrt_device_get_hand_tracking(device, XRT_INPUT_HT_CONFORMING_LEFT, latest_ns + 1'000'000'000, &predicted_hand, &timestamp);
+			require(base_hand.is_active && predicted_hand.is_active, "prediction hand fixtures active");
+			require(std::abs(predicted_hand.hand_pose.pose.position.x - base_hand.hand_pose.pose.position.x - expected_seconds) < 1e-5,
+			        "emulated hand prediction uses the same limit");
+		}
+	}
+	survive_stop(survive);
+	for (auto & device: system.static_xdevs)
+		xrt_device_destroy(&device);
+	survive_destroy(survive);
+	std::puts("libsurvive controller, tracker and emulated hand prediction limit: passed");
+	return 0;
+}
+
+int main(int argc, char ** argv)
+
 {
 	xrt_system_devices system{};
 	auto * survive = survive_create_devices(&system);

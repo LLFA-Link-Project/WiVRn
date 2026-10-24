@@ -388,7 +388,7 @@ if(WIVRN_BUILD_TEST AND WIVRN_BUILD_SERVER AND WIVRN_FEATURE_SURVIVE)
     pkg_check_modules(LH_SURVIVE REQUIRED IMPORTED_TARGET survive)
     add_executable(lh-survive-hotplug-test ../tools/lh-recorder/tests/survive_hotplug.cpp)
     set_target_properties(lh-survive-hotplug-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
-    target_include_directories(lh-survive-hotplug-test PRIVATE ${monado_SOURCE_DIR}/src/xrt/drivers/survive)
+    target_include_directories(lh-survive-hotplug-test PRIVATE ${monado_SOURCE_DIR}/src/xrt/drivers/survive ${monado_SOURCE_DIR}/src/xrt/drivers)
     target_link_libraries(lh-survive-hotplug-test PRIVATE drv_survive aux_util xrt-interfaces PkgConfig::LH_SURVIVE)
 endif()
 

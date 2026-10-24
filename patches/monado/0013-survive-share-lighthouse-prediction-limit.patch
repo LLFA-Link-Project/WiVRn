@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sat, 24 Oct 2026 00:00:00 +0000
+Subject: [PATCH] survive: share Lighthouse pose prediction limit with steamvr_lh
+
+---
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -62,6 +62,15 @@
+ DEBUG_GET_ONCE_BOOL_OPTION(survive_default_ipd, "SURVIVE_DEFAULT_IPD", false)
+ DEBUG_GET_ONCE_FLOAT_OPTION(survive_timecode_offset_ms, "SURVIVE_TIMECODE_OFFSET_MS", 0.0)
+ DEBUG_GET_ONCE_FLOAT_OPTION(survive_override_ipd, "SURVIVE_OVERRIDE_IPD_MM", -1.0f)
++DEBUG_GET_ONCE_NUM_OPTION(lh_max_extrapolation_ms, "LH_MAX_EXTRAPOLATION_MS", 50)
++
++// Share SteamVR Lighthouse's limit, default and -1 (unlimited) convention.
++static int64_t
++survive_max_extrapolation_ns(void)
++{
++	int64_t raw = debug_get_num_option_lh_max_extrapolation_ms();
++	return raw == -1 ? INT64_MAX : raw * U_TIME_1MS_IN_NS;
++}
+ 
+ 
+ static void
+@@ -239,7 +248,8 @@
+ 	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, name, &pose_offset);
+ 
+ 	struct xrt_space_relation space_relation;
+-	m_relation_history_get(survive->relation_hist, at_timestamp_ns, &space_relation);
++	m_relation_history_get_clamped(survive->relation_hist, at_timestamp_ns, survive_max_extrapolation_ns(), NULL,
++	                               &space_relation);
+ 
+ 	struct xrt_relation_chain relation_chain = {0};
+ 	m_relation_chain_push_pose(&relation_chain, &pose_offset);
+@@ -397,7 +407,8 @@
+ 
+ 	struct xrt_space_relation hand_relation;
+ 
+-	m_relation_history_get(survive->relation_hist, at_timestamp_ns, &hand_relation);
++	m_relation_history_get_clamped(survive->relation_hist, at_timestamp_ns, survive_max_extrapolation_ns(), NULL,
++	                               &hand_relation);
+ 
+ 
+ 	u_hand_sim_simulate_for_valve_index_knuckles(&values, hand, &hand_relation, out_value);

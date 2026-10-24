@@ -145,6 +145,8 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 
 	auto conf = configuration();
 	lighthouse_backend_choice = conf.selected_lighthouse_backend();
+	if (lighthouse_backend_choice != lighthouse_backend::none && conf.lh_max_extrapolation.has_value())
+		setenv("LH_MAX_EXTRAPOLATION_MS", std::format("{}", *conf.lh_max_extrapolation).c_str(), true);
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 
@@ -153,8 +155,6 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 		if (conf.lh_stick_deadzone > 0.01f)
 			setenv("LH_STICK_DEADZONE", std::format("{:.2}", *conf.lh_stick_deadzone).c_str(), true);
 
-		if (conf.lh_max_extrapolation.has_value())
-			setenv("LH_MAX_EXTRAPOLATION_MS", std::format("{}", *conf.lh_max_extrapolation).c_str(), true);
 
 		U_LOG_W("=====================");
 		U_LOG_W("Disregard lighthousedb / chaperone related error messages from the lighthouse driver. These are irrelevant in case of WiVRn.");

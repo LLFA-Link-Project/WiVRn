@@ -562,33 +562,31 @@ QString Settings::recordingDirectoryFromUrl(const QUrl & url) const
 
 bool Settings::lhMaxExtrapolationEnabled() const
 {
-	auto it = m_jsonSettings.find("lh-max-extrapolation");
-	return it != m_jsonSettings.end() and it->is_number();
+	return lhMaxExtrapolation() >= 0;
 }
 
 int64_t Settings::lhMaxExtrapolation() const
 {
 	auto it = m_jsonSettings.find("lh-max-extrapolation");
-	if (it != m_jsonSettings.end() and it->is_number())
-		return static_cast<int64_t>(*it);
+	if (it != m_jsonSettings.end() && it->is_number_integer())
+	{
+		auto value = it->get<int64_t>();
+		if (value >= -1)
+			return value;
+	}
 	return 50;
 }
 
 void Settings::set_lhMaxExtrapolation(const int64_t & value)
 {
+	if (value < -1)
+		return;
 	auto old = lhMaxExtrapolation();
-	if (value != -1)
-	{
-		m_jsonSettings["lh-max-extrapolation"] = value;
-	}
-	else
-	{
-		m_jsonSettings.erase("lh-max-extrapolation");
-	}
-
+	m_jsonSettings["lh-max-extrapolation"] = value;
 	if (old != value)
 	{
-		lhMaxExtrapolationEnabledChanged();
+		if ((old >= 0) != (value >= 0))
+			lhMaxExtrapolationEnabledChanged();
 		lhMaxExtrapolationChanged();
 	}
 }
@@ -750,6 +748,7 @@ void Settings::restore_defaults()
 	m_jsonSettings.erase("use-survive");
 	m_jsonSettings.erase("lighthouse-recording");
 	m_jsonSettings.erase("lh-stick-deadzone");
+	m_jsonSettings.erase("lh-max-extrapolation");
 	m_jsonSettings.erase("tcp-only");
 	m_jsonSettings.erase("application");
 	m_jsonSettings.erase("port");

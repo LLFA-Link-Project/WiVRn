@@ -91,6 +91,26 @@ int main(int argc, char ** argv)
 	require(a.lighthouseBackend() == "survive");
 	a.restore_defaults();
 	require(a.lighthouseBackend() == "none");
+	// Both Lighthouse backends retain the same clamp across switching/reload.
+	a.loadJson("{}");
+	require(a.lhMaxExtrapolationEnabled() && a.lhMaxExtrapolation() == 50);
+	a.set_lhMaxExtrapolation(23);
+	a.set_lighthouseBackend("survive");
+	b.loadJson(a.saveJson());
+	require(b.lhMaxExtrapolationEnabled() && b.lhMaxExtrapolation() == 23);
+	b.set_lighthouseBackend("steamvr");
+	require(b.lhMaxExtrapolation() == 23);
+	b.set_lhMaxExtrapolation(0);
+	require(b.lhMaxExtrapolationEnabled() && b.lhMaxExtrapolation() == 0);
+	b.set_lhMaxExtrapolation(-1);
+	a.loadJson(b.saveJson());
+	require(!a.lhMaxExtrapolationEnabled() && a.lhMaxExtrapolation() == -1);
+	require(nlohmann::json::parse(a.saveJson().toStdString())["lh-max-extrapolation"] == -1);
+	a.set_lhMaxExtrapolation(-2);
+	require(a.lhMaxExtrapolation() == -1);
+	a.restore_defaults();
+	require(a.lhMaxExtrapolationEnabled() && a.lhMaxExtrapolation() == 50);
+	require(!a.saveJson().contains("lh-max-extrapolation"));
 	// Manual selection survives roundtrip; disabling keeps remembered choices.
 	a.loadJson("{}");
 	require(a.lighthouseReferenceSerial().isEmpty());

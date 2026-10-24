@@ -7,6 +7,7 @@
 #include "xrt/xrt_space.h"
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -95,6 +96,25 @@ static void test_standby_control_packet()
 	main.send(to_monado::standby_lighthouse_trackers{});
 	auto packet = monado.receive();
 	require(packet && std::holds_alternative<to_monado::standby_lighthouse_trackers>(*packet), "standby request crosses existing internal control socket");
+}
+
+static void test_tracker_prediction_limit(xrt_device * xdev, double expected_seconds)
+{
+	auto * device = static_cast<Device *>(xdev);
+	constexpr int64_t second = 1'000'000'000;
+	vr::DriverPose_t pose{};
+	pose.qRotation.w = pose.qWorldFromDriverRotation.w = pose.qDriverFromHeadRotation.w = 1;
+	pose.deviceIsConnected = pose.poseIsValid = true;
+	pose.result = vr::TrackingResult_Running_OK;
+	pose.vecPosition[0] = 2;
+	pose.vecVelocity[0] = 1;
+	device->update_pose(pose, 0, 100 * second);
+	device->update_pose(pose, 0, 101 * second);
+	xrt_space_relation predicted{};
+	require(xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_TRACKER_POSE, 102 * second, &predicted) == XRT_SUCCESS,
+	        "locate predicted tracker");
+	require(std::abs(predicted.pose.position.x - 2 - expected_seconds) < 1e-5,
+	        "SteamVR uses the same prediction limit as libsurvive");
 }
 
 // State notifications must survive the stale measurement timestamps seen on
@@ -226,7 +246,7 @@ static void test_hand_source_switch()
 	xrt_hand_tracker_destroy(&tracker);
 }
 
-int main()
+int main(int argc, char ** argv)
 {
 	test_standby_control_packet();
 	test_hand_source_switch();
@@ -270,6 +290,8 @@ int main()
 	require(ctx->TrackedDeviceAdded("tracker-A", vr::TrackedDeviceClass_GenericTracker, &tracker), "late tracker accepted");
 	wait_for([&] { return __atomic_load_n(&devices.static_xdev_count, __ATOMIC_ACQUIRE) == 3; });
 	require(devices.static_xdevs[2]->device_type == XRT_DEVICE_TYPE_GENERIC_TRACKER, "tracker stays out of controller roles");
+	if (argc == 2)
+		test_tracker_prediction_limit(devices.static_xdevs[2], std::strtod(argv[1], nullptr));
 	test_tracker_pose_status(devices.static_xdevs[2]);
 	require(ctx->get_roles(&devices, &roles) == XRT_SUCCESS && roles.left == 1, "tracker preserves hand roles");
 	// A controller that reports a tracker profile must still be excluded by its
