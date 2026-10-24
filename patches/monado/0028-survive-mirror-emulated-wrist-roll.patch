@@ -1,0 +1,24 @@
+From: OpenAI Codex <codex@openai.com>
+Subject: [PATCH] survive: mirror a quarter-turn roll at each emulated wrist
+
+Apply the requested right-clockwise and left-counterclockwise 90 degree roll
+in wrist-local space. Retain the derived wrist position and its velocities,
+so the adjustment changes hand orientation without moving the wrist anchor.
+
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -470,6 +470,13 @@
+ 	m_relation_chain_push_pose(&chain, &survive->imu_from_head);
+ 	m_relation_chain_push_relation(&chain, &hand_relation);
+ 	m_relation_chain_resolve(&chain, &out_value->hand_pose);
++
++	// Roll the simulated hand about its local finger direction (-Z), keeping
++	// the wrist origin fixed. Right is clockwise, left is its mirror image.
++	const float half_sqrt = sqrtf(0.5f);
++	struct xrt_quat wrist_roll = {.z = left ? half_sqrt : -half_sqrt, .w = half_sqrt};
++	math_quat_rotate(&out_value->hand_pose.pose.orientation, &wrist_roll,
++	                 &out_value->hand_pose.pose.orientation);
+ 
+ 	// This is the truth - we pose-predicted or interpolated all the way up to `at_timestamp_ns`.
+ 	*out_timestamp_ns = at_timestamp_ns;

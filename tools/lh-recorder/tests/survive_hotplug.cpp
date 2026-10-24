@@ -279,9 +279,20 @@ static int test_prediction_limit(double expected_seconds)
 				xrt_device_get_hand_tracking(device, input, requested_ns, &result, &timestamp);
 				require(result.is_active && timestamp == requested_ns, "rotating hand active at requested time");
 				const auto & joints = result.values.hand_joint_set_default;
+				// Undo the requested mirrored wrist roll to check that the
+				// preceding canonical placement and wrist position are retained.
+				xrt_space_relation unrolled = result.hand_pose;
+				xrt_quat undo_roll{0, 0, side * float(std::sqrt(0.5)), float(std::sqrt(0.5))};
+				math_quat_rotate(&unrolled.pose.orientation, &undo_roll, &unrolled.pose.orientation);
+				const xrt_vec3 forward{0, 0, -1};
+				xrt_vec3 before{}, after{};
+				math_quat_rotate_vec3(&unrolled.pose.orientation, &forward, &before);
+				math_quat_rotate_vec3(&result.hand_pose.pose.orientation, &forward, &after);
+				require(std::abs(before.x - after.x) < 1e-5 && std::abs(before.y - after.y) < 1e-5 &&
+				        std::abs(before.z - after.z) < 1e-5, "mirrored wrist roll preserves the finger direction");
 				xrt_relation_chain chain{};
 				m_relation_chain_push_pose(&chain, &joints[XRT_HAND_JOINT_PALM].relation.pose);
-				m_relation_chain_push_relation(&chain, &result.hand_pose);
+				m_relation_chain_push_relation(&chain, &unrolled);
 				xrt_space_relation world_palm{};
 				m_relation_chain_resolve(&chain, &world_palm);
 				check(XRT_INPUT_INDEX_GRIP_POSE, world_palm, &canonical_palm);
@@ -313,7 +324,7 @@ static int test_prediction_limit(double expected_seconds)
 	for (auto & device: system.static_xdevs)
 		xrt_device_destroy(&device);
 	survive_destroy(survive);
-	std::puts("libsurvive raw-reference-first prediction, shared palm anchor, stable wrists and prediction limit: passed");
+	std::puts("libsurvive prediction, shared wrist placement, mirrored wrist roll and prediction limit: passed");
 	return 0;
 }
 
