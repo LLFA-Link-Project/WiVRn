@@ -67,6 +67,30 @@ int main(int argc, char ** argv)
 	require(!b.saveJson().contains("use-survive"));
 	b.loadJson(R"({"use-survive":"invalid"})");
 	require(!b.useSurvive());
+	// One selector persists a single owner of the Lighthouse receivers.
+	a.loadJson(R"({"unrelated":42,"use-steamvr-lh":true})");
+	require(a.lighthouseBackend() == "steamvr");
+	a.set_lighthouseBackend("survive");
+	require(a.useSurvive() && !a.steamVrLh());
+	b.loadJson(a.saveJson());
+	require(b.lighthouseBackend() == "survive");
+	b.set_lighthouseBackend("steamvr");
+	require(b.steamVrLh() && !b.useSurvive());
+	a.loadJson(b.saveJson());
+	require(a.lighthouseBackend() == "steamvr");
+	a.set_lighthouseBackend("none");
+	require(!a.steamVrLh() && !a.useSurvive());
+	a.set_lighthouseBackend("invalid");
+	require(a.lighthouseBackend() == "none");
+	a.set_useSurvive(true);
+	a.set_steamVrLh(true);
+	require(a.steamVrLh() && !a.useSurvive());
+	a.set_useSurvive(true);
+	require(a.useSurvive() && !a.steamVrLh());
+	a.loadJson(R"({"use-steamvr-lh":true,"use-survive":true})");
+	require(a.lighthouseBackend() == "survive");
+	a.restore_defaults();
+	require(a.lighthouseBackend() == "none");
 	// Manual selection survives roundtrip; disabling keeps remembered choices.
 	a.loadJson("{}");
 	require(a.lighthouseReferenceSerial().isEmpty());

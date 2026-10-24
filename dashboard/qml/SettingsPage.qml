@@ -122,34 +122,36 @@ Kirigami.ScrollablePage {
                 text: i18n("Enable debug window")
                 visible: Settings.debug_gui_supported
             }
-            RowLayout {
-                visible: Settings.steamvr_lh_supported
-                Controls.CheckBox {
-                    id: steamvr_lh
-                    text: i18n("Enable SteamVR tracked devices support")
-                }
-                Kirigami.ContextualHelpButton {
-                    toolTipText: i18n("Allows the use of lighthouse-based controllers and trackers.\nRequires SteamVR to be installed.\nDevices must be be powered on before connecting to WiVRn.\nAn external tool such as motoc is needed for calibration.")
+            Controls.ComboBox {
+                id: lighthouse_backend
+                visible: Settings.steamvr_lh_supported || Settings.survive_supported
+                Layout.fillWidth: true
+                Kirigami.FormData.label: i18n("Lighthouse backend:")
+                textRole: "text"
+                valueRole: "value"
+                model: {
+                    let backends = [{text: i18n("Disabled"), value: "none"}];
+                    if (Settings.steamvr_lh_supported)
+                        backends.push({text: "SteamVR (steamvr_lh)", value: "steamvr"});
+                    if (Settings.survive_supported)
+                        backends.push({text: "libsurvive", value: "survive"});
+                    return backends;
                 }
             }
-            RowLayout {
-                visible: Settings.survive_supported
-                Controls.CheckBox {
-                    id: use_survive
-                    text: i18n("Enable libsurvive Lighthouse devices support")
-                }
-                Kirigami.ContextualHelpButton {
-                    toolTipText: i18n("Allows the use of Lighthouse controllers and trackers with libsurvive.\nDevices can be powered on or connected while WiVRn is running.\nAn external tool such as motoc is needed for calibration.\nRestart the runtime session to apply changes.")
-                }
+            Controls.Label {
+                visible: lighthouse_backend.visible
+                text: i18n("Restart the internal Monado runtime to apply backend changes. SteamVR requires SteamVR to be installed. An external tool such as motoc is needed for calibration.")
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
             }
             Controls.CheckBox {
                 id: lighthouse_stabilization_enabled
-                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 text: i18n("Use a base station as tracking origin (experimental)")
             }
             Controls.ComboBox {
                 id: lighthouse_reference_serial
-                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 enabled: lighthouse_stabilization_enabled.checked
                 editable: true
                 Layout.fillWidth: true
@@ -158,23 +160,23 @@ Kirigami.ScrollablePage {
                 validator: RegularExpressionValidator { regularExpression: /[!-~]{0,255}/ }
             }
             Controls.Label {
-                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 text: i18n("Select a remembered base station or enter its serial. Reconnect the headset to apply. Calibrate again after enabling or changing the reference base station.")
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true
             }
             Controls.Label {
-                visible: Settings.steamvr_lh_supported
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 text: i18n("Lighthouse Recording")
                 font.bold: true
             }
             Controls.CheckBox {
                 id: lighthouse_recording_enabled
-                visible: Settings.steamvr_lh_supported
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 text: i18n("Enable recording")
             }
             RowLayout {
-                visible: Settings.steamvr_lh_supported
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 Kirigami.FormData.label: i18n("Output directory:")
                 Controls.TextField {
                     id: lighthouse_recording_output
@@ -186,18 +188,18 @@ Kirigami.ScrollablePage {
                 }
             }
             Controls.Label {
-                visible: Settings.steamvr_lh_supported
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 text: i18n("Changes take effect the next time Monado starts.")
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true
             }
             Controls.CheckBox {
                 id: lh_max_extrapolation_enabled
-                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 text: i18n("Clamp extrapolation for SteamVR tracked devices")
             }
             RowLayout {
-                visible: Settings.steamvr_lh_supported && steamvr_lh.checked && lh_max_extrapolation_enabled.checked
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr" && lh_max_extrapolation_enabled.checked
                 Kirigami.FormData.label: i18n("SteamVR max pose extrapolation")
                 Controls.Slider {
                     id: lh_max_extrapolation
@@ -217,7 +219,7 @@ Kirigami.ScrollablePage {
                 }
             }
             RowLayout {
-                visible: Settings.steamvr_lh_supported && steamvr_lh.checked
+                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
                 Kirigami.FormData.label: i18n("SteamVR joystick deadzone")
                 Controls.Slider {
                     id: lh_stick_deadzone
@@ -392,8 +394,8 @@ Kirigami.ScrollablePage {
         DashboardSettings.show_system_checks = show_system_checks.checked;
 
         Settings.debugGui = debug_gui.checked;
-        Settings.steamVrLh = steamvr_lh.checked;
-        Settings.useSurvive = use_survive.checked;
+        if (lighthouse_backend.currentIndex >= 0)
+            Settings.lighthouseBackend = lighthouse_backend.currentValue;
         Settings.lighthouseReferenceSerial = lighthouse_stabilization_enabled.checked ? lighthouse_reference_serial.editText.trim() : "";
         Settings.lighthouseRecordingEnabled = lighthouse_recording_enabled.checked;
         Settings.lighthouseRecordingOutput = lighthouse_recording_output.text;
@@ -411,8 +413,7 @@ Kirigami.ScrollablePage {
     function load() {
         select_game.load();
         debug_gui.checked = Settings.debugGui;
-        steamvr_lh.checked = Settings.steamVrLh;
-        use_survive.checked = Settings.useSurvive;
+        lighthouse_backend.currentIndex = lighthouse_backend.indexOfValue(Settings.lighthouseBackend);
         lighthouse_stabilization_enabled.checked = Settings.lighthouseReferenceSerial.length > 0;
         lighthouse_reference_serial.currentIndex = Settings.lighthouseReferenceCandidates.indexOf(Settings.lighthouseReferenceSerial);
         lighthouse_reference_serial.editText = Settings.lighthouseReferenceSerial;

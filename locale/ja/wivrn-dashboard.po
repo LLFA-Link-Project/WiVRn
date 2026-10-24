@@ -1048,9 +1048,9 @@ msgid "Turn off Lighthouse trackers"
 msgstr "Lighthouse トラッカーの電源を切る"
 
 #: dashboard/qml/SettingsPage.qml
-msgid "Enable libsurvive Lighthouse devices support"
-msgstr "libsurvive による Lighthouse デバイスのサポートを有効にする"
+msgid "Lighthouse backend:"
+msgstr "Lighthouse バックエンド:"
 
 #: dashboard/qml/SettingsPage.qml
-msgid "Allows the use of Lighthouse controllers and trackers with libsurvive.\nDevices can be powered on or connected while WiVRn is running.\nAn external tool such as motoc is needed for calibration.\nRestart the runtime session to apply changes."
-msgstr "libsurvive を使用して Lighthouse コントローラーとトラッカーを利用できます。\nWiVRn の実行中にデバイスの電源を入れたり接続したりできます。\nキャリブレーションには motoc などの外部ツールが必要です。\n変更を適用するにはランタイムのセッションを再起動してください。"
+msgid "Restart the internal Monado runtime to apply backend changes. SteamVR requires SteamVR to be installed. An external tool such as motoc is needed for calibration."
+msgstr "バックエンドの変更を適用するには、内部の Monado ランタイムを再起動してください。SteamVR バックエンドには SteamVR のインストールが必要です。キャリブレーションには motoc などの外部ツールが必要です。"

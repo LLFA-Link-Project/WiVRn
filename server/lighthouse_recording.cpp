@@ -570,7 +570,7 @@ void start_lighthouse_recording(const configuration & snapshot) noexcept
 	started = true;
 	setenv("LH_RECORDER_ENABLE", "0", true);
 	unsetenv("LH_RECORDER_OUTPUT");
-	if (!snapshot.lighthouse_recording_enabled)
+	if (!snapshot.lighthouse_recording_enabled || snapshot.selected_lighthouse_backend() == lighthouse_backend::survive)
 		return;
 	try
 	{

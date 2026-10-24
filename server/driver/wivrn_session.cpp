@@ -144,12 +144,11 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 	static_xdevs[static_xdev_count++] = &gamepad_device.emplace(*this);
 
 	auto conf = configuration();
+	lighthouse_backend_choice = conf.selected_lighthouse_backend();
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 
-	auto use_steamvr_lh = conf.use_steamvr_lh || std::getenv("WIVRN_USE_STEAMVR_LH");
-
-	if (use_steamvr_lh)
+	if (lighthouse_backend_choice == lighthouse_backend::steamvr)
 	{
 		if (conf.lh_stick_deadzone > 0.01f)
 			setenv("LH_STICK_DEADZONE", std::format("{:.2}", *conf.lh_stick_deadzone).c_str(), true);
@@ -310,7 +309,7 @@ xrt_result_t wivrn::wivrn_session::create_session(std::unique_ptr<wivrn_connecti
 	self->system_compositor = *out_xsysc;
 
 #if WIVRN_FEATURE_SURVIVE
-	if (configuration().use_survive || std::getenv("WIVRN_USE_SURVIVE"))
+	if (self->lighthouse_backend_choice == lighthouse_backend::survive)
 	{
 		self->survive = survive_create_devices(self.get());
 		if (self->survive == nullptr)

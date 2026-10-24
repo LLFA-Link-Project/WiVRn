@@ -82,6 +82,7 @@ public:
 	Q_INVOKABLE QString recordingDirectoryFromUrl(const QUrl & url) const;
 	Q_PROPERTY(QString lighthouseReferenceSerial READ lighthouseReferenceSerial WRITE set_lighthouseReferenceSerial NOTIFY lighthouseReferenceSerialChanged)
 	Q_PROPERTY(QStringList lighthouseReferenceCandidates READ lighthouseReferenceCandidates NOTIFY lighthouseReferenceCandidatesChanged)
+	Q_PROPERTY(QString lighthouseBackend READ lighthouseBackend WRITE set_lighthouseBackend NOTIFY lighthouseBackendChanged)
 	Q_PROPERTY(bool useSurvive READ useSurvive WRITE set_useSurvive NOTIFY useSurviveChanged)
 	Q_PROPERTY(bool survive_supported READ survive CONSTANT)
 	Q_PROPERTY(bool steamVrLh READ steamVrLh WRITE set_steamVrLh NOTIFY steamVrLhChanged)
@@ -104,6 +105,7 @@ public:
 	SETTER_GETTER_NOTIFY(bool, debugGui)
 	SETTER_GETTER_NOTIFY(bool, steamVrLh)
 	SETTER_GETTER_NOTIFY(bool, useSurvive)
+	SETTER_GETTER_NOTIFY(QString, lighthouseBackend)
 	SETTER_GETTER_NOTIFY(bool, lighthouseRecordingEnabled)
 	SETTER_GETTER_NOTIFY(QString, lighthouseRecordingOutput)
 	SETTER_GETTER_NOTIFY(QString, lighthouseReferenceSerial)

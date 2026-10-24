@@ -149,6 +149,13 @@ configuration::encoder parse_encoder(const nlohmann::json & item)
 	return e;
 }
 
+lighthouse_backend configuration::selected_lighthouse_backend() const
+{
+	return select_lighthouse_backend(use_steamvr_lh || std::getenv("WIVRN_USE_STEAMVR_LH"),
+	                                use_survive || std::getenv("WIVRN_USE_SURVIVE"),
+	                                WIVRN_FEATURE_STEAMVR_LIGHTHOUSE, WIVRN_FEATURE_SURVIVE);
+}
+
 configuration::configuration()
 {
 	try

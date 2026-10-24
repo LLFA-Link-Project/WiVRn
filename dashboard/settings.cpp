@@ -17,6 +17,7 @@
  */
 
 #include "settings.h"
+#include "lighthouse_backend.h"
 #include "lighthouse_recording_defaults.h"
 #include "lighthouse_reference_settings.h"
 #include <QUrl>
@@ -125,6 +126,7 @@ void Settings::emitAllChanged()
 	debugGuiChanged();
 	steamVrLhChanged();
 	useSurviveChanged();
+	lighthouseBackendChanged();
 	lighthouseRecordingEnabledChanged();
 	lighthouseRecordingOutputChanged();
 	lighthouseReferenceSerialChanged();
@@ -425,10 +427,14 @@ bool Settings::steamVrLh() const
 
 void Settings::set_steamVrLh(const bool & value)
 {
-	auto old = steamVrLh();
-	m_jsonSettings["use-steamvr-lh"] = value;
-	if (old != value)
+	if (value)
+		set_lighthouseBackend("steamvr");
+	else if (steamVrLh())
+	{
+		m_jsonSettings["use-steamvr-lh"] = false;
 		steamVrLhChanged();
+		lighthouseBackendChanged();
+	}
 }
 
 bool Settings::useSurvive() const
@@ -439,10 +445,41 @@ bool Settings::useSurvive() const
 
 void Settings::set_useSurvive(const bool & value)
 {
-	auto old = useSurvive();
-	m_jsonSettings["use-survive"] = value;
-	if (old != value)
+	if (value)
+		set_lighthouseBackend("survive");
+	else if (useSurvive())
+	{
+		m_jsonSettings["use-survive"] = false;
 		useSurviveChanged();
+		lighthouseBackendChanged();
+	}
+}
+
+QString Settings::lighthouseBackend() const
+{
+	switch (wivrn::select_lighthouse_backend(steamVrLh(), useSurvive(), true, true))
+	{
+		case wivrn::lighthouse_backend::steamvr: return "steamvr";
+		case wivrn::lighthouse_backend::survive: return "survive";
+		default: return "none";
+	}
+}
+
+void Settings::set_lighthouseBackend(const QString & value)
+{
+	if (value != "none" && value != "steamvr" && value != "survive")
+		return;
+	auto old_backend = lighthouseBackend();
+	auto old_steamvr = steamVrLh();
+	auto old_survive = useSurvive();
+	m_jsonSettings["use-steamvr-lh"] = value == "steamvr";
+	m_jsonSettings["use-survive"] = value == "survive";
+	if (old_steamvr != steamVrLh())
+		steamVrLhChanged();
+	if (old_survive != useSurvive())
+		useSurviveChanged();
+	if (old_backend != lighthouseBackend())
+		lighthouseBackendChanged();
 }
 
 bool Settings::survive() const

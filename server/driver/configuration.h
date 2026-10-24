@@ -21,6 +21,7 @@
 
 #include "hostname.h"
 #include "lighthouse_recording_defaults.h"
+#include "lighthouse_backend.h"
 #include "wivrn_config.h"
 #include <array>
 #include <chrono>
@@ -59,6 +60,7 @@ struct configuration
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
 	bool use_survive = false;
+	lighthouse_backend selected_lighthouse_backend() const;
 	std::string lighthouse_reference_serial;
 	bool lighthouse_recording_enabled = false;
 	std::filesystem::path lighthouse_recording_output = default_lighthouse_recording_directory();
