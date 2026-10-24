@@ -132,6 +132,16 @@ Kirigami.ScrollablePage {
                     toolTipText: i18n("Allows the use of lighthouse-based controllers and trackers.\nRequires SteamVR to be installed.\nDevices must be be powered on before connecting to WiVRn.\nAn external tool such as motoc is needed for calibration.")
                 }
             }
+            RowLayout {
+                visible: Settings.survive_supported
+                Controls.CheckBox {
+                    id: use_survive
+                    text: i18n("Enable libsurvive Lighthouse devices support")
+                }
+                Kirigami.ContextualHelpButton {
+                    toolTipText: i18n("Allows the use of Lighthouse controllers and trackers with libsurvive.\nDevices can be powered on or connected while WiVRn is running.\nAn external tool such as motoc is needed for calibration.\nRestart the runtime session to apply changes.")
+                }
+            }
             Controls.CheckBox {
                 id: lighthouse_stabilization_enabled
                 visible: Settings.steamvr_lh_supported && steamvr_lh.checked
@@ -383,6 +393,7 @@ Kirigami.ScrollablePage {
 
         Settings.debugGui = debug_gui.checked;
         Settings.steamVrLh = steamvr_lh.checked;
+        Settings.useSurvive = use_survive.checked;
         Settings.lighthouseReferenceSerial = lighthouse_stabilization_enabled.checked ? lighthouse_reference_serial.editText.trim() : "";
         Settings.lighthouseRecordingEnabled = lighthouse_recording_enabled.checked;
         Settings.lighthouseRecordingOutput = lighthouse_recording_output.text;
@@ -401,6 +412,7 @@ Kirigami.ScrollablePage {
         select_game.load();
         debug_gui.checked = Settings.debugGui;
         steamvr_lh.checked = Settings.steamVrLh;
+        use_survive.checked = Settings.useSurvive;
         lighthouse_stabilization_enabled.checked = Settings.lighthouseReferenceSerial.length > 0;
         lighthouse_reference_serial.currentIndex = Settings.lighthouseReferenceCandidates.indexOf(Settings.lighthouseReferenceSerial);
         lighthouse_reference_serial.editText = Settings.lighthouseReferenceSerial;

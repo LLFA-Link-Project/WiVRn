@@ -52,6 +52,8 @@ struct xrt_space_overseer;
 struct xrt_system_compositor;
 union xrt_session_event;
 
+struct survive_system;
+
 namespace wivrn
 {
 class wivrn_eye_tracker;
@@ -87,6 +89,7 @@ class wivrn_session : public xrt_system_devices
 
 	// Headset roles remain available while Lighthouse controllers are being discovered.
 	bool lighthouse_enabled = false;
+	survive_system * survive = nullptr;
 	xrt_system_roles effective_roles = XRT_SYSTEM_ROLES_INIT;
 
 	tracking_control control;

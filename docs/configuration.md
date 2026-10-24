@@ -165,6 +165,31 @@ after startup. Controllers and base stations are excluded. The action also works
 while the session is waiting for the headset to reconnect. It requests standby;
 the individual device's driver determines whether the hardware powers off.
 
+## `use-survive`
+Default value: `false`
+
+Enables Lighthouse controllers and trackers through libsurvive. In the dashboard,
+use **Advanced options → Enable libsurvive Lighthouse devices support** and
+restart the runtime session to apply changes. Controllers and trackers can be added
+while the runtime is running, including when no devices were present at startup.
+Reconnecting the same serial reuses its OpenXR device. An external tool such as
+motoc is needed for calibration.
+
+The libsurvive simple API does not report disconnections. After two seconds without
+pose or button events, WiVRn marks inputs and poses inactive and releases controller
+roles back to the headset. Events resume the device automatically. USB discovery
+and reconnection also depend on the installed libsurvive driver.
+
+Requires a build with `WIVRN_FEATURE_SURVIVE=ON` and
+`WIVRN_FEATURE_STEAMVR_LIGHTHOUSE=OFF`, plus an installed libsurvive providing the
+`survive` pkg-config package. These build options are mutually exclusive; the
+dashboard only shows the backend included in the build. SteamVR-specific recording,
+base station stabilization, extrapolation and joystick settings do not apply to
+libsurvive. Its pose extrapolation is currently clamped to 50 ms.
+
+The environment variable `WIVRN_USE_SURVIVE` also enables this backend when set,
+including when the dashboard option is disabled.
+
 ## `lh-max-extrapolation`
 Default value: unset
 

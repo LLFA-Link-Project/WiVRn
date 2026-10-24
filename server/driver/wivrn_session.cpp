@@ -50,7 +50,6 @@
 #include "util/u_logging.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
-#include "xrt/xrt_prober.h"
 #include "xrt/xrt_session.h"
 
 #include <algorithm>
@@ -146,40 +145,6 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 
 	auto conf = configuration();
 
-#if WIVRN_FEATURE_SURVIVE
-	auto register_external_controller = [this](xrt_device * device, int index) {
-		switch (device->device_type)
-		{
-			case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
-				roles.left = index;
-				static_roles.hand_tracking.unobstructed.left = nullptr;
-				static_roles.hand_tracking.conforming.left = device;
-				break;
-			case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER:
-				roles.right = index;
-				static_roles.hand_tracking.unobstructed.right = nullptr;
-				static_roles.hand_tracking.conforming.right = device;
-				break;
-			case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
-				if (roles.left == left_controller_index)
-				{
-					roles.left = index;
-					static_roles.hand_tracking.unobstructed.left = nullptr;
-					static_roles.hand_tracking.conforming.left = device;
-				}
-				else if (roles.right == right_controller_index)
-				{
-					roles.right = index;
-					static_roles.hand_tracking.unobstructed.right = nullptr;
-					static_roles.hand_tracking.conforming.right = device;
-				}
-				break;
-			default:
-				break;
-		}
-	};
-#endif
-
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 
 	auto use_steamvr_lh = conf.use_steamvr_lh || std::getenv("WIVRN_USE_STEAMVR_LH");
@@ -200,40 +165,6 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 	}
 #endif
 
-#if WIVRN_FEATURE_SURVIVE
-	U_LOG_I("libsurvive backend enabled");
-	xrt_device * survive_devices[XRT_MAX_DEVICES_PER_PROBE] = {};
-	// The config is borrowed from a survive HMD; WiVRn does not use it.
-	vive_config * survive_hmd_config = nullptr;
-	int survive_count = survive_get_devices(nullptr, survive_devices, &survive_hmd_config);
-	if (survive_count == 0)
-		U_LOG_W("survive initialization failed or no devices detected");
-	else
-		U_LOG_I("%d survive devices detected", survive_count);
-
-	for (int i = 0; i < survive_count; ++i)
-	{
-		xrt_device * device = survive_devices[i];
-		if (device == nullptr)
-			continue;
-		if (device->device_type == XRT_DEVICE_TYPE_HMD)
-		{
-			U_LOG_I("Ignored survive HMD: %s", device->str);
-			xrt_device_destroy(&device);
-			continue;
-		}
-		if (static_xdev_count == std::size(static_xdevs))
-		{
-			U_LOG_W("No room for survive device: %s", device->str);
-			xrt_device_destroy(&device);
-			continue;
-		}
-		U_LOG_I("Survive device: %s (type %d)", device->str, device->device_type);
-		int index = static_xdev_count;
-		static_xdevs[static_xdev_count++] = device;
-		register_external_controller(device, index);
-	}
-#endif
 	if (get_info().eye_gaze || is_forced_extension("EXT_eye_gaze_interaction"))
 	{
 		// The tracker space needs to be attached to the head pose once the space overseer is created
@@ -327,6 +258,9 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 
 wivrn_session::~wivrn_session()
 {
+#if WIVRN_FEATURE_SURVIVE
+	survive_stop(survive);
+#endif
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 	if (lighthouse_enabled)
 		steamvr_lh_stop(this);
@@ -341,6 +275,9 @@ wivrn_session::~wivrn_session()
 	}
 
 	connection->shutdown();
+#if WIVRN_FEATURE_SURVIVE
+	survive_destroy(survive);
+#endif
 }
 
 xrt_result_t wivrn::wivrn_session::create_session(std::unique_ptr<wivrn_connection> connection,
@@ -372,6 +309,15 @@ xrt_result_t wivrn::wivrn_session::create_session(std::unique_ptr<wivrn_connecti
 	}
 	self->system_compositor = *out_xsysc;
 
+#if WIVRN_FEATURE_SURVIVE
+	if (configuration().use_survive || std::getenv("WIVRN_USE_SURVIVE"))
+	{
+		self->survive = survive_create_devices(self.get());
+		if (self->survive == nullptr)
+			U_LOG_W("Failed to initialize libsurvive backend");
+	}
+#endif
+
 	struct xrt_pose t_stage_local = XRT_POSE_IDENTITY;
 	t_stage_local.position.y = 1.6;
 
@@ -389,6 +335,9 @@ xrt_result_t wivrn::wivrn_session::create_session(std::unique_ptr<wivrn_connecti
 	        false,
 	        out_xspovrs);
 	self->space_overseer = *out_xspovrs;
+#if WIVRN_FEATURE_SURVIVE
+	survive_start(self->survive, &wivrn_session::lighthouse_device_added, self.get());
+#endif
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 	if (self->lighthouse_enabled)
 		steamvr_lh_set_device_added_callback(self.get(), &wivrn_session::lighthouse_device_added, self.get());
@@ -424,6 +373,9 @@ void wivrn_session::start(ipc_server * server)
 
 void wivrn_session::stop()
 {
+#if WIVRN_FEATURE_SURVIVE
+	survive_stop(survive);
+#endif
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 	if (lighthouse_enabled)
 		steamvr_lh_stop(this);
@@ -1492,6 +1444,9 @@ xrt_result_t wivrn_session::create_hand_tracker(const xrt_hand_tracker_create_in
 xrt_result_t wivrn_session::get_roles(xrt_system_roles * out_roles)
 {
 	xrt_system_roles lighthouse_roles = XRT_SYSTEM_ROLES_INIT;
+#if WIVRN_FEATURE_SURVIVE
+	survive_get_roles(survive, &lighthouse_roles);
+#endif
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 	if (lighthouse_enabled)
 		steamvr_lh_get_roles(this, &lighthouse_roles);

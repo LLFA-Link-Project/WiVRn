@@ -201,6 +201,9 @@ configuration::configuration()
 		if (auto it = json.find("use-steamvr-lh"); it != json.end())
 			use_steamvr_lh = *it;
 
+		if (auto it = json.find("use-survive"); it != json.end() && it->is_boolean())
+			use_survive = *it;
+
 		if (auto it = json.find("lighthouse-reference-serial"); it != json.end() && it->is_string())
 		{
 			auto serial = it->get<std::string>();

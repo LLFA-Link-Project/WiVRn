@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sat, 24 Oct 2026 00:00:00 +0000
+Subject: [PATCH] survive: publish live devices and retain identities across reconnects
+
+---
+diff --git a/src/xrt/drivers/survive/survive_interface.h b/src/xrt/drivers/survive/survive_interface.h
+--- a/src/xrt/drivers/survive/survive_interface.h
++++ b/src/xrt/drivers/survive/survive_interface.h
+@@ -29,6 +29,29 @@
+ int
+ survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct vive_config **out_vive_config);
+ 
++struct xrt_system_devices;
++struct xrt_system_roles;
++struct survive_system;
++
++/* WiVRn owns the context independently of devices, including an empty system.
++ * Start publication only after the space overseer has been created.
++ * Stop before destroying devices; destroy the system after destroying devices.
++ */
++struct survive_system *
++survive_create_devices(struct xrt_system_devices *xsysd);
++
++void
++survive_start(struct survive_system *sys, void (*device_added)(struct xrt_device *, void *), void *userdata);
++
++void
++survive_stop(struct survive_system *sys);
++
++void
++survive_destroy(struct survive_system *sys);
++
++void
++survive_get_roles(struct survive_system *sys, struct xrt_system_roles *out_roles);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/xrt/drivers/survive/survive_internal.h b/src/xrt/drivers/survive/survive_internal.h
+--- a/src/xrt/drivers/survive/survive_internal.h
++++ b/src/xrt/drivers/survive/survive_internal.h
+@@ -91,6 +91,7 @@
+ 	const SurviveSimpleObject *survive_obj;
+ 
+ 	struct m_relation_history *relation_hist;
++	uint64_t last_event_ns;
+ 
+ 	//! Number of inputs.
+ 	size_t num_last_inputs;
+@@ -133,6 +134,10 @@
+ {
+ 	struct xrt_tracking_origin base;
+ 	SurviveSimpleContext *ctx;
++	bool system_owned;
++	struct xrt_system_devices *xsysd;
++	void (*device_added)(struct xrt_device *, void *);
++	void *device_added_userdata;
+ 	struct survive_device *hmd;
+ 	struct survive_device *controllers[MAX_TRACKED_DEVICE_COUNT];
+ 	enum u_logging_level log_level;
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -12,6 +12,7 @@
+ 
+ #include "xrt/xrt_device.h"
+ #include "xrt/xrt_prober.h"
++#include "xrt/xrt_system.h"
+ 
+ #include "math/m_api.h"
+ #include "math/m_space.h"
+@@ -96,7 +97,7 @@
+ 	bool last_device = survive->sys->hmd == NULL && all_null;
+ 	os_mutex_unlock(&survive->sys->lock);
+ 
+-	if (last_device) {
++	if (last_device && !survive->sys->system_owned) {
+ 		U_LOG_D("Tearing down libsurvive context");
+ 
+ 		// Remove the variable tracking.
+@@ -217,6 +218,15 @@
+ 	return false;
+ }
+ 
++// The simple API has no disconnect event. Expire silent devices, retaining
++// their identity so cached OpenXR handles remain valid across reconnection.
++static bool
++survive_device_active(struct survive_device *d)
++{
++	uint64_t last = __atomic_load_n(&d->last_event_ns, __ATOMIC_RELAXED);
++	return last != 0 && os_monotonic_get_ns() - last < 2 * U_TIME_1S_IN_NS;
++}
++
+ static xrt_result_t
+ survive_device_get_tracked_pose(struct xrt_device *xdev,
+                                 enum xrt_input_name name,
+@@ -229,8 +239,8 @@
+ 		return XRT_ERROR_INPUT_UNSUPPORTED;
+ 	}
+ 
+-	if (!survive->survive_obj) {
+-		// U_LOG_D("Obj not set for %p", (void*)survive);
++	if (!survive_device_active(survive)) {
++		*out_relation = (struct xrt_space_relation){0};
+ 		return XRT_SUCCESS;
+ 	}
+ 
+@@ -258,9 +268,13 @@
+ survive_device_get_battery_status(struct xrt_device *xdev, bool *out_present, bool *out_charging, float *out_charge)
+ {
+ 	struct survive_device *survive = (struct survive_device *)xdev;
+-	if (!survive->survive_obj) {
++	os_mutex_lock(&survive->sys->lock);
++	if (!survive->survive_obj || (survive->sys->system_owned && !survive_device_active(survive))) {
+ 		// U_LOG_D("Obj not set for %p", (void*)survive);
+ 		*out_present = false;
++		*out_charging = false;
++		*out_charge = 0;
++		os_mutex_unlock(&survive->sys->lock);
+ 		return XRT_SUCCESS;
+ 	}
+ 
+@@ -271,6 +285,7 @@
+ #else
+ 	*out_charge = survive_simple_object_charge_percent(survive->survive_obj) * 0.01F;
+ #endif
++	os_mutex_unlock(&survive->sys->lock);
+ 	SURVIVE_TRACE(survive, "Charging: %s, charge: %f", *out_charging ? "true" : "false", *out_charge);
+ 	return XRT_SUCCESS;
+ }
+@@ -320,7 +335,9 @@
+ 		return XRT_SUCCESS;
+ 	}
+ 
+-	int ret = survive_controller_haptic_pulse(survive, value);
++	os_mutex_lock(&survive->sys->lock);
++	int ret = survive_device_active(survive) ? survive_controller_haptic_pulse(survive, value) : 0;
++	os_mutex_unlock(&survive->sys->lock);
+ 
+ 	if (ret != 0) {
+ 		SURVIVE_ERROR(survive, "haptic failed %d", ret);
+@@ -373,6 +390,13 @@
+ 	}
+ 
+ 
++	os_mutex_lock(&survive->sys->lock);
++	if (!survive_device_active(survive)) {
++		*out_value = (struct xrt_hand_joint_set){0};
++		*out_timestamp_ns = at_timestamp_ns;
++		os_mutex_unlock(&survive->sys->lock);
++		return XRT_SUCCESS;
++	}
+ 	bool left = survive->ctrl.config.variant == CONTROLLER_INDEX_LEFT;
+ 	enum xrt_hand hand = left ? XRT_HAND_LEFT : XRT_HAND_RIGHT;
+ 
+@@ -419,9 +443,10 @@
+ 	// This is the truth - we pose-predicted or interpolated all the way up to `at_timestamp_ns`.
+ 	*out_timestamp_ns = at_timestamp_ns;
+ 
+-	// This is a lie - apparently libsurvive doesn't report controller tracked/untracked state, so just say that the
+-	// hand is being tracked
++	// Recent events keep hand emulation active; the inactivity check above
++	// releases it when libsurvive stops reporting the device.
+ 	out_value->is_active = true;
++	os_mutex_unlock(&survive->sys->lock);
+ 
+ 	return XRT_SUCCESS;
+ }
+@@ -729,8 +754,23 @@
+ add_device(struct survive_system *ss, const struct SurviveSimpleConfigEvent *e);
+ 
+ static void
++survive_device_mark_active(struct survive_device *d)
++{
++	if (!survive_device_active(d)) {
++		for (size_t i = 0; i < d->num_last_inputs; i++) {
++			memset(&d->last_inputs[i].value, 0, sizeof(d->last_inputs[i].value));
++		}
++		if (d->device_type == DEVICE_TYPE_CONTROLLER) {
++			memset(d->ctrl.curl, 0, sizeof(d->ctrl.curl));
++		}
++	}
++	__atomic_store_n(&d->last_event_ns, os_monotonic_get_ns(), __ATOMIC_RELAXED);
++}
++
++static void
+ _process_pose_event(struct survive_device *survive, const struct SurviveSimplePoseUpdatedEvent *e)
+ {
++	survive_device_mark_active(survive);
+ 	struct xrt_space_relation rel = {0};
+ 	pose_to_relation(&e->pose, &e->velocity, &rel);
+ 	timepoint_ns ts = survive_timecode_to_monotonic(survive, e->time);
+@@ -752,6 +792,7 @@
+ 			return;
+ 		}
+ 
++		survive_device_mark_active(event_device);
+ 		// hmd & controller axes have overlapping enum indices
+ 		if (event_device == ss->hmd) {
+ 			_process_hmd_button_event(event_device, e);
+@@ -782,9 +823,10 @@
+ 		break;
+ 	}
+ 	case SurviveSimpleEventType_DeviceAdded: {
+-		U_LOG_IFL_W(ss->log_level, "Device added event, but hotplugging not implemented yet");
++		// Wait for ConfigEvent before exposing an object.
+ 		break;
+ 	}
++	case SurviveSimpleEventType_Shutdown:
+ 	case SurviveSimpleEventType_None: break;
+ 	default: U_LOG_IFL_E(ss->log_level, "Unknown event %d", event->event_type);
+ 	}
+@@ -799,6 +841,10 @@
+ 
+ 	for (size_t i = 0; i < survive->base.input_count; i++) {
+ 		survive->base.inputs[i] = survive->last_inputs[i];
++		if (survive->sys->system_owned && !survive_device_active(survive)) {
++			survive->base.inputs[i].active = false;
++			memset(&survive->base.inputs[i].value, 0, sizeof(survive->base.inputs[i].value));
++		}
+ 	}
+ 
+ 	os_mutex_unlock(&survive->sys->lock);
+@@ -1021,6 +1067,28 @@
+                           struct vive_controller_config *config)
+ {
+ 
++	const char *serial = config->firmware.device_serial_number;
++	if (serial[0] != '\0') {
++		for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
++			struct survive_device *existing = sys->controllers[i];
++			if (existing != NULL && strcmp(existing->base.serial, serial) == 0) {
++				if (existing->ctrl.config.variant != config->variant) {
++					return false;
++				}
++				existing->survive_obj = sso;
++				m_relation_history_clear(existing->relation_hist);
++				__atomic_store_n(&existing->last_event_ns, 0, __ATOMIC_RELAXED);
++				for (size_t j = 0; j < existing->num_last_inputs; j++) {
++					memset(&existing->last_inputs[j].value, 0, sizeof(existing->last_inputs[j].value));
++				}
++				return true;
++			}
++		}
++	}
++	if (sys->xsysd && sys->xsysd->static_xdev_count >= XRT_SYSTEM_MAX_DEVICES) {
++		return false;
++	}
++
+ 	enum VIVE_CONTROLLER_VARIANT variant = config->variant;
+ 
+ 	int idx = -1;
+@@ -1187,6 +1255,13 @@
+ 
+ 	u_var_add_root(survive, "Survive Device", true);
+ 
++	if (sys->device_added != NULL) {
++		sys->device_added(&survive->base, sys->device_added_userdata);
++		uint32_t count = sys->xsysd->static_xdev_count;
++		sys->xsysd->static_xdevs[count] = &survive->base;
++		__atomic_store_n(&sys->xsysd->static_xdev_count, count + 1, __ATOMIC_RELEASE);
++	}
++
+ 	return true;
+ }
+ 
+@@ -1206,12 +1281,21 @@
+ 	char *conf_str = (char *)survive_simple_json_config(sso);
+ 
+ 	if (type == SurviveSimpleObject_HMD) {
++		if (ss->system_owned || ss->hmd != NULL) {
++			return;
++		}
+ 
+ 		_create_hmd_device(ss, sso, conf_str);
+ 
+ 	} else if (type == SurviveSimpleObject_OBJECT) {
+ 		struct vive_controller_config config = {0};
+-		vive_config_parse_controller(&config, conf_str, ss->log_level);
++		if (!vive_config_parse_controller(&config, conf_str, ss->log_level)) {
++			return;
++		}
++		if (ss->system_owned && config.firmware.device_serial_number[0] == '\0') {
++			U_LOG_IFL_W(ss->log_level, "Skipping survive device without a stable serial");
++			return;
++		}
+ 
+ 		switch (config.variant) {
+ 		case CONTROLLER_VIVE_WAND:
+@@ -1309,7 +1393,9 @@
+ 
+ 		// one event queue for all devices. _process_events() updates all devices
+ 		struct SurviveSimpleEvent event = {0};
+-		survive_simple_wait_for_event(ss->ctx, &event);
++		if (survive_simple_next_event(ss->ctx, &event) == SurviveSimpleEventType_None) {
++			os_nanosleep(U_TIME_1MS_IN_NS);
++		}
+ 
+ 		os_mutex_lock(&ss->lock);
+ 		_process_event(ss, &event);
+@@ -1324,8 +1410,9 @@
+ 	return NULL;
+ }
+ 
+-int
+-survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct vive_config **out_vive_config)
++static int
++survive_get_devices_internal(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct vive_config **out_vive_config,
++                             bool system_owned, struct survive_system **out_system)
+ {
+ 	SurviveSimpleContext *actx = NULL;
+ #if 1
+@@ -1354,6 +1441,7 @@
+ 	survive_simple_start_thread(actx);
+ 
+ 	ss->ctx = actx;
++	ss->system_owned = system_owned;
+ 	ss->base.type = XRT_TRACKING_TYPE_LIGHTHOUSE;
+ 	snprintf(ss->base.name, XRT_TRACKING_NAME_LEN, "%s", "Libsurvive Tracking");
+ 	ss->base.initial_offset.position.x = 0.0f;
+@@ -1419,7 +1507,7 @@
+ 		}
+ 	}
+ 
+-	if (out_idx == 0) {
++	if (out_idx == 0 && !system_owned) {
+ 		os_thread_helper_destroy(&ss->event_thread);
+ 		os_mutex_destroy(&ss->lock);
+ 		survive_simple_close(ss->ctx);
+@@ -1427,7 +1515,7 @@
+ 		return 0;
+ 	}
+ 
+-	ret = os_thread_helper_start(&ss->event_thread, run_event_thread, ss);
++	ret = system_owned ? 0 : os_thread_helper_start(&ss->event_thread, run_event_thread, ss);
+ 	if (ret != 0) {
+ 		U_LOG_IFL_E(ss->log_level, "Failed to start event thread!");
+ 		for (int i = 0; i < out_idx; i++) {
+@@ -1440,5 +1528,97 @@
+ 	u_var_add_root(ss, "Survive system", true);
+ 	u_var_add_draggable_f32(ss, &ss->timecode_offset_ms, "Timecode offset(ms)");
+ 
++	if (out_system != NULL) {
++		*out_system = ss;
++	}
+ 	return out_idx;
+ }
++
++int
++survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct vive_config **out_vive_config)
++{
++	return survive_get_devices_internal(xp, out_xdevs, out_vive_config, false, NULL);
++}
++
++struct survive_system *
++survive_create_devices(struct xrt_system_devices *xsysd)
++{
++	struct survive_system *ss = NULL;
++	struct xrt_device *devices[XRT_MAX_DEVICES_PER_PROBE] = {0};
++	struct vive_config *config = NULL;
++	int count = survive_get_devices_internal(NULL, devices, &config, true, &ss);
++	if (ss == NULL) {
++		return NULL;
++	}
++	ss->xsysd = xsysd;
++	for (int i = 0; i < count; i++) {
++		if (xsysd->static_xdev_count < XRT_SYSTEM_MAX_DEVICES) {
++			xsysd->static_xdevs[xsysd->static_xdev_count++] = devices[i];
++		} else {
++			xrt_device_destroy(&devices[i]);
++		}
++	}
++	return ss;
++}
++
++void
++survive_start(struct survive_system *ss, void (*device_added)(struct xrt_device *, void *), void *userdata)
++{
++	if (ss == NULL) {
++		return;
++	}
++	ss->device_added = device_added;
++	ss->device_added_userdata = userdata;
++	if (os_thread_helper_start(&ss->event_thread, run_event_thread, ss) != 0) {
++		U_LOG_E("Failed to start survive event thread");
++	}
++}
++
++void
++survive_stop(struct survive_system *ss)
++{
++	if (ss != NULL) {
++		os_thread_helper_stop_and_wait(&ss->event_thread);
++	}
++}
++
++void
++survive_destroy(struct survive_system *ss)
++{
++	if (ss == NULL) {
++		return;
++	}
++	survive_stop(ss);
++	os_thread_helper_destroy(&ss->event_thread);
++	u_var_remove_root(ss);
++	survive_simple_close(ss->ctx);
++	os_mutex_destroy(&ss->lock);
++	free(ss);
++}
++
++void
++survive_get_roles(struct survive_system *ss, struct xrt_system_roles *out_roles)
++{
++	*out_roles = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
++	if (ss == NULL) {
++		return;
++	}
++	os_mutex_lock(&ss->lock);
++	uint32_t count = __atomic_load_n(&ss->xsysd->static_xdev_count, __ATOMIC_ACQUIRE);
++	for (uint32_t i = 0; i < count; i++) {
++		struct xrt_device *xdev = ss->xsysd->static_xdevs[i];
++		if (xdev->tracking_origin != &ss->base || !survive_device_active((struct survive_device *)xdev)) {
++			continue;
++		}
++		if ((xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ||
++		     xdev->device_type == XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER) && out_roles->left < 0) {
++			out_roles->left = i;
++			out_roles->left_profile = xdev->name;
++		} else if ((xdev->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ||
++		            xdev->device_type == XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER) && out_roles->right < 0) {
++			out_roles->right = i;
++			out_roles->right_profile = xdev->name;
++		}
++	}
++	os_mutex_unlock(&ss->lock);
++}

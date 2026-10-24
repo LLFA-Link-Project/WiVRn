@@ -124,6 +124,7 @@ void Settings::emitAllChanged()
 	openvrChanged();
 	debugGuiChanged();
 	steamVrLhChanged();
+	useSurviveChanged();
 	lighthouseRecordingEnabledChanged();
 	lighthouseRecordingOutputChanged();
 	lighthouseReferenceSerialChanged();
@@ -430,6 +431,25 @@ void Settings::set_steamVrLh(const bool & value)
 		steamVrLhChanged();
 }
 
+bool Settings::useSurvive() const
+{
+	auto it = m_jsonSettings.find("use-survive");
+	return it != m_jsonSettings.end() && it->is_boolean() && it->get<bool>();
+}
+
+void Settings::set_useSurvive(const bool & value)
+{
+	auto old = useSurvive();
+	m_jsonSettings["use-survive"] = value;
+	if (old != value)
+		useSurviveChanged();
+}
+
+bool Settings::survive() const
+{
+	return WIVRN_FEATURE_SURVIVE;
+}
+
 QString Settings::lighthouseReferenceSerial() const
 {
 	auto it = m_jsonSettings.find("lighthouse-reference-serial");
@@ -690,6 +710,7 @@ void Settings::restore_defaults()
 	m_jsonSettings.erase("hid-forwarding");
 	m_jsonSettings.erase("debug-gui");
 	m_jsonSettings.erase("use-steamvr-lh");
+	m_jsonSettings.erase("use-survive");
 	m_jsonSettings.erase("lighthouse-recording");
 	m_jsonSettings.erase("lh-stick-deadzone");
 	m_jsonSettings.erase("tcp-only");

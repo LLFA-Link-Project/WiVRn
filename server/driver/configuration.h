@@ -58,6 +58,7 @@ struct configuration
 	std::vector<std::string> application;
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
+	bool use_survive = false;
 	std::string lighthouse_reference_serial;
 	bool lighthouse_recording_enabled = false;
 	std::filesystem::path lighthouse_recording_output = default_lighthouse_recording_directory();

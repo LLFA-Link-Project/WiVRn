@@ -47,6 +47,26 @@ int main(int argc, char ** argv)
 	b.loadJson(R"({"lighthouse-recording":{"enabled":"invalid","output-directory":null}})");
 	require(!b.lighthouseRecordingEnabled());
 	require(b.lighthouseRecordingOutput() == "/tmp/lh-xdg-data/wivrn/lighthouse-recordings");
+	// The optional backend is opt-in, persists, and resets with defaults.
+	a.loadJson(R"({"unrelated":42})");
+	require(!a.useSurvive());
+	int survive_changes = 0;
+	QObject::connect(&a, &Settings::useSurviveChanged, [&] { ++survive_changes; });
+	a.set_useSurvive(true);
+	a.set_useSurvive(true);
+	require(survive_changes == 1);
+	b.loadJson(a.saveJson());
+	require(b.useSurvive());
+	require(b.saveJson().contains("unrelated"));
+	a.set_useSurvive(false);
+	b.loadJson(a.saveJson());
+	require(!b.useSurvive());
+	b.set_useSurvive(true);
+	b.restore_defaults();
+	require(!b.useSurvive());
+	require(!b.saveJson().contains("use-survive"));
+	b.loadJson(R"({"use-survive":"invalid"})");
+	require(!b.useSurvive());
 	// Manual selection survives roundtrip; disabling keeps remembered choices.
 	a.loadJson("{}");
 	require(a.lighthouseReferenceSerial().isEmpty());
