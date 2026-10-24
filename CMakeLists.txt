@@ -82,6 +82,10 @@ option(WIVRN_FEATURE_DEBUG_GUI "Enable Monado debug GUI" OFF)
 option(WIVRN_FEATURE_RENDERDOC "Support renderdoc" OFF)
 option(WIVRN_FEATURE_SOLARXR "Enable SolarXR driver" ON)
 option(WIVRN_FEATURE_STEAMVR_LIGHTHOUSE "Enable SteamVR Lighthouse driver" ON)
+option(WIVRN_FEATURE_SURVIVE "Enable libsurvive Lighthouse driver" OFF)
+if(WIVRN_FEATURE_STEAMVR_LIGHTHOUSE AND WIVRN_FEATURE_SURVIVE)
+	message(FATAL_ERROR "WIVRN_FEATURE_STEAMVR_LIGHTHOUSE and WIVRN_FEATURE_SURVIVE are mutually exclusive")
+endif()
 
 set(WIVRN_CSS "${CMAKE_SOURCE_DIR}/images/wivrn-local.css" CACHE STRING "Stylesheet to use to render SVGs" )
 

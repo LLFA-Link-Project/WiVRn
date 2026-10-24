@@ -50,6 +50,7 @@
 #include "util/u_logging.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_prober.h"
 #include "xrt/xrt_session.h"
 
 #include <algorithm>
@@ -63,6 +64,10 @@
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 #include "steamvr_lh_interface.h"
+#endif
+
+#if WIVRN_FEATURE_SURVIVE
+#include "survive_interface.h"
 #endif
 
 #if WIVRN_FEATURE_SOLARXR
@@ -141,6 +146,40 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 
 	auto conf = configuration();
 
+#if WIVRN_FEATURE_SURVIVE
+	auto register_external_controller = [this](xrt_device * device, int index) {
+		switch (device->device_type)
+		{
+			case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
+				roles.left = index;
+				static_roles.hand_tracking.unobstructed.left = nullptr;
+				static_roles.hand_tracking.conforming.left = device;
+				break;
+			case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER:
+				roles.right = index;
+				static_roles.hand_tracking.unobstructed.right = nullptr;
+				static_roles.hand_tracking.conforming.right = device;
+				break;
+			case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
+				if (roles.left == left_controller_index)
+				{
+					roles.left = index;
+					static_roles.hand_tracking.unobstructed.left = nullptr;
+					static_roles.hand_tracking.conforming.left = device;
+				}
+				else if (roles.right == right_controller_index)
+				{
+					roles.right = index;
+					static_roles.hand_tracking.unobstructed.right = nullptr;
+					static_roles.hand_tracking.conforming.right = device;
+				}
+				break;
+			default:
+				break;
+		}
+	};
+#endif
+
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 
 	auto use_steamvr_lh = conf.use_steamvr_lh || std::getenv("WIVRN_USE_STEAMVR_LH");
@@ -158,6 +197,41 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 		U_LOG_W("If getting a SIGSEGV right after this, you are likely using an unsupported SteamVR version!");
 		U_LOG_W("=====================");
 		lighthouse_enabled = steamvr_lh_create_devices(nullptr, this) == XRT_SUCCESS;
+	}
+#endif
+
+#if WIVRN_FEATURE_SURVIVE
+	U_LOG_I("libsurvive backend enabled");
+	xrt_device * survive_devices[XRT_MAX_DEVICES_PER_PROBE] = {};
+	// The config is borrowed from a survive HMD; WiVRn does not use it.
+	vive_config * survive_hmd_config = nullptr;
+	int survive_count = survive_get_devices(nullptr, survive_devices, &survive_hmd_config);
+	if (survive_count == 0)
+		U_LOG_W("survive initialization failed or no devices detected");
+	else
+		U_LOG_I("%d survive devices detected", survive_count);
+
+	for (int i = 0; i < survive_count; ++i)
+	{
+		xrt_device * device = survive_devices[i];
+		if (device == nullptr)
+			continue;
+		if (device->device_type == XRT_DEVICE_TYPE_HMD)
+		{
+			U_LOG_I("Ignored survive HMD: %s", device->str);
+			xrt_device_destroy(&device);
+			continue;
+		}
+		if (static_xdev_count == std::size(static_xdevs))
+		{
+			U_LOG_W("No room for survive device: %s", device->str);
+			xrt_device_destroy(&device);
+			continue;
+		}
+		U_LOG_I("Survive device: %s (type %d)", device->str, device->device_type);
+		int index = static_xdev_count;
+		static_xdevs[static_xdev_count++] = device;
+		register_external_controller(device, index);
 	}
 #endif
 	if (get_info().eye_gaze || is_forced_extension("EXT_eye_gaze_interaction"))

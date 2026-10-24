@@ -39,6 +39,7 @@ static const int64_t max_extrapolation_ns = 80'000'000;
 #cmakedefine01 WIVRN_FEATURE_DEBUG_GUI
 #cmakedefine01 WIVRN_FEATURE_RENDERDOC
 #cmakedefine01 WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
+#cmakedefine01 WIVRN_FEATURE_SURVIVE
 #cmakedefine01 WIVRN_FEATURE_SOLARXR
 
 #cmakedefine01 WIVRN_SHOW_IMGUI_DEMO_WINDOW

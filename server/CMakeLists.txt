@@ -21,6 +21,7 @@ set(XRT_BUILD_DRIVER_RIFT_S             OFF)
 set(XRT_BUILD_DRIVER_ROKID              OFF)
 set(XRT_BUILD_DRIVER_SIMULATED          OFF)
 set(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE ${WIVRN_FEATURE_STEAMVR_LIGHTHOUSE})
+set(XRT_BUILD_DRIVER_SURVIVE            ${WIVRN_FEATURE_SURVIVE})
 set(XRT_BUILD_DRIVER_SOLARXR            ${WIVRN_FEATURE_SOLARXR})
 set(XRT_BUILD_DRIVER_TWRAP              OFF)
 set(XRT_BUILD_DRIVER_UVC                OFF)
@@ -93,6 +94,10 @@ set(XRT_OXR_RUNTIME_SUFFIX        "wivrn"          CACHE STRING "OpenXR client l
 
 FetchContent_MakeAvailable(monado)
 
+if(WIVRN_FEATURE_SURVIVE AND NOT TARGET drv_survive)
+	message(FATAL_ERROR "WIVRN_FEATURE_SURVIVE requires system libsurvive (pkg-config package 'survive')")
+endif()
+
 if (WIVRN_BUILD_SERVER)
 	add_executable(wivrn-server
 			accept_connection.cpp
@@ -156,6 +161,11 @@ if (WIVRN_BUILD_SERVER)
 	if (WIVRN_FEATURE_STEAMVR_LIGHTHOUSE)
 		target_include_directories(wivrn-server SYSTEM PRIVATE ${monado_SOURCE_DIR}/src/xrt/drivers/steamvr_lh/)
 		target_link_libraries(wivrn-server PRIVATE drv_steamvr_lh)
+	endif()
+
+	if (WIVRN_FEATURE_SURVIVE)
+		target_include_directories(wivrn-server SYSTEM PRIVATE ${monado_SOURCE_DIR}/src/xrt/drivers/survive/)
+		target_link_libraries(wivrn-server PRIVATE drv_survive)
 	endif()
 
 	if (WIVRN_FEATURE_SOLARXR)
