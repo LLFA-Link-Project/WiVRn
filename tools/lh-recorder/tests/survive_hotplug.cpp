@@ -47,6 +47,11 @@ extern "C"
 			std::fprintf(stderr, "FAIL: request IMU poses to match IMU velocities\n");
 			std::abort();
 		}
+		if (!survive_recording_enabled())
+			for (int i = 1; i < argc; ++i)
+				if (!std::strcmp(argv[i], "--process-weight-ang-vel") ||
+				    !std::strcmp(argv[i], "--process-weight-gyro-bias"))
+					std::abort();
 		if (survive_recording_enabled())
 		{
 			bool native = false, timing = false, state = false;

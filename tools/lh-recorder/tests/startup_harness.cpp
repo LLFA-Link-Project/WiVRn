@@ -10,7 +10,9 @@ unsigned synthetic_capture_instances();
 #include "survive_recording.h"
 extern "C" void survive_simple_close(SurviveSimpleContext *);
 #endif
+#include <cstdlib>
 #include <stdexcept>
+#include <zlib.h>
 
 // Verify the steady_clock domain used by Monado's private chrono_timestamp_ns().
 #include <chrono>
@@ -34,7 +36,7 @@ int main(int argc, char ** argv)
 	                                                                                                                                                          : make_synthetic_capture);
 	wivrn::start_lighthouse_recording(snapshot);
 #if WIVRN_FEATURE_SURVIVE
-	if (argc == 3 && std::string_view(argv[2]) == "survive-empty")
+	if (argc == 3 && (std::string_view(argv[2]) == "survive-empty" || std::string_view(argv[2]) == "survive-corrupt"))
 	{
 		char name[] = "empty-replay", playback[] = "--playback", file[] = "/dev/null", gss[] = "--globalscenesolver", yes[] = "1";
 		char * args[] = {name, playback, file, gss, yes};
@@ -42,6 +44,16 @@ int main(int argc, char ** argv)
 		if (!ctx)
 			throw std::runtime_error("native replay init failed");
 		survive_simple_close(ctx);
+		if (std::string_view(argv[2]) == "survive-corrupt")
+		{
+			auto path = std::string(std::getenv("LH_RECORDER_OUTPUT")) + "/native.rec.gz";
+			auto file = gzopen(path.c_str(), "ab");
+			if (!file)
+				throw std::runtime_error("cannot append native fixture");
+			const char records[] = "0 WM1 POSE 0\0 0\n0 WM1 POSE 0\n";
+			gzwrite(file, records, sizeof(records) - 1);
+			gzclose(file);
+		}
 		wivrn::stop_lighthouse_recording(0);
 		if (synthetic_capture_instances() != 0)
 			throw std::runtime_error("survive opened USB observer");

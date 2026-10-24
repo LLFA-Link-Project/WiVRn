@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "lighthouse_recording.h"
+#include "lighthouse_native_validation.h"
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE || WIVRN_FEATURE_SURVIVE
 #include <nlohmann/json.hpp>
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
@@ -169,9 +170,15 @@ public:
 	{
 		line.clear();
 		std::array<char, 4096> buffer;
-		while (gzgets(file, buffer.data(), buffer.size()))
+		for (;;)
 		{
-			line += buffer.data();
+			auto before = gztell(file);
+			if (!gzgets(file, buffer.data(), buffer.size()))
+				break;
+			auto after = gztell(file);
+			if (before < 0 || after < before || after - before >= z_off_t(buffer.size()))
+				throw std::runtime_error("Invalid gzip read position");
+			line.append(buffer.data(), size_t(after - before));
 			if (line.size() > 1024 * 1024)
 				throw std::runtime_error("Oversized event record");
 			if (!line.empty() && line.back() == '\n')
@@ -274,11 +281,22 @@ public:
 			if (status.is_object() && status.value("dropped", uint64_t(0)))
 				errors.push_back("libsurvive pose records dropped");
 			json tags = json::object(), devices = json::object(), options = json::object();
+			json integrity = {{"scope", "NUL/header/CONFIG/fixed numeric records; unknown diagnostic bodies not validated"}, {"lines", 0}, {"malformed_lines", 0}, {"examples", json::array()}};
+			uint64_t native_lines = 0, bad_lines = 0;
 			try
 			{
 				gzip_input native(directory / "native.rec.gz");
 				for (std::string line; native.getline(line);)
 				{
+					++native_lines;
+					auto problem = lighthouse::native_line_error(line);
+					if (!problem.empty())
+					{
+						++bad_lines;
+						if (integrity["examples"].size() < 8)
+							integrity["examples"].push_back({{"line", native_lines}, {"reason", problem}});
+						continue;
+					}
 					std::istringstream in(line);
 					double elapsed;
 					std::string device, tag;
@@ -312,6 +330,11 @@ public:
 				errors.push_back(e.what());
 				manifest["native_recorder"]["gzip_crc_and_read"] = "failed";
 			}
+			integrity["lines"] = native_lines;
+			integrity["malformed_lines"] = bad_lines;
+			manifest["native_record_integrity"] = integrity;
+			if (bad_lines)
+				errors.push_back("Malformed native records: " + std::to_string(bad_lines));
 			manifest["native_tag_counts"] = tags;
 			for (const char * required: {"i", "I", "B", "POSE", "POSE_TIMING", "POSE_STATE", "POSE_BIAS"})
 				if (!tags.value(required, uint64_t(0)))
@@ -320,6 +343,26 @@ public:
 			save(directory / "native-options.json", options);
 			auto settings = read_json(directory / "survive-settings.json");
 			manifest["survive_settings"] = settings;
+			if (settings.is_object() && settings.value("expected_trial_options", json(nullptr)).is_object())
+			{
+				json actual = json::object();
+				for (const auto & [key, value]: settings["expected_trial_options"].items())
+				{
+					double effective = NAN;
+					try
+					{
+						effective = std::stod(options.at(key).at("value").get<std::string>());
+					}
+					catch (...)
+					{}
+					actual[key] = std::isfinite(effective) ? json(effective) : json(nullptr);
+					if (!std::isfinite(effective) || effective != value.get<double>())
+						errors.push_back("Trial option mismatch: " + key);
+				}
+				manifest["trial_effective_options"] = actual;
+				if (manifest["configuration"]["lh-max-extrapolation"] != 0)
+					errors.push_back("Angular noise trial requires prediction clamp 0 ms");
+			}
 			if (!settings.is_object())
 				errors.push_back("libsurvive settings snapshot missing");
 			if (settings.is_object() && settings.contains("configfile"))

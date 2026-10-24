@@ -33,7 +33,8 @@ def fixture(path):
         for p in poses: f.write(json.dumps(p)+'\n')
     with gzip.open(path/'native.rec.gz', 'wt') as f:
         for tag in ('CONFIG', 'i', 'I', 'B', 'POSE', 'POSE_TIMING', 'POSE_STATE', 'POSE_BIAS'):
-            f.write(f'0.01 WM5 {tag} synthetic\n')
+            payload = '{}' if tag == 'CONFIG' else ' '.join(['0']*r.NATIVE_NUMERIC_FIELDS[tag])
+            f.write(f'0.01 WM5 {tag} {payload}\n')
     r.dump(path/'pose_status.json', dict(stopped=True, context_initialized=True, written=3, enqueued=3, attempted=3, dropped=0, error=''))
     return manifest, poses
 
@@ -77,6 +78,17 @@ class ValidationTests(unittest.TestCase):
             self.assertFalse(result['valid'])
             self.assertTrue(any(x.startswith('native_read_error') for x in result['issues']))
 
+    def test_native_corruption_with_valid_crc(self):
+        for record, reason in (('0 WM1 POSE 0\0 0\n', 'nul_byte'),
+                               ('0 WM1 POSE 0\n', 'wrong_numeric_field_count'),
+                               ('0 WM1 CONFIG {bad}\n', 'invalid_config_json')):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as d:
+                path=Path(d); fixture(path)
+                with gzip.open(path/'native.rec.gz', 'at') as f: f.write(record)
+                result=r.validate(path,write=False)
+                self.assertIn('native_malformed_records',result['issues'])
+                self.assertEqual(result['native_record_integrity']['examples'][0]['reason'],reason)
+
     def test_native_archive_roundtrip_preserves_source_and_tags(self):
         with tempfile.TemporaryDirectory() as d:
             base=Path(d); path=base/'session'; path.mkdir()
@@ -103,11 +115,13 @@ class ValidationTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('LH_SURVIVE_HARNESS'), 'requires built Monado adapter harness')
 class AdapterTests(unittest.TestCase):
-    def run_harness(self, path, clamp='0', bias=None):
+    def run_harness(self, path, clamp='0', bias=None, angular=None):
         env = dict(os.environ, WIVRN_TEST_SURVIVE_RECORDER=str(path), LH_MAX_EXTRAPOLATION_MS=clamp,
                    SURVIVE_CONFIGFILE=str(path/'config.json'))
         env.pop('WIVRN_SURVIVE_BIAS_COMPARISON', None)
+        env.pop('WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON', None)
         if bias: env['WIVRN_SURVIVE_BIAS_COMPARISON'] = bias
+        if angular: env['WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON'] = angular
         return subprocess.run([os.environ['LH_SURVIVE_HARNESS'], str(1 if clamp == '-1' else float(clamp)/1000)],
                               env=env, capture_output=True, text=True, timeout=30)
 
@@ -165,6 +179,27 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(args[args.index('--kalman-minimize-state-space')+1], '0')
                 self.assertEqual(args[args.index('--process-weight-gyro-bias')+1], '0' if bias == 'A' else '1e-8')
 
+    def test_angular_trials_preserve_fixed_snapshot(self):
+        for mode, weight in (('A', 60), ('B', .6)):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+                path=Path(d); (path/'config.json').write_text('immutable baseline fixture')
+                result=self.run_harness(path,angular=mode)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                settings=r.read(path/'survive-settings.json'); args=settings['arguments']
+                self.assertEqual(settings['angular_noise_comparison'],mode)
+                self.assertEqual(settings['configfile'],str(path/'config.json'))
+                self.assertEqual((path/'calibration.initial.json').read_text(),'immutable baseline fixture')
+                expected={'kalman-minimize-state-space':0,'process-weight-gyro-bias':1e-8,
+                          'process-weight-acc-bias':1e-8,'process-weight-ang-vel':weight}
+                self.assertEqual(settings['expected_trial_options'],expected)
+                for key,value in expected.items(): self.assertEqual(float(args[args.index('--'+key)+1]),value)
+
+    def test_trial_environment_ignored_without_recording(self):
+        env=dict(os.environ,WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON='B',LH_MAX_EXTRAPOLATION_MS='50')
+        env.pop('WIVRN_TEST_SURVIVE_RECORDER',None)
+        result=subprocess.run([os.environ['LH_SURVIVE_HARNESS'],'0.05'],env=env,capture_output=True,text=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
     def test_queue_overflow_is_bounded_accounted_and_drained(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)
@@ -209,6 +244,34 @@ class NativeLifecycleTests(unittest.TestCase):
             self.assertAlmostEqual(float(re.search(r'"floor-offset":"([^"]+)"',final).group(1)),.375)
             self.assertNotEqual(final,'"floor-offset":"0.375"\n')
             self.assertFalse((path/'config.json').exists())
+
+    def test_native_seal_preserves_and_detects_nul(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)
+            r.dump(path/'config.json',{'use-survive':True,'lighthouse-recording':{'enabled':True,'output-directory':str(path/'sessions')}})
+            env=dict(os.environ,SURVIVE_CONFIGFILE=str(path/'calibration.json'))
+            result=subprocess.run([os.environ['LH_STARTUP_HARNESS'],str(path/'config.json'),'survive-corrupt'],env=env,capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            session=next((path/'sessions').iterdir()); manifest=r.read(session/'manifest.json')
+            self.assertEqual(manifest['native_recorder']['gzip_crc_and_read'],'passed')
+            integrity=manifest['native_record_integrity']
+            self.assertEqual(integrity['malformed_lines'],2,integrity)
+            self.assertEqual([x['reason'] for x in integrity['examples']],['nul_byte','wrong_numeric_field_count'])
+            self.assertEqual(r.native_integrity(session)['malformed_lines'],2)
+
+    def test_real_native_trial_effective_values(self):
+        for mode in ('A','B'):
+            with tempfile.TemporaryDirectory() as d:
+                path=Path(d)
+                r.dump(path/'config.json',{'use-survive':True,'lh-max-extrapolation':0,'lighthouse-recording':{'enabled':True,'output-directory':str(path/'sessions')}})
+                env=dict(os.environ,SURVIVE_CONFIGFILE=str(path/'calibration.json'),WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON=mode)
+                env.pop('WIVRN_SURVIVE_BIAS_COMPARISON',None)
+                result=subprocess.run([os.environ['LH_STARTUP_HARNESS'],str(path/'config.json'),'survive-empty'],env=env,capture_output=True,text=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                session=next((path/'sessions').iterdir()); manifest=r.read(session/'manifest.json')
+                expected=manifest['survive_settings']['expected_trial_options']
+                self.assertEqual(manifest['trial_effective_options'],expected,manifest['errors'])
+                self.assertFalse(any('Trial option mismatch' in e for e in manifest['errors']))
 
     def test_real_native_no_usb_and_missing_data_not_success(self):
         with tempfile.TemporaryDirectory() as d:

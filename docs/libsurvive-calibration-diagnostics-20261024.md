@@ -1,5 +1,7 @@
 # 較正診断の更新と固定初期値による比較 (2026-10-24)
 
+後続の手持ち A/B では、[20:37 の新しい固定較正と更新版バイナリ](libsurvive-handheld-jitter-ab-20261024.md)を使う。以下はそれ以前の較正診断の記録。
+
 `~/libsurvive/docs/libsurvive-calibration-diagnostics-handoff-20261024.md` の返答を反映。
 依存コピーは `llfa-main` の `2f2e69fb3330736fad2785d8645fa5a22ea61cf2` に更新。
 診断修正 `4def8c2` を含む。元の `~/libsurvive` は変更しない。

@@ -27,3 +27,6 @@ gzipの内容を展開してからtar.xzに最高圧縮で格納します。
 libsurvive も同じ Dashboard 設定で記録できます。セッション名の `_libsurvive_`、
 manifest の `source: libsurvive`、各 pose 行の `source` / `stream` / `stage` で識別します。
 usbmon の権限は不要です。詳しくは [libsurvive の記録・比較手順](../../docs/libsurvive-recording.md)。
+
+手持ちジッターの角速度プロセス雑音 A/B と native 記録の部分文法検査は
+[比較手順](../../docs/libsurvive-handheld-jitter-ab-20261024.md)を参照。

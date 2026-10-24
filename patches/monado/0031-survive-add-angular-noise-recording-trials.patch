@@ -1,0 +1,84 @@
+From 665a2710241ae83b26f4c24469eb0917a061321f Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sat, 24 Oct 2026 21:51:23 +0900
+Subject: [PATCH] survive: add opt-in angular process noise recording trials
+
+---
+ src/xrt/drivers/survive/survive_recording.cpp | 40 ++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/survive/survive_recording.cpp b/src/xrt/drivers/survive/survive_recording.cpp
+index 28fe29b89..71b107602 100644
+--- a/src/xrt/drivers/survive/survive_recording.cpp
++++ b/src/xrt/drivers/survive/survive_recording.cpp
+@@ -7,6 +7,7 @@
+ #include <condition_variable>
+ #include <cmath>
+ #include <cctype>
++#include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
+@@ -278,6 +279,31 @@ survive_recording_init_context(int argc, char **argv)
+ 			args.emplace_back(argv[i]);
+ 		const char *config = std::getenv("SURVIVE_CONFIGFILE");
+ 		const char *comparison = std::getenv("WIVRN_SURVIVE_BIAS_COMPARISON");
++		const char *angular = std::getenv("WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON");
++		const bool angular_trial = angular && *angular;
++		if (angular_trial) {
++			if (std::strcmp(angular, "A") && std::strcmp(angular, "B"))
++				throw std::runtime_error("angular comparison must be A or B");
++			if (comparison && *comparison)
++				throw std::runtime_error("do not combine bias and angular comparisons");
++			// libsurvive's SURVIVE_* environment overrides its argv. Reject a
++			// conflicting environment instead of silently running another condition.
++			const char *keys[] = {"SURVIVE_KALMAN-MINIMIZE-STATE-SPACE", "SURVIVE_PROCESS-WEIGHT-GYRO-BIAS",
++			                      "SURVIVE_PROCESS-WEIGHT-ACC-BIAS", "SURVIVE_PROCESS-WEIGHT-ANG-VEL"};
++			const double expected[] = {0, 1e-8, 1e-8, std::strcmp(angular, "A") == 0 ? 60. : .6};
++			for (int i = 0; i < 4; ++i)
++				if (const char *value = std::getenv(keys[i])) {
++					char *end = nullptr;
++					double actual = std::strtod(value, &end);
++					if (end == value || *end || actual != expected[i])
++						throw std::runtime_error(
++						    std::string("conflicting trial environment: ") + keys[i]);
++				}
++			args.insert(args.end(),
++			            {"--kalman-minimize-state-space", "0", "--process-weight-gyro-bias", "1e-8",
++			             "--process-weight-acc-bias", "1e-8", "--process-weight-ang-vel",
++			             std::strcmp(angular, "A") == 0 ? "60" : "0.6"});
++		}
+ 		std::string config_argument = config && *config ? config : "config.json";
+ 		if (comparison && *comparison) {
+ 			if (std::strcmp(comparison, "A") && std::strcmp(comparison, "B"))
+@@ -295,7 +321,15 @@ survive_recording_init_context(int argc, char **argv)
+ 		                 {"configfile", config_path},
+ 		                 {"configfile_argument", config_argument},
+ 		                 {"bias_comparison", comparison ? json(comparison) : json(nullptr)},
+-		                 {"estimator_settings_changed", comparison && *comparison ? true : false}};
++		                 {"angular_noise_comparison", angular_trial ? json(angular) : json(nullptr)},
++		                 {"expected_trial_options",
++		                  angular_trial
++		                      ? json{{"kalman-minimize-state-space", 0},
++		                             {"process-weight-gyro-bias", 1e-8},
++		                             {"process-weight-acc-bias", 1e-8},
++		                             {"process-weight-ang-vel", std::strcmp(angular, "A") == 0 ? 60. : .6}}
++		                      : json(nullptr)},
++		                 {"estimator_settings_changed", (comparison && *comparison) || angular_trial}};
+ 		args.insert(args.end(),
+ 		            {"--configfile", config_argument, "--record", r->directory + "/native.rec.gz",
+ 		             "--record-imu", "1", "--record-cal-imu", "1", "--record-rawlight", "1", "--record-angle",
+@@ -328,7 +362,9 @@ survive_recording_init_context(int argc, char **argv)
+ 		} catch (...) { /* Finalization marks missing load evidence as incomplete. */
+ 		}
+ 		return ctx;
+-	} catch (...) {
++	} catch (const std::exception &e) {
++		std::ofstream(r->directory + "/initialization-error.txt") << e.what() << '\n';
++		std::fprintf(stderr, "libsurvive diagnostic initialization: %s\n", e.what());
+ 		return nullptr;
+ 	}
+ }
+-- 
+2.56.0
+

@@ -215,16 +215,61 @@ def pcap_records(path):
             index += 1
 
 
-def native_tags(session):
-    """Read to EOF to verify gzip CRC. Native timestamps remain in their own domains."""
-    counts = {}
+NATIVE_NUMERIC_FIELDS = dict(i=12, I=12, B=5, W=4, Y=4, C=3, A=6, POSE=7,
+    VELOCITY=6, POSE_TIMING=4, POSE_STATE=12, POSE_BIAS=15, POSE_BIAS_VAR=7,
+    LH_POSE=8, INPUT_TIME=2, IMU_SCALES=2, BUTTON=2, DISCONNECT=0)
+
+
+def native_line_error(line):
+    # Partial grammar, matching the server seal check. Unknown diagnostic bodies
+    # are not validated; this is not a replacement for the playback parser.
+    if '\0' in line: return 'nul_byte'
+    line = line.rstrip().removesuffix(r'\r\n')
+    fields = line.split()
+    if len(fields) < 3: return 'invalid_header'
+    def numeric(value):
+        try: float(value); return True
+        except ValueError: return False
+    if not numeric(fields[0]) or not math.isfinite(float(fields[0])): return 'invalid_receive_time'
+    if fields[1] == 'INFO': return None
+    if fields[1] == 'OPTION':
+        if len(fields) < 4: return 'invalid_option'
+        if fields[3] != 's' and (len(fields) != 5 or not numeric(fields[4])): return 'invalid_option_value'
+        return None
+    if fields[2] == 'CONFIG':
+        try:
+            if not isinstance(json.loads(line.split(' CONFIG ', 1)[1]), dict): return 'invalid_config_json'
+        except (ValueError, IndexError): return 'invalid_config_json'
+        return None
+    size = NATIVE_NUMERIC_FIELDS.get(fields[2])
+    if size is not None:
+        if len(fields) != 3 + size: return 'wrong_numeric_field_count'
+        if not all(numeric(v) for v in fields[3:]): return 'invalid_numeric_field'
+    return None
+
+
+def native_integrity(session):
+    """Read through EOF/CRC; detect corruption even in otherwise valid gzip."""
+    counts, options, examples, total, bad = {}, {}, [], 0, 0
     with gzip.open(session/'native.rec.gz', 'rt', encoding='utf-8') as f:
         for line in f:
+            total += 1
+            error = native_line_error(line)
+            if error:
+                bad += 1
+                if len(examples) < 8: examples.append(dict(line=total, reason=error))
+                continue
             fields = line.split()
-            if len(fields) >= 3:
-                tag = 'OPTION' if fields[1] == 'OPTION' else fields[2]
-                counts[tag] = counts.get(tag, 0) + 1
-    return counts
+            tag = 'OPTION' if fields[1] == 'OPTION' else fields[2]
+            counts[tag] = counts.get(tag, 0) + 1
+            if tag == 'OPTION': options[fields[2]] = ' '.join(fields[4:])
+    return dict(lines=total, malformed_lines=bad, examples=examples,
+                scope='NUL/header/CONFIG/fixed numeric records; unknown diagnostic bodies not validated',
+                tag_counts=counts, options=options)
+
+
+def native_tags(session):
+    return native_integrity(session)['tag_counts']
 
 
 def validate_survive(session, write=True):
@@ -268,8 +313,18 @@ def validate_survive(session, write=True):
         if not stages.get(required): issues.add('missing_stage: '+required)
     if not stages.get('app_output'):
         warnings.add('no_application_pose_requests_recorded')
+    integrity = {}
     try:
-        tags = native_tags(session)
+        integrity = native_integrity(session)
+        tags = integrity['tag_counts']
+        if integrity['malformed_lines']: issues.add('native_malformed_records')
+        settings = manifest.get('survive_settings') or {}
+        for key, expected in (settings.get('expected_trial_options') or {}).items():
+            try: effective = float(integrity['options'][key])
+            except (ValueError, KeyError): effective = math.nan
+            if effective != expected: issues.add('trial_option_mismatch: '+key)
+        if settings.get('angular_noise_comparison') and manifest.get('configuration', {}).get('lh-max-extrapolation') != 0:
+            issues.add('trial_requires_zero_clamp')
         for required in ('CONFIG', 'i', 'I', 'B', 'POSE', 'POSE_TIMING', 'POSE_STATE', 'POSE_BIAS'):
             if not tags.get(required): issues.add('missing_native_tag: '+required)
     except (OSError, EOFError, UnicodeError) as e:
@@ -294,8 +349,8 @@ def validate_survive(session, write=True):
         issues.add('missing_libsurvive_revision')
     warnings.add('native_recorder_synchronous_overhead_and_input_loss_unmeasured')
     result = dict(schema_version=2, source='libsurvive', valid=not issues, issues=sorted(issues), warnings=sorted(warnings),
-                  full_content_validation=True, validation_scope='stage values, native gzip/tag presence, clock brackets, queue accounting and session hashes; no sensor-to-render latency inference',
-                  pose_count=count, stage_counts=stages, device_ids=sorted(ids), native_tag_counts=tags,
+                  full_content_validation=True, validation_scope='stage values, native gzip/partial record grammar/tag presence, clock brackets, queue accounting and session hashes; no sensor-to-render latency inference',
+                  pose_count=count, stage_counts=stages, device_ids=sorted(ids), native_tag_counts=tags, native_record_integrity=integrity,
                   native_drop_count=None, clock_sync=mapping.report(), hardware_tracking_quality_test='not_run')
     if write: dump(session/'validation.json', result)
     return result
