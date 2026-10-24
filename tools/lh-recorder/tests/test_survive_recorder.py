@@ -4,6 +4,7 @@ import gzip
 import importlib.machinery
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -132,6 +133,27 @@ class AdapterTests(unittest.TestCase):
                 self.assertFalse(settings['estimator_settings_changed'])
                 self.assertNotIn('--process-weight-gyro-bias', settings['arguments'])
 
+    def test_config_names_follow_libsurvive_directory_not_cwd(self):
+        for setting, xdg_enabled in ((None, True), (None, False), ('custom.json', True), ('./relative.json', True)):
+            with self.subTest(setting=setting, xdg=xdg_enabled), tempfile.TemporaryDirectory() as d:
+                path=Path(d); output=path/'recording';output.mkdir()
+                env=dict(os.environ,WIVRN_TEST_SURVIVE_RECORDER=str(output),LH_MAX_EXTRAPOLATION_MS='0', HOME=str(path/'home'))
+                env.pop('WIVRN_SURVIVE_BIAS_COMPARISON',None);env.pop('SURVIVE_CONFIGFILE',None)
+                env.pop('XDG_CONFIG_HOME',None)
+                if xdg_enabled:env['XDG_CONFIG_HOME']=str(path/'xdg')
+                if setting is not None:env['SURVIVE_CONFIGFILE']=setting
+                argument=setting or 'config.json'
+                if argument.startswith('./'):expected=path/'relative.json'
+                else:expected=(path/'xdg'/'libsurvive' if xdg_enabled else path/'home'/'.config'/'libsurvive')/argument
+                expected.parent.mkdir(parents=True,exist_ok=True);expected.write_text('saved-calibration-fixture')
+                result=subprocess.run([os.environ['LH_SURVIVE_HARNESS'],'0'],env=env,cwd=path,capture_output=True,text=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                settings=r.read(output/'survive-settings.json');args=settings['arguments']
+                self.assertEqual(settings['configfile'],str(expected))
+                self.assertEqual(args[args.index('--configfile')+1],argument)
+                self.assertEqual((output/'calibration.initial.json').read_text(),'saved-calibration-fixture')
+                if not argument.startswith('./'):self.assertFalse((path/'config.json').exists())
+
     def test_ab_explicit_and_fresh_config(self):
         for bias in ('A', 'B'):
             with self.subTest(bias=bias), tempfile.TemporaryDirectory() as d:
@@ -170,6 +192,24 @@ class AdapterTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('LH_STARTUP_HARNESS'), 'requires built startup harness')
 class NativeLifecycleTests(unittest.TestCase):
+    def test_native_default_reads_existing_xdg_calibration(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d);calibration=path/'xdg'/'libsurvive'/'config.json'
+            calibration.parent.mkdir(parents=True);calibration.write_text('"floor-offset":"0.375"\n')
+            r.dump(path/'owner.json',{'use-survive':True,'lighthouse-recording':{'enabled':True,'output-directory':str(path/'sessions')}})
+            env=dict(os.environ,XDG_CONFIG_HOME=str(path/'xdg'))
+            env.pop('SURVIVE_CONFIGFILE',None);env.pop('WIVRN_SURVIVE_BIAS_COMPARISON',None)
+            result=subprocess.run([os.environ['LH_STARTUP_HARNESS'],str(path/'owner.json'),'survive-empty'],env=env,cwd=path,capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            session=next((path/'sessions').iterdir());settings=r.read(session/'survive-settings.json')
+            self.assertEqual(settings['configfile'],str(calibration))
+            self.assertEqual(settings['configfile_argument'],'config.json')
+            self.assertEqual((session/'calibration.initial.json').read_text(),'"floor-offset":"0.375"\n')
+            final=(session/'calibration.final.json').read_text()
+            self.assertAlmostEqual(float(re.search(r'"floor-offset":"([^"]+)"',final).group(1)),.375)
+            self.assertNotEqual(final,'"floor-offset":"0.375"\n')
+            self.assertFalse((path/'config.json').exists())
+
     def test_real_native_no_usb_and_missing_data_not_success(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)

@@ -1,0 +1,87 @@
+From 3a6805dcb8ab02913b8bce3ab29161754d11fdf7 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sat, 24 Oct 2026 19:46:46 +0900
+Subject: [PATCH] survive: preserve native configuration lookup during
+ recording
+
+---
+ src/xrt/drivers/survive/survive_recording.cpp | 34 +++++++++++++++----
+ 1 file changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/src/xrt/drivers/survive/survive_recording.cpp b/src/xrt/drivers/survive/survive_recording.cpp
+index 57b8a7e9f..28fe29b89 100644
+--- a/src/xrt/drivers/survive/survive_recording.cpp
++++ b/src/xrt/drivers/survive/survive_recording.cpp
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <condition_variable>
+ #include <cmath>
++#include <cctype>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
+@@ -245,6 +246,26 @@ survive_recording_submit(const survive_recording_sample *sample)
+ 	++r->enqueued;
+ 	r->wake.notify_one();
+ }
++namespace {
++// Match libsurvive's standard survive_config_file_path convention for snapshots.
++// Crucially, pass the original argument to libsurvive: bare names are relative to
++// its configuration directory, whereas ./names and absolute paths are literal.
++std::filesystem::path
++configuration_snapshot_path(const std::string &argument)
++{
++	if (!argument.empty() && std::isalpha(static_cast<unsigned char>(argument.front()))) {
++		std::string root;
++		if (const char *xdg = std::getenv("XDG_CONFIG_HOME"))
++			root = std::string(xdg) + "/libsurvive";
++		else if (const char *home = std::getenv("HOME"))
++			root = std::string(home) + "/.config/libsurvive";
++		else if (const char *local = std::getenv("LOCALAPPDATA"))
++			root = std::string(local) + "/libsurvive";
++		return std::filesystem::absolute(root + "/" + argument).lexically_normal();
++	}
++	return std::filesystem::absolute(argument).lexically_normal();
++}
++} // namespace
+ extern "C" SurviveSimpleContext *
+ survive_recording_init_context(int argc, char **argv)
+ {
+@@ -257,27 +278,28 @@ survive_recording_init_context(int argc, char **argv)
+ 			args.emplace_back(argv[i]);
+ 		const char *config = std::getenv("SURVIVE_CONFIGFILE");
+ 		const char *comparison = std::getenv("WIVRN_SURVIVE_BIAS_COMPARISON");
+-		std::string config_path = config && *config ? config : "config.json";
++		std::string config_argument = config && *config ? config : "config.json";
+ 		if (comparison && *comparison) {
+ 			if (std::strcmp(comparison, "A") && std::strcmp(comparison, "B"))
+ 				throw std::runtime_error("bias comparison must be A or B");
+-			config_path = r->directory + "/calibration.json";
++			config_argument = r->directory + "/calibration.json";
+ 			args.insert(args.end(),
+ 			            {"--kalman-minimize-state-space", "0", "--process-weight-gyro-bias",
+ 			             std::strcmp(comparison, "A") == 0 ? "0" : "1e-8", "--process-weight-acc-bias",
+ 			             std::strcmp(comparison, "A") == 0 ? "0" : "1e-8"});
+ 		}
+-		config_path = std::filesystem::absolute(config_path).string();
++		std::string config_path = configuration_snapshot_path(config_argument).string();
+ 		if (std::filesystem::is_regular_file(config_path))
+ 			std::filesystem::copy_file(config_path, r->directory + "/calibration.initial.json");
+ 		json settings = {{"source", "libsurvive"},
+ 		                 {"configfile", config_path},
++		                 {"configfile_argument", config_argument},
+ 		                 {"bias_comparison", comparison ? json(comparison) : json(nullptr)},
+ 		                 {"estimator_settings_changed", comparison && *comparison ? true : false}};
+ 		args.insert(args.end(),
+-		            {"--configfile", config_path, "--record", r->directory + "/native.rec.gz", "--record-imu",
+-		             "1", "--record-cal-imu", "1", "--record-rawlight", "1", "--record-angle", "1",
+-		             "--record-pose-timing", "1", "--record-tracking-state", "1", "--report-in-imu", "1"});
++		            {"--configfile", config_argument, "--record", r->directory + "/native.rec.gz",
++		             "--record-imu", "1", "--record-cal-imu", "1", "--record-rawlight", "1", "--record-angle",
++		             "1", "--record-pose-timing", "1", "--record-tracking-state", "1", "--report-in-imu", "1"});
+ 		settings["arguments"] = args;
+ 		std::ofstream(r->directory + "/survive-settings.json") << settings.dump(2) << '\n';
+ 		std::vector<char *> pointers;
+-- 
+2.56.0
+

@@ -46,7 +46,10 @@ INPUT_TIMEが対応POSEより後に記録される場合もあり、行順や異
 
 通常の記録をONにしてもfilterやZVU、静止判定閾値は変更しません。
 native recorderが設定ファイルを記録名から自動選択する副作用を避けるため、
-`SURVIVE_CONFIGFILE`（未指定なら通常の `config.json`）を明示して使用します。
+`SURVIVE_CONFIGFILE`（未指定なら `config.json`）を元の表記のまま明示します。
+libsurviveは裸のファイル名を `$XDG_CONFIG_HOME/libsurvive`、未設定なら
+`$HOME/.config/libsurvive` から読みます。`./名前` や絶対パスはそのまま使用します。
+記録時も同じ解釈を維持し、較正ファイルを作業ディレクトリの別ファイルへ切り替えません。
 追加の native recorder は同期式で、独立したdrop/書込エラーカウンターや
 closeの戻り値を公開していません。これらの指標はnull/取得不能と明記し、終了後に
 gzipのCRCと読み取り、タグの存在、ハッシュを検査します。完全な入力無損失は証明しません。
