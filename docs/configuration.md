@@ -254,6 +254,11 @@ These offsets follow the predicted orientation, and their linear velocities
 include the tangential velocity at that orientation. This uses the same order as
 steamvr_lh's raw-reference-first prediction.
 
+Emulated Index hands share steamvr_lh's canonical grip-to-palm placement.
+The adapter derives the wrist origin from the simulated hand's local palm
+joint, so finger curls do not shift the wrist relative to the controller.
+Finger joints still use Monado's hand simulation rather than Valve's skeleton.
+
 ## `lh-stick-deadzone`
 Default value: `0`
 

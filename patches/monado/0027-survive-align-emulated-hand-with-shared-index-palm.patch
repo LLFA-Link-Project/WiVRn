@@ -1,0 +1,97 @@
+From: OpenAI Codex <codex@openai.com>
+Subject: [PATCH] survive: place emulated Index wrists from the shared palm anchor
+
+The native driver used a separate hardcoded wrist offset. Share steamvr_lh's
+canonical grip-to-palm calibration and derive the simulated wrist from its
+local palm joint. This keeps the palm anchored as finger curls change, while
+retaining raw IMU prediction and composing all offsets afterwards.
+
+diff --git a/src/xrt/auxiliary/vive/vive_poses.h b/src/xrt/auxiliary/vive/vive_poses.h
+--- a/src/xrt/auxiliary/vive/vive_poses.h
++++ b/src/xrt/auxiliary/vive/vive_poses.h
+@@ -30,6 +30,10 @@
+                            struct xrt_pose *out_offset_pose);
+ 
+ 
++//! Index palm pose in grip space, shared by native and SteamVR Lighthouse.
++void
++vive_poses_get_index_palm_offset(enum xrt_hand hand, struct xrt_pose *out_pose);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/xrt/auxiliary/vive/vive_poses.c b/src/xrt/auxiliary/vive/vive_poses.c
+--- a/src/xrt/auxiliary/vive/vive_poses.c
++++ b/src/xrt/auxiliary/vive/vive_poses.c
+@@ -173,3 +173,16 @@
+ 	default: *out_offset_pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+ 	}
+ }
++
++// Same canonical Index grip-to-palm calibration used by steamvr_lh.
++// ValveSoftware/OpenXR-Canonical-Pose-Tool, commit 5e6f3f6db584d58483058ff3262e7eef02c3acfd,
++// dist/steamvr/cpt_SteamVR-valve_index_controller.xml.
++void
++vive_poses_get_index_palm_offset(enum xrt_hand hand, struct xrt_pose *out_pose)
++{
++	float side = hand == XRT_HAND_LEFT ? -1.0f : 1.0f;
++	*out_pose = (struct xrt_pose){
++	    .orientation = {.x = -0.46f, .y = side * 0.02f, .z = side * 0.01f, .w = 0.89f},
++	    .position = {.x = side * 0.015f, .y = 0.0f, .z = 0.001f},
++	};
++}
+diff --git a/src/xrt/drivers/steamvr_lh/device.cpp b/src/xrt/drivers/steamvr_lh/device.cpp
+--- a/src/xrt/drivers/steamvr_lh/device.cpp
++++ b/src/xrt/drivers/steamvr_lh/device.cpp
+@@ -507,18 +507,9 @@
+ xrt_pose
+ palm_offset_index(xrt_hand hand)
+ {
+-	// Taken from:
+-	// https://github.com/ValveSoftware/OpenXR-Canonical-Pose-Tool/blob/5e6f3f6db584d58483058ff3262e7eef02c3acfd/dist/steamvr/cpt_SteamVR-valve_index_controller.xml#L1
+-	switch (hand) {
+-	case XRT_HAND_LEFT:
+-		return xrt_pose{.orientation = xrt_quat{.x = -0.46, .y = -0.02, .z = -0.01, .w = 0.89},
+-		                .position = xrt_vec3{.x = -0.015, .y = 0.0, .z = 0.001}};
+-	case XRT_HAND_RIGHT:
+-		return xrt_pose{.orientation = xrt_quat{.x = -0.46, .y = 0.02, .z = 0.01, .w = 0.89},
+-		                .position = xrt_vec3{.x = 0.015, .y = 0.0, .z = 0.001}};
+-	}
+-
+-	return {};
++	xrt_pose offset;
++	vive_poses_get_index_palm_offset(hand, &offset);
++	return offset;
+ }
+ 
+ } // namespace
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -452,12 +452,21 @@
+ 	u_hand_sim_simulate_for_valve_index_knuckles(&values, hand, &hand_relation, out_value);
+ 
+ 
++	// Anchor the simulated palm to the same grip-relative pose as steamvr_lh.
++	// The simulation defines joints relative to its wrist: derive that wrist
++	// placement from its local palm instead of using an unrelated fixed offset.
++	struct xrt_pose grip_offset, palm_offset, wrist_in_palm;
++	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, XRT_INPUT_INDEX_GRIP_POSE,
++	                           &grip_offset);
++	vive_poses_get_index_palm_offset(hand, &palm_offset);
++	math_quat_normalize(&palm_offset.orientation);
++	math_pose_invert(&out_value->values.hand_joint_set_default[XRT_HAND_JOINT_PALM].relation.pose,
++	                 &wrist_in_palm);
++
+ 	struct xrt_relation_chain chain = {0};
+-
+-	struct xrt_pose pose_offset = XRT_POSE_IDENTITY;
+-	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, name, &pose_offset);
+-
+-	m_relation_chain_push_pose(&chain, &pose_offset);
++	m_relation_chain_push_pose(&chain, &wrist_in_palm);
++	m_relation_chain_push_pose(&chain, &palm_offset);
++	m_relation_chain_push_pose(&chain, &grip_offset);
+ 	m_relation_chain_push_pose(&chain, &survive->imu_from_head);
+ 	m_relation_chain_push_relation(&chain, &hand_relation);
+ 	m_relation_chain_resolve(&chain, &out_value->hand_pose);

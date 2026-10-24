@@ -2,6 +2,7 @@
 // Exercise the real Monado adapter with a synthetic libsurvive event source.
 #include "math/m_api.h"
 #include "math/m_relation_history.h"
+#include "math/m_space.h"
 #include "os/os_time.h"
 #include "survive_api.h"
 #include "survive_interface.h"
@@ -224,14 +225,25 @@ static int test_prediction_limit(double expected_seconds)
 		int64_t latest_ns;
 		xrt_space_relation raw{};
 		require(m_relation_history_get_latest(adapter->relation_hist, &latest_ns, &raw), "rotating raw sample available");
-		auto check = [&](xrt_input_name input, const xrt_space_relation &result) {
+		auto check = [&](xrt_input_name input, const xrt_space_relation &result, const xrt_pose * extra = nullptr) {
 			xrt_pose offset = XRT_POSE_IDENTITY;
 			vive_poses_get_pose_offset(device->name, device->device_type, input, &offset);
+			if (extra)
+				math_pose_transform(&offset, extra, &offset);
 			xrt_pose head{{0, 0, float(std::sin(0.3)), float(std::cos(0.3))}, {0.08f, -0.04f, 0.03f}};
 			math_pose_transform(&head, &offset, &offset);
 			xrt_vec3 r0{};
 			math_quat_rotate_vec3(&raw.pose.orientation, &offset.position, &r0);
 			const double angle = 20 * expected_seconds;
+			xrt_quat turn{0, float(std::sin(angle / 2)), 0, float(std::cos(angle / 2))};
+			xrt_quat predicted_raw{}, expected_orientation{};
+			math_quat_rotate(&turn, &raw.pose.orientation, &predicted_raw);
+			math_quat_rotate(&predicted_raw, &offset.orientation, &expected_orientation);
+			math_quat_normalize(&expected_orientation);
+			const auto & q = result.pose.orientation;
+			const double dot = q.x * expected_orientation.x + q.y * expected_orientation.y +
+			                   q.z * expected_orientation.z + q.w * expected_orientation.w;
+			require(std::abs(std::abs(dot) - 1) < 1e-5, "offset orientation follows the predicted raw reference");
 			const double rx = std::cos(angle) * r0.x + std::sin(angle) * r0.z;
 			const double rz = -std::sin(angle) * r0.x + std::cos(angle) * r0.z;
 			require(std::abs(result.pose.position.x - (raw.pose.position.x + expected_seconds + rx)) < 1e-5 &&
@@ -255,9 +267,40 @@ static int test_prediction_limit(double expected_seconds)
 			auto input = device->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ? XRT_INPUT_HT_CONFORMING_RIGHT : XRT_INPUT_HT_CONFORMING_LEFT;
 			xrt_hand_joint_set result{};
 			int64_t timestamp;
-			xrt_device_get_hand_tracking(device, input, requested_ns, &result, &timestamp);
-			require(result.is_active, "rotating hand active");
-			check(input, result.hand_pose);
+			const float side = device->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ? 1.f : -1.f;
+			xrt_pose canonical_palm{{-0.46f, side * 0.02f, side * 0.01f, 0.89f}, {side * 0.015f, 0, 0.001f}};
+			math_quat_normalize(&canonical_palm.orientation);
+			xrt_pose open_wrist{};
+			xrt_vec3 open_tip{};
+			for (float curl: {0.f, 0.5f, 1.f})
+			{
+				for (auto & finger: adapter->ctrl.curl)
+					finger = curl;
+				xrt_device_get_hand_tracking(device, input, requested_ns, &result, &timestamp);
+				require(result.is_active && timestamp == requested_ns, "rotating hand active at requested time");
+				const auto & joints = result.values.hand_joint_set_default;
+				xrt_relation_chain chain{};
+				m_relation_chain_push_pose(&chain, &joints[XRT_HAND_JOINT_PALM].relation.pose);
+				m_relation_chain_push_relation(&chain, &result.hand_pose);
+				xrt_space_relation world_palm{};
+				m_relation_chain_resolve(&chain, &world_palm);
+				check(XRT_INPUT_INDEX_GRIP_POSE, world_palm, &canonical_palm);
+				const auto & wrist = result.hand_pose.pose;
+				if (curl == 0)
+				{
+					open_wrist = wrist;
+					open_tip = joints[XRT_HAND_JOINT_MIDDLE_TIP].relation.pose.position;
+				}
+				else
+				{
+					require(std::abs(wrist.position.x - open_wrist.position.x) < 1e-5 &&
+					        std::abs(wrist.position.y - open_wrist.position.y) < 1e-5 &&
+					        std::abs(wrist.position.z - open_wrist.position.z) < 1e-5,
+					        "finger curls do not move the wrist anchor");
+					require(std::abs(joints[XRT_HAND_JOINT_MIDDLE_TIP].relation.pose.position.z - open_tip.z) > 0.001,
+					        "finger curls still animate local joints");
+				}
+			}
 		}
 		else
 		{
@@ -270,7 +313,7 @@ static int test_prediction_limit(double expected_seconds)
 	for (auto & device: system.static_xdevs)
 		xrt_device_destroy(&device);
 	survive_destroy(survive);
-	std::puts("libsurvive raw-reference-first prediction, offset velocity and shared limit: passed");
+	std::puts("libsurvive raw-reference-first prediction, shared palm anchor, stable wrists and prediction limit: passed");
 	return 0;
 }
 
