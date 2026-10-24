@@ -1,5 +1,7 @@
 # libsurvive の記録と微動比較
 
+較正の失敗を調べる場合は [固定初期値と新規較正の比較手順](libsurvive-calibration-diagnostics-20261024.md) を先に参照してください。
+
 ダッシュボードで libsurvive を選択し、「Lighthouse Recording」の記録を有効にします。
 ヘッドセットを再接続して内部Monadoを起動すると、指定した出力先の
 `日時_libsurvive_…` に保存します。通常の終了でnative記録を閉じ、非同期writerを
