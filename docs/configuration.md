@@ -215,6 +215,11 @@ installs them under `build-survive-check/_deps/libsurvive-llfa-main-install`.
 Run it again to fetch and fast-forward that independent checkout to the latest
 local `llfa-main`. It records the exact revision in
 `build-survive-check/_deps/libsurvive-llfa-main-revision.txt`.
+The helper applies the managed Global Scene Solver shutdown fix and records its
+checksum in `libsurvive-llfa-main-patches.txt`. It removes that patch before
+updating, refuses unrelated local modifications, and skips applying the fix if
+upstream already includes it. See [the libsurvive handoff](libsurvive-shutdown-handoff.md)
+for the patch, regression test and upstream integration instructions.
 Point WiVRn's `PKG_CONFIG_PATH` at that installation's `lib/pkgconfig` directory
 when configuring, then rebuild WiVRn. If changing an existing build to a different
 installation, clear its cached discovery paths during configuration:
@@ -225,7 +230,7 @@ cmake -S . -B build-survive-check \
     -DWIVRN_FEATURE_SURVIVE=ON -DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON \
     -U 'SURVIVE_*' -U 'LH_SURVIVE_*' \
     -U '__pkg_config_checked_*SURVIVE' -U 'pkgcfg_lib_*SURVIVE*'
-cmake --build build-survive-check --target wivrn-server wivrn-dashboard
+cmake --build build-survive-check --target wivrn-server wivrn-dashboard openxr_wivrn monado
 ```
 
 ## `lh-max-extrapolation`
