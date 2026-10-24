@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSL-1.0
 // Exercise the real Monado adapter with a synthetic libsurvive event source.
+#include "math/m_api.h"
 #include "math/m_relation_history.h"
 #include "os/os_time.h"
 #include "survive_api.h"
@@ -7,6 +8,7 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_system.h"
 #include "survive_internal.h"
+#include "vive/vive_poses.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -125,17 +127,19 @@ static void added(xrt_device * device, void * userdata)
 static int test_prediction_limit(double expected_seconds)
 {
 	SurviveSimpleObject left{R"({"model_number":"Knuckles Left","device_serial_number":"LHR-LEFT"})"};
+	SurviveSimpleObject right{R"({"model_number":"Knuckles Right","device_serial_number":"LHR-RIGHT"})"};
 	SurviveSimpleObject tracker{R"({"model_number":"VIVE Tracker 3.0 MV","device_serial_number":"LHR-TRACKER"})"};
 	config(left);
+	config(right);
 	config(tracker);
 	xrt_system_devices system{};
 	auto * survive = survive_create_devices(&system);
-	require(survive != nullptr && system.static_xdev_count == 2, "prediction fixtures created");
+	require(survive != nullptr && system.static_xdev_count == 3, "prediction fixtures created");
 	Publication publication{&system};
 	survive_start(survive, added, &publication);
 	double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 	for (int sample = 0; sample < 2; ++sample)
-		for (auto * object: {&left, &tracker})
+		for (auto * object: {&left, &right, &tracker})
 		{
 			SurviveSimpleEvent event{};
 			event.event_type = SurviveSimpleEventType_PoseUpdateEvent;
@@ -164,24 +168,90 @@ static int test_prediction_limit(double expected_seconds)
 		{
 			xrt_hand_joint_set base_hand{}, predicted_hand{};
 			int64_t timestamp;
-			xrt_device_get_hand_tracking(device, XRT_INPUT_HT_CONFORMING_LEFT, latest_ns, &base_hand, &timestamp);
-			xrt_device_get_hand_tracking(device, XRT_INPUT_HT_CONFORMING_LEFT, latest_ns + 1'000'000'000, &predicted_hand, &timestamp);
+			auto hand_input = device->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ? XRT_INPUT_HT_CONFORMING_RIGHT : XRT_INPUT_HT_CONFORMING_LEFT;
+			xrt_device_get_hand_tracking(device, hand_input, latest_ns, &base_hand, &timestamp);
+			xrt_device_get_hand_tracking(device, hand_input, latest_ns + 1'000'000'000, &predicted_hand, &timestamp);
 			require(base_hand.is_active && predicted_hand.is_active, "prediction hand fixtures active");
 			require(std::abs(predicted_hand.hand_pose.pose.position.x - base_hand.hand_pose.pose.position.x - expected_seconds) < 1e-5,
 			        "emulated hand prediction uses the same limit");
+		}
+	}
+	// Regression for steamvr_lh's raw-reference-first issue: a rotating offset
+	// must follow an arc, rather than extending its initial tangent linearly.
+	// Feed events through the real adapter, including its coordinate conversion.
+	for (auto * object: {&left, &right, &tracker})
+	{
+		SurviveSimpleEvent event{};
+		event.event_type = SurviveSimpleEventType_PoseUpdateEvent;
+		auto & p = event.d.__private_pose_event;
+		p.object = object;
+		p.time = now;
+		p.pose.Rot[0] = 1;
+		p.velocity.Pos[0] = 1;
+		p.velocity.AxisAngleRot[2] = 20; // Monado world +Y, 20 rad/s.
+		enqueue(event);
+	}
+	for (size_t i = 0; i < system.static_xdev_count; ++i)
+	{
+		auto * device = system.static_xdevs[i];
+		auto * adapter = reinterpret_cast<survive_device *>(device);
+		wait_for([&] { return m_relation_history_get_size(adapter->relation_hist) == 3; });
+		int64_t latest_ns;
+		xrt_space_relation raw{};
+		require(m_relation_history_get_latest(adapter->relation_hist, &latest_ns, &raw), "rotating raw sample available");
+		auto check = [&](xrt_input_name input, const xrt_space_relation &result) {
+			xrt_pose offset = XRT_POSE_IDENTITY;
+			vive_poses_get_pose_offset(device->name, device->device_type, input, &offset);
+			xrt_vec3 r0{};
+			math_quat_rotate_vec3(&raw.pose.orientation, &offset.position, &r0);
+			const double angle = 20 * expected_seconds;
+			const double rx = std::cos(angle) * r0.x + std::sin(angle) * r0.z;
+			const double rz = -std::sin(angle) * r0.x + std::cos(angle) * r0.z;
+			require(std::abs(result.pose.position.x - (raw.pose.position.x + expected_seconds + rx)) < 1e-5 &&
+			        std::abs(result.pose.position.y - (raw.pose.position.y + r0.y)) < 1e-5 &&
+			        std::abs(result.pose.position.z - (raw.pose.position.z + rz)) < 1e-5,
+			        "predict raw reference before composing rotating offset");
+			require(std::abs(result.linear_velocity.x - (1 + 20 * rz)) < 1e-4 &&
+			        std::abs(result.linear_velocity.y) < 1e-4 &&
+			        std::abs(result.linear_velocity.z + 20 * rx) < 1e-4,
+			        "offset velocity uses the predicted orientation");
+		};
+		const int64_t requested_ns = latest_ns + 1'000'000'000;
+		if (device->supported.hand_tracking)
+		{
+			for (auto input: {XRT_INPUT_INDEX_GRIP_POSE, XRT_INPUT_INDEX_AIM_POSE})
+			{
+				xrt_space_relation result{};
+				xrt_device_get_tracked_pose(device, input, requested_ns, &result);
+				check(input, result);
+			}
+			auto input = device->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ? XRT_INPUT_HT_CONFORMING_RIGHT : XRT_INPUT_HT_CONFORMING_LEFT;
+			xrt_hand_joint_set result{};
+			int64_t timestamp;
+			xrt_device_get_hand_tracking(device, input, requested_ns, &result, &timestamp);
+			require(result.is_active, "rotating hand active");
+			check(input, result.hand_pose);
+		}
+		else
+		{
+			xrt_space_relation result{};
+			xrt_device_get_tracked_pose(device, XRT_INPUT_GENERIC_TRACKER_POSE, requested_ns, &result);
+			check(XRT_INPUT_GENERIC_TRACKER_POSE, result);
 		}
 	}
 	survive_stop(survive);
 	for (auto & device: system.static_xdevs)
 		xrt_device_destroy(&device);
 	survive_destroy(survive);
-	std::puts("libsurvive controller, tracker and emulated hand prediction limit: passed");
+	std::puts("libsurvive raw-reference-first prediction, offset velocity and shared limit: passed");
 	return 0;
 }
 
 int main(int argc, char ** argv)
 
 {
+	if (argc == 2)
+		return test_prediction_limit(std::strtod(argv[1], nullptr));
 	xrt_system_devices system{};
 	auto * survive = survive_create_devices(&system);
 	require(survive != nullptr && system.static_xdev_count == 0, "empty startup keeps discovery alive");
@@ -250,4 +320,5 @@ int main(int argc, char ** argv)
 	survive_destroy(startup);
 	require(closed == 2, "unstarted system closes after device destruction");
 	std::puts("libsurvive empty startup, live publication, roles, inactivity, reconnect and shutdown: passed");
+	return test_prediction_limit(0.05);
 }
