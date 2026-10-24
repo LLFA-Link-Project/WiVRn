@@ -244,9 +244,13 @@ The libsurvive adapter applies the limit to controller/tracker poses and emulate
 hand poses. There is no separate fixed 50 ms cap. Its two-second inactivity
 handling for silent/disconnected devices is independent of prediction clamping.
 
-The libsurvive adapter stores the raw tracking reference in pose history and
-predicts it before applying grip, aim or emulated hand offsets. During rotation,
-these offsets follow the predicted orientation, and their linear velocities
+The libsurvive adapter requests raw IMU poses (`--report-in-imu 1`) so that
+positions and velocities refer to the same origin. It stores that reference in
+pose history and predicts it before applying the device-origin transform and
+grip, aim or emulated hand offsets. libsurvive's default output already applies
+the device-origin transform to poses, but reports velocities at the IMU origin;
+predicting those together would use mismatched origins during rotation.
+These offsets follow the predicted orientation, and their linear velocities
 include the tangential velocity at that orientation. This uses the same order as
 steamvr_lh's raw-reference-first prediction.
 

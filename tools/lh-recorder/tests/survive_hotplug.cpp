@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -24,6 +25,7 @@ struct SurviveSimpleObject
 {
 	const char * config;
 	SurviveSimpleObject_type type = SurviveSimpleObject_OBJECT;
+	SurvivePose head_in_imu = [] { SurvivePose p{}; p.Rot[0] = 1; return p; }();
 };
 static SurviveSimpleContext context;
 static std::mutex events_mutex;
@@ -32,9 +34,22 @@ static unsigned closed = 0;
 
 extern "C"
 {
-	SurviveSimpleContext * survive_simple_init(int, char * const *)
+	SurviveSimpleContext * survive_simple_init(int argc, char * const * argv)
 	{
+		bool imu_poses = false;
+		for (int i = 1; i + 1 < argc; ++i)
+			if (std::strcmp(argv[i], "--report-in-imu") == 0 && std::strcmp(argv[i + 1], "1") == 0)
+				imu_poses = true;
+		if (!imu_poses)
+		{
+			std::fprintf(stderr, "FAIL: request IMU poses to match IMU velocities\n");
+			std::abort();
+		}
 		return &context;
+	}
+	void survive_simple_object_get_transform_to_imu(const SurviveSimpleObject * object, SurvivePose * local)
+	{
+		*local = object->head_in_imu;
 	}
 	void survive_simple_start_thread(SurviveSimpleContext *) {}
 	void survive_simple_close(SurviveSimpleContext *)
@@ -129,6 +144,16 @@ static int test_prediction_limit(double expected_seconds)
 	SurviveSimpleObject left{R"({"model_number":"Knuckles Left","device_serial_number":"LHR-LEFT"})"};
 	SurviveSimpleObject right{R"({"model_number":"Knuckles Right","device_serial_number":"LHR-RIGHT"})"};
 	SurviveSimpleObject tracker{R"({"model_number":"VIVE Tracker 3.0 MV","device_serial_number":"LHR-TRACKER"})"};
+	// Model libsurvive's device-origin transform, which its default pose output
+	// applies even though the reported linear velocity remains at the IMU.
+	for (auto * object: {&left, &right, &tracker})
+	{
+		object->head_in_imu.Pos[0] = 0.08;
+		object->head_in_imu.Pos[1] = -0.04;
+		object->head_in_imu.Pos[2] = 0.03;
+		object->head_in_imu.Rot[0] = std::cos(0.3);
+		object->head_in_imu.Rot[3] = std::sin(0.3);
+	}
 	config(left);
 	config(right);
 	config(tracker);
@@ -202,6 +227,8 @@ static int test_prediction_limit(double expected_seconds)
 		auto check = [&](xrt_input_name input, const xrt_space_relation &result) {
 			xrt_pose offset = XRT_POSE_IDENTITY;
 			vive_poses_get_pose_offset(device->name, device->device_type, input, &offset);
+			xrt_pose head{{0, 0, float(std::sin(0.3)), float(std::cos(0.3))}, {0.08f, -0.04f, 0.03f}};
+			math_pose_transform(&head, &offset, &offset);
 			xrt_vec3 r0{};
 			math_quat_rotate_vec3(&raw.pose.orientation, &offset.position, &r0);
 			const double angle = 20 * expected_seconds;

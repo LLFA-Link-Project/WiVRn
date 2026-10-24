@@ -1,0 +1,100 @@
+From: OpenAI Codex <codex@openai.com>
+Subject: [PATCH] survive: predict a common IMU reference for pose and velocity
+
+libsurvive normally composes head2imu into output poses while its velocity
+remains at the IMU origin. The adapter incorrectly assumed these had the same
+reference. Request IMU poses, keep raw IMU relations in history, then compose
+the device origin and interaction profile offsets after bounded prediction.
+Keep local transform axes unchanged: only the world frame is converted.
+
+diff --git a/src/xrt/drivers/survive/survive_internal.h b/src/xrt/drivers/survive/survive_internal.h
+--- a/src/xrt/drivers/survive/survive_internal.h
++++ b/src/xrt/drivers/survive/survive_internal.h
+@@ -90,6 +90,8 @@
+ 	struct survive_system *sys;
+ 	const SurviveSimpleObject *survive_obj;
+ 
++	// Local device origin in IMU space; applied only after raw IMU prediction.
++	struct xrt_pose imu_from_head;
+ 	struct m_relation_history *relation_hist;
+ 	uint64_t last_event_ns;
+ 
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -213,6 +213,20 @@
+ 	}
+ }
+ 
++// libsurvive reports IMU velocities. Request IMU poses as well, retain that
++// reference in history, and compose the device origin only after prediction.
++static void
++survive_set_object(struct survive_device *survive, const SurviveSimpleObject *object)
++{
++	survive->survive_obj = object;
++	SurvivePose local;
++	survive_simple_object_get_transform_to_imu(object, &local);
++	survive->imu_from_head = (struct xrt_pose){
++	    .orientation = {local.Rot[1], local.Rot[2], local.Rot[3], local.Rot[0]},
++	    .position = {local.Pos[0], local.Pos[1], local.Pos[2]},
++	};
++}
++
+ static bool
+ verify_device_name(struct survive_device *survive, enum xrt_input_name name)
+ {
+@@ -253,7 +267,6 @@
+ 		return XRT_SUCCESS;
+ 	}
+ 
+-	// We're pretty sure libsurvive is giving us the IMU pose here, so this works.
+ 	struct xrt_pose pose_offset = XRT_POSE_IDENTITY;
+ 	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, name, &pose_offset);
+ 
+@@ -263,6 +276,7 @@
+ 
+ 	struct xrt_relation_chain relation_chain = {0};
+ 	m_relation_chain_push_pose(&relation_chain, &pose_offset);
++	m_relation_chain_push_pose(&relation_chain, &survive->imu_from_head);
+ 	m_relation_chain_push_relation(&relation_chain, &space_relation);
+ 	m_relation_chain_resolve(&relation_chain, out_relation);
+ 
+@@ -440,11 +454,11 @@
+ 
+ 	struct xrt_relation_chain chain = {0};
+ 
+-	// We're pretty sure libsurvive is giving us the IMU pose here, so this works.
+ 	struct xrt_pose pose_offset = XRT_POSE_IDENTITY;
+ 	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, name, &pose_offset);
+ 
+ 	m_relation_chain_push_pose(&chain, &pose_offset);
++	m_relation_chain_push_pose(&chain, &survive->imu_from_head);
+ 	m_relation_chain_push_relation(&chain, &hand_relation);
+ 	m_relation_chain_resolve(&chain, &out_value->hand_pose);
+ 
+@@ -944,7 +958,7 @@
+ 
+ 	sys->hmd = survive;
+ 	survive->sys = sys;
+-	survive->survive_obj = sso;
++	survive_set_object(survive, sso);
+ 	survive->device_type = DEVICE_TYPE_HMD;
+ 
+ 	survive->base.name = XRT_DEVICE_GENERIC_HMD;
+@@ -1149,7 +1163,7 @@
+ 
+ 	sys->controllers[idx] = survive;
+ 	survive->sys = sys;
+-	survive->survive_obj = sso;
++	survive_set_object(survive, sso);
+ 	survive->device_type = DEVICE_TYPE_CONTROLLER;
+ 
+ 	survive->base.tracking_origin = &sys->base;
+@@ -1429,6 +1443,7 @@
+ 	char *survive_args[] = {
+ 	    "Monado-libsurvive", "--lighthouse-gen", (char *)debug_get_option_survive_lh_gen(),
+ 		"--globalscenesolver", (char*)debug_get_option_survive_global_scene_solver(),
++	    "--report-in-imu", "1",
+ 	    //"--time-window", "1500000"
+ 	    //"--use-imu", "0",
+ 	    //"--use-kalman", "0"
