@@ -1,4 +1,7 @@
-# Lighthouse Reference Dataset Recorder v2.1
+# Lighthouse Reference Dataset Recorder v3.0
+
+libsurviveを選択した場合は [専用の記録schemaと微動比較手順](libsurvive-recording.md) を参照してください。
+以下のValve/usbmon形式と区別して保存・検証します。
 
 Valve Pose は Ground Truth ではなく **Reference Pose** です。本実装はデータ収集を担当します。
 Dashboard の設定項目は「Enable recording」と「Output directory」の2つだけです。

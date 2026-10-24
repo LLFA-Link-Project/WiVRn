@@ -23,3 +23,7 @@ tools/lh-recorder/lh-recorder decompress ~/LH-Archives --output ~/LH-Restored
 gzipの内容を展開してからtar.xzに最高圧縮で格納します。
 展開ツールはJSONL／pcapをgzip level 6に揃え、manifestのSHA-256を再計算します。
 元セッションは変更せず、JSONL原文とUSB payloadを保持します。
+
+libsurvive も同じ Dashboard 設定で記録できます。セッション名の `_libsurvive_`、
+manifest の `source: libsurvive`、各 pose 行の `source` / `stream` / `stage` で識別します。
+usbmon の権限は不要です。詳しくは [libsurvive の記録・比較手順](../../docs/libsurvive-recording.md)。

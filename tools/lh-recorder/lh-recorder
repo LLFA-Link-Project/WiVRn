@@ -19,7 +19,7 @@ import tempfile
 import sys
 import time
 
-VERSION = '2.1.0'
+VERSION = '3.0.0'
 
 
 def dump(path, value):
@@ -215,7 +215,95 @@ def pcap_records(path):
             index += 1
 
 
+def native_tags(session):
+    """Read to EOF to verify gzip CRC. Native timestamps remain in their own domains."""
+    counts = {}
+    with gzip.open(session/'native.rec.gz', 'rt', encoding='utf-8') as f:
+        for line in f:
+            fields = line.split()
+            if len(fields) >= 3:
+                tag = 'OPTION' if fields[1] == 'OPTION' else fields[2]
+                counts[tag] = counts.get(tag, 0) + 1
+    return counts
+
+
+def validate_survive(session, write=True):
+    issues, warnings, stages, ids = set(), set(), {}, set()
+    manifest = read(session/'manifest.json', {})
+    if manifest.get('status') != 'complete':
+        issues.add('manifest_not_finalized_normally')
+    mapping = ClockMap.from_file(session/'clock_sync.jsonl') if stream_path(session/'clock_sync.jsonl').exists() else ClockMap([])
+    count = 0
+    try:
+        for p in lines(session/'poses.jsonl'):
+            count += 1
+            if p.get('source') != 'libsurvive' or p.get('stream') != 'libsurvive_pose' or p.get('capture_clock') != 'CLOCK_MONOTONIC':
+                issues.add('wrong_pose_stream_or_clock')
+            stage = p['stage']
+            if stage not in ('backend_received', 'history_input', 'app_output', 'hand_output'):
+                issues.add('unknown_pose_stage')
+            stages[stage] = stages.get(stage, 0) + 1
+            if p.get('serial') != p['device_id'] or p.get('role') not in ('left_hand', 'right_hand', 'tracker', 'head', 'unknown'):
+                issues.add('missing_or_inconsistent_device_identity')
+            ids.add(p['device_id'])
+            if getattr(mapping, 'sample_count', 0) and not mapping.first['monotonic_before_ns'] <= p['capture_time_ns'] <= mapping.last['monotonic_after_ns']:
+                issues.add('pose_outside_sync_session')
+            for key, size in (('position_m', 3), ('orientation_xyzw', 4), ('linear_velocity_m_s', 3), ('angular_velocity_rad_s', 3)):
+                v = p[key]
+                if not isinstance(v, list) or len(v) != size:
+                    issues.add('invalid_vector_size')
+                elif p.get('pose_is_valid') and any(x is None or not isinstance(x, (int, float)) or not math.isfinite(x) for x in v):
+                    issues.add('nonfinite_valid_pose')
+                elif key == 'orientation_xyzw' and p.get('pose_is_valid') and abs(sum((x or 0)**2 for x in v)-1) > .02:
+                    issues.add('nonunit_valid_quaternion')
+            if stage in ('app_output', 'hand_output') and p.get('history_result') in (3, 4):
+                clamp = manifest.get('configuration', {}).get('lh-max-extrapolation')
+                if clamp == 0 and p.get('effective_prediction_ns') != 0:
+                    issues.add('nonzero_prediction_with_zero_clamp')
+                elif isinstance(clamp, (int, float)) and clamp >= 0 and abs(p.get('effective_prediction_ns') or 0) > clamp*1e6:
+                    issues.add('prediction_exceeds_clamp')
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as e:
+        issues.add('pose_parse_error: '+str(e))
+    for required in ('backend_received', 'history_input'):
+        if not stages.get(required): issues.add('missing_stage: '+required)
+    if not stages.get('app_output'):
+        warnings.add('no_application_pose_requests_recorded')
+    try:
+        tags = native_tags(session)
+        for required in ('CONFIG', 'i', 'I', 'B', 'POSE', 'POSE_TIMING', 'POSE_STATE', 'POSE_BIAS'):
+            if not tags.get(required): issues.add('missing_native_tag: '+required)
+    except (OSError, EOFError, UnicodeError) as e:
+        tags = {}; issues.add('native_read_error: '+str(e))
+    status = read(session/'pose_status.json', {})
+    if not status.get('stopped') or not status.get('context_initialized'):
+        issues.add('pose_writer_not_finalized_or_context_missing')
+    if status.get('written') != count or status.get('enqueued') != status.get('written'):
+        issues.add('pose_writer_count_mismatch')
+    if status.get('attempted') != status.get('enqueued', 0) + status.get('dropped', 0):
+        issues.add('pose_writer_accounting_mismatch')
+    if status.get('error'): issues.add('pose_writer_error: '+str(status['error']))
+    if status.get('dropped'): issues.add('pose_records_dropped')
+    if getattr(mapping, 'sample_count', 0) < 2: issues.add('insufficient_clock_samples')
+    if mapping.jumps: warnings.add('clock_jump_intervals')
+    for name, expected in manifest.get('files_sha256', {}).items():
+        if Path(name).is_absolute() or '..' in Path(name).parts or not (session/name).is_file() or sha(session/name) != expected:
+            issues.add('hash_mismatch: '+name)
+    if not manifest.get('loaded_survive_objects'):
+        issues.add('missing_loaded_library_evidence')
+    if not read(session/'build-provenance.json', {}).get('libsurvive', {}).get('revision'):
+        issues.add('missing_libsurvive_revision')
+    warnings.add('native_recorder_synchronous_overhead_and_input_loss_unmeasured')
+    result = dict(schema_version=2, source='libsurvive', valid=not issues, issues=sorted(issues), warnings=sorted(warnings),
+                  full_content_validation=True, validation_scope='stage values, native gzip/tag presence, clock brackets, queue accounting and session hashes; no sensor-to-render latency inference',
+                  pose_count=count, stage_counts=stages, device_ids=sorted(ids), native_tag_counts=tags,
+                  native_drop_count=None, clock_sync=mapping.report(), hardware_tracking_quality_test='not_run')
+    if write: dump(session/'validation.json', result)
+    return result
+
+
 def validate(session, write=True):
+    if read(session/'manifest.json', {}).get('source') == 'libsurvive':
+        return validate_survive(session, write)
     issues, warnings = set(), set()
     manifest = read(session/'manifest.json', {})
     if manifest.get('status') == 'abnormal':
@@ -335,6 +423,8 @@ def validate(session, write=True):
 
 
 def align(session):
+    if read(session/'manifest.json', {}).get('source') == 'libsurvive':
+        raise ValueError('Native sensor ticks are device-local; use native POSE_TIMING and INPUT_TIME without assuming wall-clock alignment')
     mapping = ClockMap.from_file(session/'clock_sync.jsonl')
     with gzip.open(session/'usb_timestamps.jsonl.gz', 'wt', encoding='utf-8', compresslevel=6) as output:
         for packet in pcap_records(session/'usb.pcap.gz'):
@@ -344,6 +434,8 @@ def align(session):
 
 
 def export_public(source, dest):
+    if read(source/'manifest.json', {}).get('source') == 'libsurvive':
+        raise ValueError('Public export does not yet redact native libsurvive identities and calibration')
     # USB configuration payloads contain identities; retaining them cannot promise anonymity.
     dest.mkdir(mode=0o700, parents=True, exist_ok=False)
     salt = secrets.token_bytes(32)
@@ -560,17 +652,32 @@ def decompress_sessions(source, output):
     return results
 
 
+def mark_scene(session, label):
+    manifest = read(session/'manifest.json', {})
+    if manifest.get('status') != 'recording' or manifest.get('source') != 'libsurvive':
+        raise ValueError('Scene markers require an active libsurvive session')
+    record = dict(schema_version=1, source='libsurvive', event='scene_marker', label=label,
+                  capture_time_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC), capture_clock='CLOCK_MONOTONIC',
+                  motion_amplitude='manual target, not measured ground truth')
+    with (session/'scene-markers.jsonl').open('a') as f:
+        f.write(json.dumps(record)+'\n'); f.flush(); os.fsync(f.fileno())
+    return record
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Offline Lighthouse dataset validation, clock alignment, public export and tar.xz archival. Recording is built into wivrn-server.')
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('validate', 'align'):
         p = sub.add_parser(name); p.add_argument('session', type=Path)
+    p = sub.add_parser('mark'); p.add_argument('session', type=Path); p.add_argument('label')
     p = sub.add_parser('export-public'); p.add_argument('session', type=Path); p.add_argument('output', type=Path)
     for name in ('compress', 'decompress'):
         p = sub.add_parser(name)
         p.add_argument('source', type=Path, help='Session/archive, or directory containing sessions/archives')
         p.add_argument('--output', required=True, type=Path, help='Destination directory (existing data is never overwritten)')
     args = parser.parse_args(argv)
+    if args.command == 'mark':
+        print(json.dumps(mark_scene(args.session, args.label), indent=2)); return 0
     if args.command == 'compress':
         print(json.dumps(compress_sessions(args.source, args.output), indent=2)); return 0
     if args.command == 'decompress':

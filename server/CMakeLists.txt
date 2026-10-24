@@ -357,6 +357,16 @@ if(WIVRN_BUILD_SERVER)
 		target_sources(wivrn-server PRIVATE lighthouse_capture.cpp)
 		target_link_libraries(wivrn-server PRIVATE PkgConfig::LH_PCAP ZLIB::ZLIB xrt-external-openvr)
 	endif()
+	if(WIVRN_FEATURE_SURVIVE)
+		find_package(ZLIB REQUIRED)
+		find_package(Python3 REQUIRED COMPONENTS Interpreter)
+		get_filename_component(LH_SURVIVE_DEPENDENCIES "${SURVIVE_PREFIX}" DIRECTORY)
+		execute_process(COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/lh-recorder/build_provenance.py"
+			"${PROJECT_SOURCE_DIR}" "${monado_SOURCE_DIR}" "${LH_SURVIVE_DEPENDENCIES}/libsurvive-llfa-main-src"
+			"${CMAKE_CURRENT_BINARY_DIR}/lighthouse_build_provenance.h" COMMAND_ERROR_IS_FATAL ANY)
+		target_include_directories(wivrn-server PRIVATE "${monado_SOURCE_DIR}/src/xrt/drivers/survive" "${CMAKE_CURRENT_BINARY_DIR}")
+		target_link_libraries(wivrn-server PRIVATE drv_survive ZLIB::ZLIB)
+	endif()
 	# Offline validation, alignment and archival; recording never invokes these programs.
 	install(PROGRAMS ${PROJECT_SOURCE_DIR}/tools/lh-recorder/lh-recorder DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/wivrn)
 	configure_file(${PROJECT_SOURCE_DIR}/tools/lh-recorder/launcher.in ${CMAKE_CURRENT_BINARY_DIR}/lh-recorder-cli @ONLY)
@@ -376,6 +386,11 @@ if(WIVRN_BUILD_TEST AND WIVRN_BUILD_SERVER AND WIVRN_FEATURE_STEAMVR_LIGHTHOUSE)
         WIVRN_LH_RECORDING_TEST=1
         WIVRN_LH_MONADO_REV="${LH_MONADO_ACTUAL_REV}"
         WIVRN_LH_WIVRN_REV="${LH_WIVRN_REV}")
+
+    if(WIVRN_FEATURE_SURVIVE)
+        target_include_directories(lh-recording-startup-test PRIVATE "${monado_SOURCE_DIR}/src/xrt/drivers/survive" "${CMAKE_CURRENT_BINARY_DIR}")
+        target_link_libraries(lh-recording-startup-test PRIVATE drv_survive)
+    endif()
 
     add_executable(lh-hotplug-test ../tools/lh-recorder/tests/hotplug.cpp)
     target_compile_features(lh-hotplug-test PRIVATE cxx_std_20)

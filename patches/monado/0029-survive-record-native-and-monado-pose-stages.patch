@@ -1,0 +1,658 @@
+From 5e4ebce05e61eb2de946d4c8e7aaa25839d130d5 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sat, 24 Oct 2026 16:48:00 +0900
+Subject: [PATCH] survive: record native input and asynchronous Monado pose
+ stages
+
+---
+ src/xrt/auxiliary/math/m_relation_history.cpp |  17 +-
+ src/xrt/auxiliary/math/m_relation_history.h   |   6 +
+ src/xrt/drivers/CMakeLists.txt                |   5 +
+ src/xrt/drivers/survive/survive_driver.c      | 100 +++++-
+ src/xrt/drivers/survive/survive_recording.cpp | 312 ++++++++++++++++++
+ src/xrt/drivers/survive/survive_recording.h   |  36 ++
+ 6 files changed, 467 insertions(+), 9 deletions(-)
+ create mode 100644 src/xrt/drivers/survive/survive_recording.cpp
+ create mode 100644 src/xrt/drivers/survive/survive_recording.h
+
+diff --git a/src/xrt/auxiliary/math/m_relation_history.cpp b/src/xrt/auxiliary/math/m_relation_history.cpp
+index 47a61ed6d..8324af033 100644
+--- a/src/xrt/auxiliary/math/m_relation_history.cpp
++++ b/src/xrt/auxiliary/math/m_relation_history.cpp
+@@ -84,12 +84,14 @@ m_relation_history_push(struct m_relation_history *rh, struct xrt_space_relation
+ }
+ 
+ enum m_relation_history_result
+-m_relation_history_get_clamped(const struct m_relation_history *rh,
++m_relation_history_get_clamped_with_prediction(const struct m_relation_history *rh,
+                                int64_t at_timestamp_ns,
+                                int64_t max_extrapolation_ns,
+                                int64_t *out_timestamp_ns,
++                               int64_t *out_prediction_ns,
+                                struct xrt_space_relation *out_relation)
+ {
++	if (out_prediction_ns) *out_prediction_ns = 0;
+ 	XRT_TRACE_MARKER();
+ 	std::unique_lock<os::Mutex> lock(rh->mutex);
+ 	try {
+@@ -125,8 +127,9 @@ m_relation_history_get_clamped(const struct m_relation_history *rh,
+ 			m_predict_relation(&rh->impl.back().relation, delta_s, out_relation);
+ 			if (out_timestamp_ns) {
+ 				// We extrapolated to the requested timestamp.
+-				*out_timestamp_ns = at_timestamp_ns + diff_prediction_ns;
++				*out_timestamp_ns = rh->impl.back().timestamp + diff_prediction_ns;
+ 			}
++			if (out_prediction_ns) *out_prediction_ns = diff_prediction_ns;
+ 			return M_RELATION_HISTORY_RESULT_PREDICTED;
+ 		}
+ 		if (at_timestamp_ns == it->timestamp) {
+@@ -152,8 +155,9 @@ m_relation_history_get_clamped(const struct m_relation_history *rh,
+ 			m_predict_relation(&rh->impl.front().relation, delta_s, out_relation);
+ 			if (out_timestamp_ns) {
+ 				// We extrapolated to the requested timestamp.
+-				*out_timestamp_ns = at_timestamp_ns + diff_prediction_ns;
++				*out_timestamp_ns = rh->impl.front().timestamp + diff_prediction_ns;
+ 			}
++			if (out_prediction_ns) *out_prediction_ns = diff_prediction_ns;
+ 			return M_RELATION_HISTORY_RESULT_REVERSE_PREDICTED;
+ 		}
+ 		U_LOG_T("Interpolating within buffer!");
+@@ -206,6 +210,13 @@ m_relation_history_get_clamped(const struct m_relation_history *rh,
+ 	}
+ }
+ 
++enum m_relation_history_result
++m_relation_history_get_clamped(const struct m_relation_history *rh, int64_t requested, int64_t limit,
++                              int64_t *resolved, struct xrt_space_relation *relation)
++{
++ return m_relation_history_get_clamped_with_prediction(rh, requested, limit, resolved, nullptr, relation);
++}
++
+ static void
+ m_relation_history_estimate_motion(struct xrt_space_relation const &old_relation,
+                                    struct xrt_space_relation const &new_relation,
+diff --git a/src/xrt/auxiliary/math/m_relation_history.h b/src/xrt/auxiliary/math/m_relation_history.h
+index 5aaa94404..81d620992 100644
+--- a/src/xrt/auxiliary/math/m_relation_history.h
++++ b/src/xrt/auxiliary/math/m_relation_history.h
+@@ -96,6 +96,12 @@ m_relation_history_get_clamped(const struct m_relation_history *rh,
+                                int64_t *out_timestamp_ns,
+                                struct xrt_space_relation *out_relation);
+ 
++// Diagnostic variant: signed extrapolation duration and resolved timestamp are
++// sampled under the same history lock. Zero for exact/interpolated/invalid results.
++enum m_relation_history_result
++m_relation_history_get_clamped_with_prediction(const struct m_relation_history *rh, int64_t requested_ns,
++    int64_t limit_ns, int64_t *resolved_ns, int64_t *prediction_ns, struct xrt_space_relation *relation);
++
+ /*!
+  * Wrapper for @ref m_relation_history_get_clamped with unlimited extrapolation.
+  *
+diff --git a/src/xrt/drivers/CMakeLists.txt b/src/xrt/drivers/CMakeLists.txt
+index c24392015..5bb07d1e2 100644
+--- a/src/xrt/drivers/CMakeLists.txt
++++ b/src/xrt/drivers/CMakeLists.txt
+@@ -472,11 +472,15 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
+ endif()
+ 
+ if(XRT_BUILD_DRIVER_SURVIVE)
++ find_package(ZLIB REQUIRED)
++ find_package(nlohmann_json REQUIRED)
+ 	include(CMakePushCheckState)
+ 	include(CheckSymbolExists)
+ 	add_library(
+ 		drv_survive STATIC
+ 		survive/survive_driver.c
++        survive/survive_recording.cpp
++        survive/survive_recording.h
+ 		survive/survive_interface.h
+ 		survive/survive_internal.h
+ 		survive/survive_vp2.c
+@@ -493,6 +497,7 @@ if(XRT_BUILD_DRIVER_SURVIVE)
+ 			drv_includes
+ 			drv_vp2
+ 			PkgConfig::SURVIVE
++            nlohmann_json::nlohmann_json ZLIB::ZLIB ${CMAKE_DL_LIBS}
+ 		)
+ 
+ 	cmake_push_check_state(RESET)
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+index b68d0afd1..ed778e931 100644
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -38,6 +38,7 @@
+ #include "vive/vive_poses.h"
+ 
+ #include "survive_internal.h"
++#include "survive_recording.h"
+ #include "survive_vp2.h"
+ 
+ 
+@@ -227,6 +228,69 @@ survive_set_object(struct survive_device *survive, const SurviveSimpleObject *ob
+ 	};
+ }
+ 
++// Do no allocation, serialization or disk I/O on the callback path.
++static void
++record_sample(struct survive_device *d,
++              const char *stage,
++              const struct xrt_space_relation *relation,
++              int64_t callback_ns,
++              int64_t pose_ns,
++              double event_s,
++              enum xrt_input_name input,
++              int64_t requested_ns,
++              int64_t resolved_ns,
++              int64_t prediction_ns,
++              int result,
++              bool accepted,
++              const struct xrt_pose *palm_from_wrist,
++              const struct SurviveSimplePoseUpdatedEvent *raw_event)
++{
++	if (!survive_recording_enabled())
++		return;
++	struct survive_recording_sample s = {0};
++	snprintf(s.serial, sizeof(s.serial), "%s", d->base.serial);
++	s.role = d->base.device_type;
++	s.stage = stage;
++	s.relation = *relation;
++	if (raw_event) {
++		s.has_raw = true;
++		for (int i = 0; i < 3; ++i) {
++			s.raw_pose[i] = raw_event->pose.Pos[i];
++			s.raw_velocity[i] = raw_event->velocity.Pos[i];
++			s.raw_velocity[i + 3] = raw_event->velocity.AxisAngleRot[i];
++		}
++		for (int i = 0; i < 3; ++i)
++			s.raw_pose[i + 3] = raw_event->pose.Rot[i + 1];
++		s.raw_pose[6] = raw_event->pose.Rot[0];
++	}
++	s.callback_ns = callback_ns ? callback_ns : os_monotonic_get_ns();
++	s.pose_ns = pose_ns;
++	s.event_time_s = event_s;
++	s.input_name = input;
++	s.requested_ns = requested_ns;
++	s.resolved_ns = resolved_ns;
++	s.prediction_ns = prediction_ns;
++	s.history_result = result;
++	s.history_accepted = accepted;
++	s.imu_from_head = d->imu_from_head;
++	s.head_from_grip = (struct xrt_pose)XRT_POSE_IDENTITY;
++	s.head_from_input = (struct xrt_pose)XRT_POSE_IDENTITY;
++	if (input)
++		vive_poses_get_pose_offset(d->base.name, d->base.device_type, input, &s.head_from_input);
++	if (palm_from_wrist) {
++		s.palm_from_wrist = *palm_from_wrist;
++		s.has_wrist_transform = true;
++	}
++	s.grip_from_palm = (struct xrt_pose)XRT_POSE_IDENTITY;
++	vive_poses_get_pose_offset(d->base.name, d->base.device_type, XRT_INPUT_INDEX_GRIP_POSE, &s.head_from_grip);
++	if (d->base.name == XRT_DEVICE_INDEX_CONTROLLER)
++		vive_poses_get_index_palm_offset(
++		    d->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? XRT_HAND_LEFT : XRT_HAND_RIGHT,
++		    &s.grip_from_palm);
++	math_quat_normalize(&s.grip_from_palm.orientation);
++	survive_recording_submit(&s);
++}
++
+ static bool
+ verify_device_name(struct survive_device *survive, enum xrt_input_name name)
+ {
+@@ -264,6 +328,8 @@ survive_device_get_tracked_pose(struct xrt_device *xdev,
+ 
+ 	if (!survive_device_active(survive)) {
+ 		*out_relation = (struct xrt_space_relation){0};
++		record_sample(survive, "app_output", out_relation, 0, 0, NAN, name, at_timestamp_ns, 0, 0, 0, false,
++		              NULL, NULL);
+ 		return XRT_SUCCESS;
+ 	}
+ 
+@@ -271,14 +337,18 @@ survive_device_get_tracked_pose(struct xrt_device *xdev,
+ 	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, name, &pose_offset);
+ 
+ 	struct xrt_space_relation space_relation;
+-	m_relation_history_get_clamped(survive->relation_hist, at_timestamp_ns, survive_max_extrapolation_ns(), NULL,
+-	                               &space_relation);
++	int64_t resolved_ns = 0, prediction_ns = 0;
++	enum m_relation_history_result history_result = m_relation_history_get_clamped_with_prediction(
++	    survive->relation_hist, at_timestamp_ns, survive_max_extrapolation_ns(), &resolved_ns, &prediction_ns,
++	    &space_relation);
+ 
+ 	struct xrt_relation_chain relation_chain = {0};
+ 	m_relation_chain_push_pose(&relation_chain, &pose_offset);
+ 	m_relation_chain_push_pose(&relation_chain, &survive->imu_from_head);
+ 	m_relation_chain_push_relation(&relation_chain, &space_relation);
+ 	m_relation_chain_resolve(&relation_chain, out_relation);
++	record_sample(survive, "app_output", out_relation, 0, resolved_ns - prediction_ns, NAN, name, at_timestamp_ns,
++	              resolved_ns, prediction_ns, history_result, false, NULL, NULL);
+ 
+ 	struct xrt_pose *p = &out_relation->pose;
+ 	SURVIVE_TRACE(survive, "GET_POSITION (%f %f %f) GET_ORIENTATION (%f, %f, %f, %f)", p->position.x, p->position.y,
+@@ -416,6 +486,7 @@ survive_controller_get_hand_tracking(struct xrt_device *xdev,
+ 	if (!survive_device_active(survive)) {
+ 		*out_value = (struct xrt_hand_joint_set){0};
+ 		*out_timestamp_ns = at_timestamp_ns;
++        record_sample(survive,"hand_output",&out_value->hand_pose,0,0,NAN,name,at_timestamp_ns,0,0,0,false,NULL, NULL);
+ 		os_mutex_unlock(&survive->sys->lock);
+ 		return XRT_SUCCESS;
+ 	}
+@@ -445,8 +516,9 @@ survive_controller_get_hand_tracking(struct xrt_device *xdev,
+ 
+ 	struct xrt_space_relation hand_relation;
+ 
+-	m_relation_history_get_clamped(survive->relation_hist, at_timestamp_ns, survive_max_extrapolation_ns(), NULL,
+-	                               &hand_relation);
++	int64_t resolved_ns=0, prediction_ns=0;
++ enum m_relation_history_result history_result=m_relation_history_get_clamped_with_prediction(
++     survive->relation_hist,at_timestamp_ns,survive_max_extrapolation_ns(),&resolved_ns,&prediction_ns,&hand_relation);
+ 
+ 
+ 	u_hand_sim_simulate_for_valve_index_knuckles(&values, hand, &hand_relation, out_value);
+@@ -484,6 +556,8 @@ survive_controller_get_hand_tracking(struct xrt_device *xdev,
+ 	// Recent events keep hand emulation active; the inactivity check above
+ 	// releases it when libsurvive stops reporting the device.
+ 	out_value->is_active = true;
++ record_sample(survive,"hand_output",&out_value->hand_pose,0,resolved_ns-prediction_ns,NAN,name,
++               at_timestamp_ns,resolved_ns,prediction_ns,history_result,false,&wrist_in_palm, NULL);
+ 	os_mutex_unlock(&survive->sys->lock);
+ 
+ 	return XRT_SUCCESS;
+@@ -808,11 +882,25 @@ survive_device_mark_active(struct survive_device *d)
+ static void
+ _process_pose_event(struct survive_device *survive, const struct SurviveSimplePoseUpdatedEvent *e)
+ {
++	int64_t callback_ns = survive_recording_enabled() ? os_monotonic_get_ns() : 0;
+ 	survive_device_mark_active(survive);
+ 	struct xrt_space_relation rel = {0};
+ 	pose_to_relation(&e->pose, &e->velocity, &rel);
+ 	timepoint_ns ts = survive_timecode_to_monotonic(survive, e->time);
+-	m_relation_history_push(survive->relation_hist, &rel, ts);
++	bool accepted = m_relation_history_push(survive->relation_hist, &rel, ts);
++	if (callback_ns) {
++		struct xrt_space_relation raw = rel;
++		raw.pose =
++		    (struct xrt_pose){.position = {e->pose.Pos[0], e->pose.Pos[1], e->pose.Pos[2]},
++		                      .orientation = {e->pose.Rot[1], e->pose.Rot[2], e->pose.Rot[3], e->pose.Rot[0]}};
++		raw.linear_velocity = (struct xrt_vec3){e->velocity.Pos[0], e->velocity.Pos[1], e->velocity.Pos[2]};
++		raw.angular_velocity = (struct xrt_vec3){e->velocity.AxisAngleRot[0], e->velocity.AxisAngleRot[1],
++		                                         e->velocity.AxisAngleRot[2]};
++		record_sample(survive, "backend_received", &raw, callback_ns, ts, e->time, 0, 0, 0, 0, 0, false, NULL,
++		              e);
++		record_sample(survive, "history_input", &rel, callback_ns, ts, e->time, 0, 0, 0, 0, 0, accepted, NULL,
++		              NULL);
++	}
+ 
+ 	SURVIVE_TRACE(survive, "Process pose event for %s", survive->base.str);
+ }
+@@ -1465,7 +1553,7 @@ survive_get_devices_internal(struct xrt_prober *xp, struct xrt_device **out_xdev
+ 	    //"--use-kalman", "0"
+ 	};
+ 	// clang-format on
+-	actx = survive_simple_init(sizeof(survive_args) / sizeof(survive_args[0]), survive_args);
++	actx = survive_recording_init_context(sizeof(survive_args) / sizeof(survive_args[0]), survive_args);
+ #else
+ 	actx = survive_simple_init(0, 0);
+ #endif
+diff --git a/src/xrt/drivers/survive/survive_recording.cpp b/src/xrt/drivers/survive/survive_recording.cpp
+new file mode 100644
+index 000000000..57b8a7e9f
+--- /dev/null
++++ b/src/xrt/drivers/survive/survive_recording.cpp
+@@ -0,0 +1,312 @@
++// SPDX-License-Identifier: BSL-1.0
++#include "survive_recording.h"
++#include "survive_api.h"
++#include <nlohmann/json.hpp>
++#include <array>
++#include <atomic>
++#include <condition_variable>
++#include <cmath>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <link.h>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++#include <zlib.h>
++using json = nlohmann::json;
++namespace {
++constexpr size_t capacity = 8192;
++struct Recorder
++{
++	std::array<survive_recording_sample, capacity> queue{};
++	size_t head = 0, tail = 0, count = 0;
++	std::mutex mutex;
++	std::condition_variable wake;
++	std::thread writer;
++	std::atomic<bool> accepting{false};
++	bool stopping = false;
++	uint64_t attempted = 0, enqueued = 0, dropped = 0, written = 0;
++	std::string directory, error;
++	bool context_ready = false;
++	Recorder(const char *d) : directory(d) {}
++	void
++	status(bool stopped)
++	{
++		std::ofstream f(directory + "/pose_status.json.tmp");
++		f << json{{"schema_version", 2},
++		          {"source", "libsurvive"},
++		          {"stopped", stopped},
++		          {"attempted", attempted},
++		          {"enqueued", enqueued},
++		          {"written", written},
++		          {"dropped", dropped},
++		          {"queue_capacity", capacity},
++		          {"unwritten", enqueued - written},
++		          {"error", error},
++		          {"context_initialized", context_ready}}
++		         .dump()
++		  << '\n';
++		f.close();
++		if (!f)
++			throw std::runtime_error("pose status write failed");
++		std::filesystem::rename(directory + "/pose_status.json.tmp", directory + "/pose_status.json");
++	}
++	static json
++	pose(const xrt_pose &p)
++	{
++		return {{"position_m", {p.position.x, p.position.y, p.position.z}},
++		        {"orientation_xyzw", {p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w}}};
++	}
++	static const char *
++	role(xrt_device_type r)
++	{
++		switch (r) {
++		case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER: return "left_hand";
++		case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER: return "right_hand";
++		case XRT_DEVICE_TYPE_HMD: return "head";
++		case XRT_DEVICE_TYPE_GENERIC_TRACKER: return "tracker";
++		default: return "unknown";
++		}
++	}
++	json
++	encode(const survive_recording_sample &s)
++	{
++		auto &r = s.relation;
++		auto flags = r.relation_flags;
++		bool raw = std::strcmp(s.stage, "backend_received") == 0;
++		json j = {
++		    {"schema_version", 2},
++		    {"source", "libsurvive"},
++		    {"stream", "libsurvive_pose"},
++		    {"device_id", s.serial},
++		    {"serial", s.serial},
++		    {"role", role(s.role)},
++		    {"stage", s.stage},
++		    {"sequence", written},
++		    {"capture_time_ns", s.callback_ns},
++		    {"callback_monotonic_ns", s.callback_ns},
++		    {"capture_clock", "CLOCK_MONOTONIC"},
++		    {"sensor_tick", nullptr},
++		    {"sensor_hz", nullptr},
++		    {"pose_time_ns", s.pose_ns ? json(s.pose_ns) : json(nullptr)},
++		    {"pose_time_clock",
++		     s.pose_ns ? json("CLOCK_MONOTONIC_estimated_from_simple_API_epoch") : json(nullptr)},
++		    {"simple_api_pose_time_s", std::isfinite(s.event_time_s) ? json(s.event_time_s) : json(nullptr)},
++		    {"simple_api_pose_time_clock",
++		     std::isfinite(s.event_time_s) ? json("libsurvive_epoch_seconds") : json(nullptr)},
++		    {"velocity_time_ns", nullptr},
++		    {"velocity_time_clock", nullptr},
++		    {"requested_time_ns", s.requested_ns ? json(s.requested_ns) : json(nullptr)},
++		    {"resolved_time_ns", s.resolved_ns ? json(s.resolved_ns) : json(nullptr)},
++		    {"effective_prediction_ns", s.requested_ns ? json(s.prediction_ns) : json(nullptr)},
++		    {"history_result", s.requested_ns ? json(s.history_result) : json(nullptr)},
++		    {"history_accepted",
++		     std::strcmp(s.stage, "history_input") == 0 ? json(s.history_accepted) : json(nullptr)},
++		    {"input_name", s.input_name ? json(s.input_name) : json(nullptr)},
++		    {"coordinate_frame",
++		     raw ? "libsurvive_world_z_up_floor_subtracted" : "monado_tracking_y_up_floor_subtracted"},
++		    {"reference_point", raw || std::strcmp(s.stage, "history_input") == 0 ? "imu"
++		                        : std::strcmp(s.stage, "hand_output") == 0        ? "emulated_wrist"
++		                                                                          : "interaction_profile_pose"},
++		    {"floor_offset_m", nullptr},
++		    {"floor_offset_source", "native.rec.gz:POSE_STATE"},
++		    {"native_sensor_and_bias_source",
++		     "native.rec.gz:POSE_TIMING/POSE_STATE/POSE_BIAS/POSE_BIAS_VAR; join by serial/config and sensor "
++		     "clock, not line order"},
++		    {"relation_flags", uint32_t(flags)},
++		    {"pose_is_valid", bool((flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) &&
++		                           (flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT))},
++		    {"validity",
++		     {{"position", bool(flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)},
++		      {"orientation", bool(flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT)},
++		      {"linear_velocity", bool(flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT)},
++		      {"angular_velocity", bool(flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT)}}},
++		    {"linear_velocity_m_s", {r.linear_velocity.x, r.linear_velocity.y, r.linear_velocity.z}},
++		    {"angular_velocity_rad_s", {r.angular_velocity.x, r.angular_velocity.y, r.angular_velocity.z}},
++		    {"world_from_survive_rotation_xyzw", {-0.7071067811865476, 0, 0, 0.7071067811865476}},
++		    {"imu_from_head", pose(s.imu_from_head)},
++		    {"head_from_grip", pose(s.head_from_grip)},
++		    {"grip_from_palm", pose(s.grip_from_palm)},
++		    {"head_from_input",
++		     std::strcmp(s.stage, "app_output") == 0 ? pose(s.head_from_input) : json(nullptr)},
++		    {"palm_from_wrist", s.has_wrist_transform ? pose(s.palm_from_wrist) : json(nullptr)},
++		    {"wrist_roll_xyzw",
++		     s.has_wrist_transform
++		         ? json::array({0., 0.,
++		                        s.role == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? std::sqrt(.5) : -std::sqrt(.5),
++		                        std::sqrt(.5)})
++		         : json(nullptr)}};
++		j.update(pose(r.pose));
++		if (s.has_raw) {
++			j["position_m"] = {s.raw_pose[0], s.raw_pose[1], s.raw_pose[2]};
++			j["orientation_xyzw"] = {s.raw_pose[3], s.raw_pose[4], s.raw_pose[5], s.raw_pose[6]};
++			j["linear_velocity_m_s"] = {s.raw_velocity[0], s.raw_velocity[1], s.raw_velocity[2]};
++			j["angular_velocity_rad_s"] = {s.raw_velocity[3], s.raw_velocity[4], s.raw_velocity[5]};
++		}
++		return j;
++	}
++	void
++	run() noexcept
++	{
++		gzFile f = gzopen((directory + "/poses.jsonl.gz").c_str(), "wb6");
++		if (!f)
++			error = "pose stream open failed";
++		try {
++			for (;;) {
++				survive_recording_sample s{};
++				{
++					std::unique_lock<std::mutex> lock(mutex);
++					wake.wait(lock, [&] { return count || stopping; });
++					if (!count && stopping)
++						break;
++					s = queue[tail];
++					tail = (tail + 1) % capacity;
++					--count;
++				}
++				if (!error.empty())
++					continue;
++				auto text = encode(s).dump() + "\n";
++				if (gzwrite(f, text.data(), text.size()) != int(text.size()))
++					error = "pose stream write failed";
++				else
++					++written;
++			}
++		} catch (const std::exception &e) {
++			error = e.what();
++			accepting = false;
++		}
++		if (f && gzclose(f) != Z_OK)
++			error = "pose stream close failed";
++	}
++};
++std::unique_ptr<Recorder> storage;
++std::atomic<Recorder *> active{nullptr};
++// Only startup/shutdown mutate storage. The runtime must stop callbacks before finish.
++} // namespace
++extern "C" bool
++survive_recording_initialize(const char *directory)
++{
++	try {
++		if (storage)
++			return false;
++		storage = std::make_unique<Recorder>(directory);
++		storage->status(false);
++		storage->writer = std::thread([] { storage->run(); });
++		storage->accepting = true;
++		active.store(storage.get());
++		return true;
++	} catch (...) {
++		storage.reset();
++		return false;
++	}
++}
++extern "C" bool
++survive_recording_enabled()
++{
++	return active.load() != nullptr;
++}
++extern "C" void
++survive_recording_finish()
++{
++	auto *r = active.exchange(nullptr);
++	if (!r)
++		return;
++	r->accepting = false;
++	{
++		std::lock_guard<std::mutex> lock(r->mutex);
++		r->stopping = true;
++	}
++	r->wake.notify_all();
++	if (r->writer.joinable())
++		r->writer.join();
++	try {
++		r->status(true);
++	} catch (...) {
++	}
++	storage.reset();
++}
++extern "C" void
++survive_recording_submit(const survive_recording_sample *sample)
++{
++	auto *r = active.load();
++	if (!r || !r->accepting)
++		return;
++	std::lock_guard<std::mutex> lock(r->mutex);
++	++r->attempted;
++	if (r->count == capacity) {
++		++r->dropped;
++		return;
++	}
++	r->queue[r->head] = *sample;
++	r->head = (r->head + 1) % capacity;
++	++r->count;
++	++r->enqueued;
++	r->wake.notify_one();
++}
++extern "C" SurviveSimpleContext *
++survive_recording_init_context(int argc, char **argv)
++{
++	auto *r = active.load();
++	if (!r)
++		return survive_simple_init(argc, argv);
++	try {
++		std::vector<std::string> args;
++		for (int i = 0; i < argc; ++i)
++			args.emplace_back(argv[i]);
++		const char *config = std::getenv("SURVIVE_CONFIGFILE");
++		const char *comparison = std::getenv("WIVRN_SURVIVE_BIAS_COMPARISON");
++		std::string config_path = config && *config ? config : "config.json";
++		if (comparison && *comparison) {
++			if (std::strcmp(comparison, "A") && std::strcmp(comparison, "B"))
++				throw std::runtime_error("bias comparison must be A or B");
++			config_path = r->directory + "/calibration.json";
++			args.insert(args.end(),
++			            {"--kalman-minimize-state-space", "0", "--process-weight-gyro-bias",
++			             std::strcmp(comparison, "A") == 0 ? "0" : "1e-8", "--process-weight-acc-bias",
++			             std::strcmp(comparison, "A") == 0 ? "0" : "1e-8"});
++		}
++		config_path = std::filesystem::absolute(config_path).string();
++		if (std::filesystem::is_regular_file(config_path))
++			std::filesystem::copy_file(config_path, r->directory + "/calibration.initial.json");
++		json settings = {{"source", "libsurvive"},
++		                 {"configfile", config_path},
++		                 {"bias_comparison", comparison ? json(comparison) : json(nullptr)},
++		                 {"estimator_settings_changed", comparison && *comparison ? true : false}};
++		args.insert(args.end(),
++		            {"--configfile", config_path, "--record", r->directory + "/native.rec.gz", "--record-imu",
++		             "1", "--record-cal-imu", "1", "--record-rawlight", "1", "--record-angle", "1",
++		             "--record-pose-timing", "1", "--record-tracking-state", "1", "--report-in-imu", "1"});
++		settings["arguments"] = args;
++		std::ofstream(r->directory + "/survive-settings.json") << settings.dump(2) << '\n';
++		std::vector<char *> pointers;
++		for (auto &s : args)
++			pointers.push_back(s.data());
++		auto *ctx = survive_simple_init(pointers.size(), pointers.data());
++		if (!ctx)
++			return nullptr;
++		r->context_ready = true;
++		try {
++			// Enumerate mappings after plugin initialization, not guessed install paths.
++			json loaded = json::array();
++			dl_iterate_phdr(
++			    [](dl_phdr_info *info, size_t, void *opaque) {
++				    auto &list = *static_cast<json *>(opaque);
++				    std::string p = info->dlpi_name;
++				    if (!p.empty() && (p.find("survive") != std::string::npos ||
++				                       p.find("driver_") != std::string::npos ||
++				                       p.find("poser_") != std::string::npos))
++					    list.push_back({{"path", std::filesystem::absolute(p).string()},
++					                    {"load_address", info->dlpi_addr}});
++				    return 0;
++			    },
++			    &loaded);
++			std::ofstream(r->directory + "/loaded-survive-objects.json") << loaded.dump(2) << '\n';
++		} catch (...) { /* Finalization marks missing load evidence as incomplete. */
++		}
++		return ctx;
++	} catch (...) {
++		return nullptr;
++	}
++}
+diff --git a/src/xrt/drivers/survive/survive_recording.h b/src/xrt/drivers/survive/survive_recording.h
+new file mode 100644
+index 000000000..d8311b61c
+--- /dev/null
++++ b/src/xrt/drivers/survive/survive_recording.h
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: BSL-1.0
++#pragma once
++#include "xrt/xrt_defines.h"
++typedef struct SurviveSimpleContext SurviveSimpleContext;
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Initialized at runtime startup; callbacks only copy POD records into a bounded queue.
++bool
++survive_recording_initialize(const char *directory);
++void
++survive_recording_finish(void);
++bool
++survive_recording_enabled(void);
++SurviveSimpleContext *
++survive_recording_init_context(int argc, char **argv);
++struct survive_recording_sample
++{
++	char serial[256];
++	enum xrt_device_type role;
++	const char *stage; // static literals only
++	int64_t callback_ns, pose_ns, requested_ns, resolved_ns, prediction_ns;
++	double event_time_s; // simple API epoch seconds; NaN when not observable
++	int input_name, history_result;
++	bool history_accepted;
++	struct xrt_space_relation relation;
++	struct xrt_pose imu_from_head, head_from_grip, grip_from_palm, head_from_input, palm_from_wrist;
++	bool has_wrist_transform;
++	double raw_pose[7], raw_velocity[6];
++	bool has_raw;
++};
++void
++survive_recording_submit(const struct survive_recording_sample *sample);
++#ifdef __cplusplus
++}
++#endif
+-- 
+2.56.0
+

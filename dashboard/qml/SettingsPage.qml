@@ -166,17 +166,17 @@ Kirigami.ScrollablePage {
                 Layout.fillWidth: true
             }
             Controls.Label {
-                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
+                visible: (Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr") || (Settings.survive_supported && lighthouse_backend.currentValue === "survive")
                 text: i18n("Lighthouse Recording")
                 font.bold: true
             }
             Controls.CheckBox {
                 id: lighthouse_recording_enabled
-                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
+                visible: (Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr") || (Settings.survive_supported && lighthouse_backend.currentValue === "survive")
                 text: i18n("Enable recording")
             }
             RowLayout {
-                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
+                visible: (Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr") || (Settings.survive_supported && lighthouse_backend.currentValue === "survive")
                 Kirigami.FormData.label: i18n("Output directory:")
                 Controls.TextField {
                     id: lighthouse_recording_output
@@ -188,7 +188,7 @@ Kirigami.ScrollablePage {
                 }
             }
             Controls.Label {
-                visible: Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr"
+                visible: (Settings.steamvr_lh_supported && lighthouse_backend.currentValue === "steamvr") || (Settings.survive_supported && lighthouse_backend.currentValue === "survive")
                 text: i18n("Changes take effect the next time Monado starts.")
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true

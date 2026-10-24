@@ -192,8 +192,8 @@ providing the `survive` pkg-config package. Keep
 `WIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON` (the default) to include both backends. After
 that initial build, switching backends only requires saving the dashboard setting
 and restarting the internal Monado runtime. The selector also offers **Disabled**
-and only lists backends included in the build. SteamVR-specific recording,
-base station stabilization and joystick settings do not apply to libsurvive.
+and only lists backends included in the build. Recording supports both backends and identifies the selected backend in each session.
+SteamVR-specific base station stabilization and joystick settings do not apply to libsurvive.
 The maximum pose extrapolation setting is shared by both backends.
 
 The environment variable `WIVRN_USE_SURVIVE` also enables this backend when set,

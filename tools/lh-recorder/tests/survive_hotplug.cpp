@@ -6,10 +6,11 @@
 #include "os/os_time.h"
 #include "survive_api.h"
 #include "survive_interface.h"
+#include "survive_internal.h"
+#include "survive_recording.h"
+#include "vive/vive_poses.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_system.h"
-#include "survive_internal.h"
-#include "vive/vive_poses.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -45,6 +46,21 @@ extern "C"
 		{
 			std::fprintf(stderr, "FAIL: request IMU poses to match IMU velocities\n");
 			std::abort();
+		}
+		if (survive_recording_enabled())
+		{
+			bool native = false, timing = false, state = false;
+			for (int i = 1; i + 1 < argc; ++i)
+			{
+				if (!std::strcmp(argv[i], "--record"))
+					native = std::strstr(argv[i + 1], "native.rec.gz") != nullptr;
+				if (!std::strcmp(argv[i], "--record-pose-timing"))
+					timing = !std::strcmp(argv[i + 1], "1");
+				if (!std::strcmp(argv[i], "--record-tracking-state"))
+					state = !std::strcmp(argv[i + 1], "1");
+			}
+			if (!native || !timing || !state)
+				std::abort();
 		}
 		return &context;
 	}
@@ -173,7 +189,8 @@ static int test_prediction_limit(double expected_seconds)
 			p.object = object;
 			p.time = now - 0.02 + sample * 0.01;
 			p.pose.Rot[0] = 1;
-			p.velocity.Pos[0] = 1; // 1 m/s along X: distance equals prediction seconds.
+			p.pose.Pos[0] = 0.123456789012; // Preserve native double precision before Monado float conversion.
+			p.velocity.Pos[0] = 1;          // 1 m/s along X: distance equals prediction seconds.
 			enqueue(event);
 		}
 	for (size_t i = 0; i < system.static_xdev_count; ++i)
@@ -186,6 +203,13 @@ static int test_prediction_limit(double expected_seconds)
 		require(m_relation_history_get_latest(adapter->relation_hist, &latest_ns, &latest), "latest sample available");
 		auto input = device->device_type == XRT_DEVICE_TYPE_GENERIC_TRACKER ? XRT_INPUT_GENERIC_TRACKER_POSE : XRT_INPUT_INDEX_GRIP_POSE;
 		xrt_space_relation base{}, predicted{};
+		int64_t resolved = 0, horizon = 0;
+		xrt_space_relation diagnostic{};
+		m_relation_history_get_clamped_with_prediction(adapter->relation_hist, latest_ns + 1'000'000'000, expected_seconds == 1 ? INT64_MAX : int64_t(expected_seconds * 1e9), &resolved, &horizon, &diagnostic);
+		require(std::abs(horizon - int64_t(expected_seconds * 1e9)) <= 1, "exact diagnostic horizon under history lock");
+		require(resolved == latest_ns + horizon, "resolved timestamp follows source sample, including clamp zero");
+		m_relation_history_get_clamped_with_prediction(adapter->relation_hist, latest_ns - 1'000'000'000, 0, &resolved, &horizon, &diagnostic);
+		require(horizon == 0, "zero clamp disables reverse extrapolation too");
 		xrt_device_get_tracked_pose(device, input, latest_ns, &base);
 		xrt_device_get_tracked_pose(device, input, latest_ns + 1'000'000'000, &predicted);
 		require(std::abs(predicted.pose.position.x - base.pose.position.x - expected_seconds) < 1e-5,
@@ -225,7 +249,7 @@ static int test_prediction_limit(double expected_seconds)
 		int64_t latest_ns;
 		xrt_space_relation raw{};
 		require(m_relation_history_get_latest(adapter->relation_hist, &latest_ns, &raw), "rotating raw sample available");
-		auto check = [&](xrt_input_name input, const xrt_space_relation &result, const xrt_pose * extra = nullptr) {
+		auto check = [&](xrt_input_name input, const xrt_space_relation & result, const xrt_pose * extra = nullptr) {
 			xrt_pose offset = XRT_POSE_IDENTITY;
 			vive_poses_get_pose_offset(device->name, device->device_type, input, &offset);
 			if (extra)
@@ -247,12 +271,12 @@ static int test_prediction_limit(double expected_seconds)
 			const double rx = std::cos(angle) * r0.x + std::sin(angle) * r0.z;
 			const double rz = -std::sin(angle) * r0.x + std::cos(angle) * r0.z;
 			require(std::abs(result.pose.position.x - (raw.pose.position.x + expected_seconds + rx)) < 1e-5 &&
-			        std::abs(result.pose.position.y - (raw.pose.position.y + r0.y)) < 1e-5 &&
-			        std::abs(result.pose.position.z - (raw.pose.position.z + rz)) < 1e-5,
+			                std::abs(result.pose.position.y - (raw.pose.position.y + r0.y)) < 1e-5 &&
+			                std::abs(result.pose.position.z - (raw.pose.position.z + rz)) < 1e-5,
 			        "predict raw reference before composing rotating offset");
 			require(std::abs(result.linear_velocity.x - (1 + 20 * rz)) < 1e-4 &&
-			        std::abs(result.linear_velocity.y) < 1e-4 &&
-			        std::abs(result.linear_velocity.z + 20 * rx) < 1e-4,
+			                std::abs(result.linear_velocity.y) < 1e-4 &&
+			                std::abs(result.linear_velocity.z + 20 * rx) < 1e-4,
 			        "offset velocity uses the predicted orientation");
 		};
 		const int64_t requested_ns = latest_ns + 1'000'000'000;
@@ -289,7 +313,8 @@ static int test_prediction_limit(double expected_seconds)
 				math_quat_rotate_vec3(&unrolled.pose.orientation, &forward, &before);
 				math_quat_rotate_vec3(&result.hand_pose.pose.orientation, &forward, &after);
 				require(std::abs(before.x - after.x) < 1e-5 && std::abs(before.y - after.y) < 1e-5 &&
-				        std::abs(before.z - after.z) < 1e-5, "mirrored wrist roll preserves the finger direction");
+				                std::abs(before.z - after.z) < 1e-5,
+				        "mirrored wrist roll preserves the finger direction");
 				xrt_relation_chain chain{};
 				m_relation_chain_push_pose(&chain, &joints[XRT_HAND_JOINT_PALM].relation.pose);
 				m_relation_chain_push_relation(&chain, &unrolled);
@@ -305,8 +330,8 @@ static int test_prediction_limit(double expected_seconds)
 				else
 				{
 					require(std::abs(wrist.position.x - open_wrist.position.x) < 1e-5 &&
-					        std::abs(wrist.position.y - open_wrist.position.y) < 1e-5 &&
-					        std::abs(wrist.position.z - open_wrist.position.z) < 1e-5,
+					                std::abs(wrist.position.y - open_wrist.position.y) < 1e-5 &&
+					                std::abs(wrist.position.z - open_wrist.position.z) < 1e-5,
 					        "finger curls do not move the wrist anchor");
 					require(std::abs(joints[XRT_HAND_JOINT_MIDDLE_TIP].relation.pose.position.z - open_tip.z) > 0.001,
 					        "finger curls still animate local joints");
@@ -328,7 +353,7 @@ static int test_prediction_limit(double expected_seconds)
 	return 0;
 }
 
-int main(int argc, char ** argv)
+static int test_main(int argc, char ** argv)
 
 {
 	if (argc == 2)
@@ -402,4 +427,27 @@ int main(int argc, char ** argv)
 	require(closed == 2, "unstarted system closes after device destruction");
 	std::puts("libsurvive empty startup, live publication, roles, inactivity, reconnect and shutdown: passed");
 	return test_prediction_limit(0.05);
+}
+
+int main(int argc, char ** argv)
+{
+	const char * directory = std::getenv("WIVRN_TEST_SURVIVE_RECORDER");
+	if (directory)
+		require(survive_recording_initialize(directory), "recording initializes");
+	int result = 0;
+	if (argc == 2 && !std::strcmp(argv[1], "--recorder-stress"))
+	{
+		survive_recording_sample sample{};
+		std::strcpy(sample.serial, "synthetic-stress");
+		sample.role = XRT_DEVICE_TYPE_GENERIC_TRACKER;
+		sample.stage = "history_input";
+		sample.callback_ns = os_monotonic_get_ns();
+		sample.relation.pose.orientation.w = 1;
+		for (int i = 0; i < 100000; ++i)
+			survive_recording_submit(&sample);
+	}
+	else
+		result = test_main(argc, argv);
+	survive_recording_finish();
+	return result;
 }
