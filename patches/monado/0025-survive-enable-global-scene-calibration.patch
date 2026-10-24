@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sat, 24 Oct 2026 00:00:00 +0000
+Subject: [PATCH] survive: enable global scene calibration by default
+
+WiVRn was overriding libsurvive's default with --globalscenesolver 0.
+This prevents global scene calibration in fresh installations without saved
+base station poses, even though buttons and device configs still arrive.
+Use libsurvive's default of 1; keep SURVIVE_GLOBALSCENESOLVER as an override.
+
+---
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -1275,7 +1275,7 @@
+ 
+ DEBUG_GET_ONCE_LOG_OPTION(survive_log, "SURVIVE_LOG", U_LOGGING_WARN)
+ DEBUG_GET_ONCE_OPTION(survive_lh_gen, "SURVIVE_LH_GEN", "0")
+-DEBUG_GET_ONCE_OPTION(survive_global_scene_solver, "SURVIVE_GLOBALSCENESOLVER", "0")
++DEBUG_GET_ONCE_OPTION(survive_global_scene_solver, "SURVIVE_GLOBALSCENESOLVER", "1")
+ 
+ static void
+ add_device(struct survive_system *ss, const struct SurviveSimpleConfigEvent *e)

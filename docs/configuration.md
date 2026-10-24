@@ -175,8 +175,12 @@ Enables Lighthouse controllers and trackers through libsurvive. In the dashboard
 select **Advanced options → Lighthouse backend → libsurvive** and
 restart the internal Monado runtime to apply changes. Controllers and trackers can be added
 while the runtime is running, including when no devices were present at startup.
-Reconnecting the same serial reuses its OpenXR device. An external tool such as
-motoc is needed for calibration.
+Reconnecting the same serial reuses its OpenXR device.
+The libsurvive global scene solver is enabled by default to establish base
+station calibration when none is saved. `SURVIVE_GLOBALSCENESOLVER=0` explicitly
+disables it. Button input alone does not establish optical tracking; base station
+calibration must complete before usable poses are available. After that, an external
+tool such as motoc aligns Lighthouse space with the headset tracking space.
 
 The libsurvive simple API does not report disconnections. After two seconds without
 pose or button events, WiVRn marks inputs and poses inactive and releases controller
