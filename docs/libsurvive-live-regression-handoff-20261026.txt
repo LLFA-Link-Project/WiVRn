@@ -1,0 +1,153 @@
+WiVRn → libsurvive: severe live tracking regression report, 2026-10-26
+
+User feedback
+The new handheld constraint build felt substantially worse than before for all
+devices, including Index controllers. Desk-static was sometimes as tolerable
+as before. The user confirms base station positions have not been changed
+since the 2026-10-24 successful tracking session. Physical BS movement must
+not be assumed to explain the estimated lighthouse pose changes below.
+
+Live source (original recording unchanged)
+/home/reina/LH-Dump/2026-10-25_235403_libsurvive_402193931_1505902
+Normal exit 0. Complete manifest, 4,964,641 native lines without malformed
+records; JSONL attempted=enqueued=written=722,753, dropped=unwritten=0.
+No additional prediction: configured clamp 0 ms and all recorded effective
+prediction horizons are zero. Raw input loss is not independently measured.
+
+Verified rollout, not a mixed-library or stale-profile assumption
+WiVRn 552c5ed8 / Monado 40bf582ae / libsurvive 176473d (7efb618+b769138).
+All 13 recorded loaded core/plugin paths are in the dedicated tracker-constraints
+prefix, and their current SHA values match the recorded values. No tracked
+source diff was embedded. The new profile's ten requested native OPTION values
+match, including angular process noise 60, minimize-state-space 0, bias Q 1e-8,
+ramp .5, gyro scale .02, velocity sigma .1, guard .5, controller extension OFF,
+and observation quaternion alignment OFF. The B=.6 trial was not active.
+Initial calibration matches the immutable successful libsurvive snapshot:
+c0fd8d7485628f0471b3001e13786cf092bfb06ce66bd384d0740188087dd9da
+
+Device identities in this recording
+WM0 = LHR-DF24384D, right Index
+WM1 = LHR-F39A0C97, left Index
+WM2 = LHR-C6F86C46, VIVE Tracker Pro MV
+Use serials; codenames differ between recordings.
+
+Live observations
+Paired guided markers exist for all eight steps. Exclude one second at each
+boundary. Below are native receive-time windows mapped from CLOCK_MONOTONIC
+using INPUT_TIME receive epoch_us anchors plus clock_sync samples.
+These are not physical ground-truth position error measurements.
+
+Tracker raw POSE_STATE:
+- Desk-static ~121.963-131.968 s: positional radial RMS ~0.025 mm, maximum
+  adjacent position step ~0.010 mm. Static behavior alone hides the failure.
+- Slow translation ~227.999-241.006 s: maximum adjacent step 0.711024 m,
+  maximum adjacent orientation change 133.56 degrees (different pair).
+- Held after Index ~315.331-325.336 s: maximum adjacent step 0.970903 m,
+  maximum adjacent orientation change 115.50 degrees (different pair).
+The same 0.711024 m and 0.970903 m steps appear in Monado backend_received.
+This failure is already present before Monado frame conversion/history/clamp.
+Whole-window spread during hand movement includes intended motion and must
+not be used as pure jitter/error. Do not claim centimeter accuracy from it.
+
+Exact Tracker pairs for upstream inspection:
+1) receive 236.136018 -> 236.140010 s,
+   ticks 11997105920 -> 11997297920 at 48 MHz:
+   step .711023656 m, rotation 14.34194 degrees in the same pair.
+   Latest preceding calibrated gyro [-.007728,.082117,.003506] rad/s.
+2) receive 318.493330 -> 318.499418 s,
+   ticks 15950348800 -> 15950540800 at 48 MHz:
+   step .970903497 m, rotation 52.07051 degrees in the same pair.
+   Latest preceding calibrated gyro [-.173909,-.119218,-1.533671] rad/s.
+Recorded receive spacing and sensor spacing are distinct clocks.
+
+Index discontinuities also exist in native output. During the slow-rotation
+Tracker step the right Index has an adjacent step up to ~.110741 m / an
+orientation step up to 55.21 degrees, with calibrated gyro p95 ~.010 rad/s.
+These maxima are separate pairs. Tracker-only policy scope does not prove
+that the user could not experience controller deterioration through shared
+calibration changes or existing controller estimation faults.
+
+Shared calibration changes
+Although the initial calibration snapshot is fixed, live GSS remains enabled.
+There are 19 MPFIT success messages, alongside GSS_QUALITY and Global solve
+messages. Lighthouse estimates are repeatedly refined during the trial.
+Final relative to initial config positions change about 80.68, 19.42, 64.50 mm;
+orientations about 1.925, 2.563, .813 degrees for LH indices 0/1/2.
+Recorded LH_POSE ranges from their first pose reach about .201, .019, .232 m.
+These are emitted estimates, not proof of BS physical movement or valid
+calibration. Getter interpolation/shared-state races may affect emitted
+LH_POSE samples; the recording mutex does not protect all BSD state.
+
+Do not assert the two largest Tracker jumps coincide with an immediate GSS
+adoption: the nearest MPFIT success is ~15.97 s before the .711 m jump and
+~57.91 s before the .971 m jump. Bad current calibration could still influence
+subsequent optical corrections; temporal proximity alone does not establish
+or exclude that mechanism. The log also reports unknown-object events;
+those messages alone are not proof that tracker/controller poses were dropped.
+
+Controlled raw-input replays
+Derived raw input includes only CONFIG, IMU_SCALES, i, Y, W, B. All recorded
+output poses, LH_POSE, calibrated IMU and OPTION records are excluded. Gzip
+is read through EOF/CRC; original files are not modified.
+Same binary, same initial calibration, serial posers, playback-factor 0,
+GSS=0, no automatic floor update, bias Q/state dimension/recording held equal.
+Only ramp and gyro-scale differ between new and legacy conditions.
+This isolates the stationary constraints but does NOT reproduce live worker
+scheduling or the live sequence of adopted GSS solutions.
+
+Tracker maximum adjacent position steps in the replay:
+                                  new       legacy
+slow translation                 1113.290 mm 1113.657 mm
+held after Index                  407.825 mm  409.001 mm
+slow motion after Index            437.495 mm  437.837 mm
+Both conditions have respectively 23, 14, 8 steps over 50 mm in these windows.
+All left and right Index raw pose/tick hashes are exactly identical between
+new and legacy; Tracker hashes differ. Restoring these two constraint values
+alone does not remove this recording's large jumps in fixed-calibration replay.
+This does not establish that the new policy cannot worsen live shared GSS
+calibration. A matching legacy live trial has not yet been requested.
+
+Local evidence and reproducibility
+/home/reina/WiVRn/build-dashboard/diagnostics/tracker-regression-20261026/
+  conditions-and-feedback.json, validation.json
+  analyze.py, native-analysis.json, analysis.json
+  monado_windows.py, monado-window-analysis.json
+  inspect-native.py, native-discontinuities-and-calibration.json
+  replay.py, replay-input.json, raw-input.rec.gz, replay-runs.json
+  compare-replays.py, replay-comparison.json
+  replay-new/, replay-legacy/, replay-old-source/ (config, output, logs, argv)
+
+Prioritize optical pose correction/reseed behavior, initial calibration quality
+for these current observations, shared GSS evolution, and bias/covariance state
+around the exact tick pairs. Keep input clock domains and pose reference points
+distinct. Do not add Monado smoothing/prediction clamps to hide these native
+jumps, treat all BS estimates as valid, or enable the excluded quaternion/
+controller experiments as an unexplained fix. New-policy adoption remains
+unconfirmed in live use, and should not be described as a tracking improvement.
+
+Additional control: pre-update source
+Built survive-cli from the existing WiVRn dependency copy of 9f3919c, without
+installing over either runtime prefix or modifying ~/libsurvive. Replayed the
+same derived raw input and initial snapshot under the same GSS=0 / serial /
+full-state / Q / recording settings. The six new options were omitted because
+they do not exist in that source.
+Every device's full raw IMU pose/tick hash is EXACTLY IDENTICAL to the current
+176473d legacy-constraint replay. The old code therefore also produces the
+same 1.113657 m maximum Tracker step in the slow-translation window, and the
+same later discontinuities under these replay conditions. This is stronger
+than comparing only aggregate RMS, but is not evidence that live shared GSS
+behavior could not have regressed through new Tracker state evolution.
+
+Offline recording validation returned valid=true with no issues. This checks
+capture integrity/metadata/clock/pose accounting, not tracking quality. The
+large native discontinuities are not excused by a passing recording validator.
+
+Rollout status / next step
+Do not call the new policy validated for live improvement from this trial.
+Changing only ramp/gyro-scale is not supported as a complete fix by these
+controls. Original recording plus the exact tick pairs and controlled replay
+artifacts are ready for libsurvive-side investigation. No additional live
+trial is required merely to establish that this failure exists. A future
+live GSS/fixed-calibration comparison would be a distinct, labelled experiment,
+not a silent change to the existing new/legacy protocol.
+No tracking/runtime defaults were changed in WiVRn during this investigation.
