@@ -1,0 +1,103 @@
+WiVRn → libsurvive: live A/B feedback, 2026-10-25
+
+Decision
+The user reports B is erratic and A feels better overall. Do not adopt 0.6
+as the default angular process weight on the strength of the earlier replay.
+This is one live run per condition, not a controlled ground-truth benchmark.
+A also contains large pose discontinuities; preferring A does not resolve those.
+
+Recordings (original files left unchanged)
+A: /home/reina/LH-Dump/2026-10-25_211424_libsurvive_158643023_1366788
+B: /home/reina/LH-Dump/2026-10-25_212950_libsurvive_116099164_1379517
+
+Conditions verified
+Both use WiVRn 46cfb894 / Monado 665a27102 / libsurvive 9f3919c.
+Build provenance matches, as do the current SHA-256 hashes of 13 loaded core/plugin
+paths. Initial calibration snapshots both have SHA-256:
+c0fd8d7485628f0471b3001e13786cf092bfb06ce66bd384d0740188087dd9da
+Native OPTION differences are only record/configfile paths and angular process
+weight 60 (A) versus 0.6 (B). Both have minimize-state-space=0 and gyro/acc bias
+process weights 1e-8. Configured and recorded effective additional prediction=0.
+Do not compare object codenames directly: the Tracker is WM2 in A, WM1 in B;
+left Index is WM1 in A, WM2 in B. Serial identity must be used.
+
+Capture quality and shutdown
+A: killed with SIGKILL after server failed to finish shutdown. Manifest remains
+recording, pose_status remains its initial placeholder, both gzip streams have
+missing EOF trailers. About 311 seconds / 666,983 complete JSONL records can be
+read. These are prefix observations; final queue-loss accounting and full CRC
+verification are unavailable. Do not change the original manifest to complete.
+No NUL/malformed native record was found in the readable prefix.
+B: normal server exit 0, complete manifest, offline validate passes. Native
+3,764,450 lines, no malformed records; JSONL attempted=enqueued=written=588,937,
+dropped=unwritten=0, no writer error. Native input loss remains unmeasured.
+B ending normally does not establish that A's shutdown hang is fixed.
+
+Markers and clock mapping
+A has 6 manual start markers and lacks some ends. B has all 8 guided start/end
+pairs. A/B motions and durations are not identical. Windows trim one second
+from each available boundary. A ends are inferred from the next marker.
+Native receive time is mapped to CLOCK_MONOTONIC via the first 32 INPUT_TIME
+receive epoch_us samples and sampled CLOCK_REALTIME-MONOTONIC offset. Sensor
+pose timestamps are a different clock and must not be substituted for receive
+time. Local analysis saves the anchor spread. No physical sensor-to-render
+latency is claimed from callback-minus-estimated-pose timing.
+
+Observed native raw IMU pose (POSE_STATE, full precision)
+Tracker LHR-C6F86C46 during labelled desk-static windows:
+A: positional radial RMS about 0.025 mm; B: about 0.308 mm.
+This is within-window scatter, not absolute accuracy or a pure high-frequency
+jitter score. Drift contributes; the two runs differ in motion history.
+During hand motion, whole-window scatter includes intentional movement and
+must not be described as tracking error or used to rank jitter by itself.
+Native output remains approximately 248-251 Hz during examined windows.
+
+B right Index LHR-DF24384D after high-speed rotation:
+The user placed Index down before picking up the Tracker. In the labelled
+tracker-held-after-index window (~221.5-231.5 native receive seconds after
+trimming), raw IMU position has an adjacent-output jump as large as 0.722 m;
+maximum adjacent orientation change is about 117.85 degrees. Calibrated gyro
+norm p95 in this interval is only about 0.010 rad/s.
+The largest position step is at native receive 227.661260 -> 227.663256 s
+(sensor ticks 13721373952 -> 13721566208, 48 MHz), with 20.61 degrees
+rotation in that same step. The 117.85-degree maximum is a different pair.
+The latest preceding calibrated gyro is [0.004116, 0.005094, 0.001065] rad/s.
+An independent Monado backend_received scan observes the same 0.722 m
+position step and the same window maximum orientation step of 117.85 degrees.
+
+These discontinuities already exist in POSE_STATE before Monado conversion,
+history or prediction; the native POSE records also show large jumps.
+B also has some large Index jumps before/after this interval. A contains large
+Index orientation jumps too, so the issue is not exclusive to B.
+Interpretation: a low angular process weight is not demonstrated to improve
+live tracking and may behave badly after dynamic motion. Optical observations,
+filter corrections, scene updates and bias state need investigation; this
+record does not establish which one causes the discontinuities.
+
+B has a GSS failed-candidate diagnostic at about 214.8598 s:
+status=2, optical_rms_rad=0.117434852, object_gravity_rms_deg=31.3289629.
+Do not treat that candidate as accepted calibration without checking adoption.
+No single-pose accelerometer renormalization, extra prediction clamp, coordinate
+transform change, or new filter default has been introduced for these results.
+
+Local reproducible analysis and details
+/home/reina/WiVRn/build-dashboard/diagnostics/handheld-review-20261025/
+  analyze.py, analysis.json, monado_windows.py, monado-window-analysis.json,
+  user-feedback.json
+/home/reina/WiVRn/build-dashboard/diagnostics/handheld-review-B-20261025/
+  analyze.py, analysis.json, monado_windows.py, monado-window-analysis.json,
+  comparison-conditions.json, validation.json,
+  B-right-index-post-fast-jump.json
+Scripts operate read-only on recordings. The B jump JSON contains the exact
+adjacent raw poses/ticks and latest preceding calibrated IMU sample. The
+Monado window report is independent of native receive-time alignment.
+
+Suggested next investigation
+Use the serial/tick-identified B post-fast segment to inspect optical correction
+innovations, covariance, quaternion correction and reset/reseed decisions;
+compare the filter's pose derivative with calibrated gyro, keeping physical
+motion distinct from correction-induced output changes. Include A's existing
+Index jumps as well. Preserve good fixed calibration and existing Monado math.
+Keep 60 as the preferred live condition for now; do not describe it as solved.
+For another shutdown hang, collect all thread stacks before SIGKILL. The A log
+alone does not identify the blocked lock or thread.
