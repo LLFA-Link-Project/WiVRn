@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Launch and mark fixed-calibration libsurvive Tracker constraint comparisons."""
+import argparse
+import hashlib
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[2]
+BASELINE = ROOT/'build-dashboard/diagnostics/handheld-angular-comparison-20261024/baseline.json'
+BASELINE_SHA = 'c0fd8d7485628f0471b3001e13786cf092bfb06ce66bd384d0740188087dd9da'
+STEPS = [
+    ('tracker-desk', 'Tracker を台に置く。置いた直後からの落ち着き方も観察', 12),
+    ('tracker-held', 'Tracker を手に持ち、自然な小さな動きで観察', 12),
+    ('slow-translation', '回転させず、数mm〜数cmゆっくり並進・停止・逆転', 15),
+    ('slow-rotation', '小さな回転を伴う動き。向きを変えた前後の滑りの方向も観察', 15),
+    ('index-fast', 'Tracker は台へ。右 Index を前回と同じように高速回転', 10),
+    ('index-down', '右 Index を台に置き、復帰と静止を観察', 12),
+    ('tracker-held-after-index', 'Tracker を手に持ち、小さな自然な動きを観察', 12),
+    ('slow-motion-after-index', 'Tracker の小さな並進・回転・停止・逆転を再度観察', 15),
+]
+
+
+def owner_config():
+    path = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home()/'.config')))/'wivrn/config.json'
+    config = json.loads(path.read_text())
+    if not config.get('use-survive') or config.get('lh-max-extrapolation') != 0 or not config.get('lighthouse-recording', {}).get('enabled'):
+        raise ValueError('ダッシュボードで libsurvive・記録有効・予測 clamp 0 ms にしてください。')
+    return config
+
+
+def start(args):
+    config = owner_config()
+    dashboard = ROOT/'build-dashboard/server/wivrn-dashboard'
+    if not dashboard.is_file():
+        raise ValueError('build-dashboard のダッシュボードがありません。先にビルドしてください。')
+    baseline = None
+    if not args.fresh:
+        baseline = BASELINE.read_bytes()
+        if hashlib.sha256(baseline).hexdigest() != BASELINE_SHA:
+            raise ValueError('固定較正の SHA が予定した snapshot と異なります。')
+    trial = Path(tempfile.mkdtemp(prefix=f'wivrn-survive-constraints-{args.condition}-'))
+    calibration = trial/'config.json'
+    if baseline is not None:
+        calibration.write_bytes(baseline)
+        calibration.chmod(0o600)
+    env = dict(os.environ)
+    for name in ('WIVRN_SURVIVE_BIAS_COMPARISON', 'WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON', 'SURVIVE_INIT_CONFIGFILE'):
+        env.pop(name, None)
+    env.update(WIVRN_SURVIVE_TRACKER_CONSTRAINTS=args.condition, SURVIVE_CONFIGFILE=str(calibration))
+    print(json.dumps(dict(condition=args.condition, calibration='fresh' if args.fresh else 'fixed-snapshot',
+                          initial_sha256=None if args.fresh else BASELINE_SHA,
+                          configfile=str(calibration), dashboard=str(dashboard),
+                          recording=config['lighthouse-recording']), ensure_ascii=False, indent=2), flush=True)
+    if not args.dry_run:
+        os.chdir(ROOT)
+        os.execvpe(str(dashboard), [str(dashboard)], env)
+
+
+def mark(args):
+    config = owner_config()
+    folder = Path(config['lighthouse-recording']['output-directory']).expanduser()
+    candidates = []
+    for session in folder.glob('*_libsurvive_*'):
+        try:
+            manifest = json.loads((session/'manifest.json').read_text())
+            settings = json.loads((session/'survive-settings.json').read_text())
+            if manifest.get('status') == 'recording' and settings.get('tracker_constraints_comparison') == args.condition:
+                candidates.append(session)
+        except (OSError, ValueError):
+            continue
+    if not candidates:
+        raise ValueError(f'{args.condition} の記録が見つかりません。先にその条件で起動・接続してください。')
+    session = max(candidates, key=lambda p: (p/'survive-settings.json').stat().st_mtime_ns)
+    recorder = importlib.machinery.SourceFileLoader('lh_recorder', str(ROOT/'tools/lh-recorder/lh-recorder')).load_module()
+    print(f'条件: {args.condition}\n記録先: {session}', flush=True)
+    recorder.mark_scene(session, 'tracker-constraints-condition:'+args.condition)
+    for label, instruction, seconds in STEPS:
+        input(f'\n{instruction}。準備できたら Enter、その後{seconds}秒実施 > ')
+        recorder.mark_scene(session, label+'-start')
+        print(f'記録中… {seconds}秒', flush=True)
+        time.sleep(seconds)
+        recorder.mark_scene(session, label+'-end')
+        print('区間終了。', flush=True)
+    recorder.mark_scene(session, 'test-end')
+    print('全区間終了。ジッター・始動遅れ・微動の消失・停止後の滑り・Indexの復帰を別々に評価してください。')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    launch = sub.add_parser('start', help='server/dashboard を終了後に実行')
+    launch.add_argument('condition', choices=('new', 'legacy'))
+    launch.add_argument('--fresh', action='store_true', help='固定較正の比較後に使う、別の新規較正試行')
+    launch.add_argument('--dry-run', action='store_true', help='試行 config を準備して表示。起動しない')
+    markers = sub.add_parser('mark', help='接続後、別ターミナルで実行')
+    markers.add_argument('condition', choices=('new', 'legacy'))
+    args = parser.parse_args()
+    try:
+        (start if args.command == 'start' else mark)(args)
+    except (ValueError, OSError) as e:
+        parser.exit(1, str(e)+'\n')
+    except (KeyboardInterrupt, EOFError):
+        print('\n案内を中断しました。保存済みマーカーは残ります。server は停止しません。')
+
+
+if __name__ == '__main__':
+    main()

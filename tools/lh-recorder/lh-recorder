@@ -323,7 +323,7 @@ def validate_survive(session, write=True):
             try: effective = float(integrity['options'][key])
             except (ValueError, KeyError): effective = math.nan
             if effective != expected: issues.add('trial_option_mismatch: '+key)
-        if settings.get('angular_noise_comparison') and manifest.get('configuration', {}).get('lh-max-extrapolation') != 0:
+        if (settings.get('angular_noise_comparison') or settings.get('tracker_constraints_comparison')) and manifest.get('configuration', {}).get('lh-max-extrapolation') != 0:
             issues.add('trial_requires_zero_clamp')
         for required in ('CONFIG', 'i', 'I', 'B', 'POSE', 'POSE_TIMING', 'POSE_STATE', 'POSE_BIAS'):
             if not tags.get(required): issues.add('missing_native_tag: '+required)

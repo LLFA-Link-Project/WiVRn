@@ -1,0 +1,113 @@
+From 40bf582ae62f389b82aa9a618b20e361f90fd13d Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Sun, 25 Oct 2026 23:42:13 +0900
+Subject: [PATCH] survive: configure full bias state and Tracker constraint
+ trials
+
+---
+ src/xrt/drivers/survive/survive_driver.c      |  2 +
+ src/xrt/drivers/survive/survive_recording.cpp | 68 +++++++++++++++----
+ 2 files changed, 57 insertions(+), 13 deletions(-)
+
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+index ed778e931..405e547f6 100644
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -1548,6 +1548,8 @@ survive_get_devices_internal(struct xrt_prober *xp, struct xrt_device **out_xdev
+ 	    "Monado-libsurvive", "--lighthouse-gen", (char *)debug_get_option_survive_lh_gen(),
+ 		"--globalscenesolver", (char*)debug_get_option_survive_global_scene_solver(),
+ 	    "--report-in-imu", "1",
++	    // Preserve learned IMU bias states for the handheld tracking policy.
++	    "--kalman-minimize-state-space", "0",
+ 	    //"--time-window", "1500000"
+ 	    //"--use-imu", "0",
+ 	    //"--use-kalman", "0"
+diff --git a/src/xrt/drivers/survive/survive_recording.cpp b/src/xrt/drivers/survive/survive_recording.cpp
+index 71b107602..c341012f3 100644
+--- a/src/xrt/drivers/survive/survive_recording.cpp
++++ b/src/xrt/drivers/survive/survive_recording.cpp
+@@ -281,6 +281,47 @@ survive_recording_init_context(int argc, char **argv)
+ 		const char *comparison = std::getenv("WIVRN_SURVIVE_BIAS_COMPARISON");
+ 		const char *angular = std::getenv("WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON");
+ 		const bool angular_trial = angular && *angular;
++		const char *constraints = std::getenv("WIVRN_SURVIVE_TRACKER_CONSTRAINTS");
++		const bool constraints_trial = constraints && *constraints;
++		json constraints_options = nullptr;
++		if (constraints_trial) {
++			if (std::strcmp(constraints, "new") && std::strcmp(constraints, "legacy"))
++				throw std::runtime_error("tracker constraints must be new or legacy");
++			if (angular_trial || (comparison && *comparison))
++				throw std::runtime_error(
++				    "do not combine tracker constraints with angular/bias comparisons");
++			const bool legacy = std::strcmp(constraints, "legacy") == 0;
++			constraints_options = {{"process-weight-ang-vel", 60},
++			                       {"kalman-minimize-state-space", 0},
++			                       {"process-weight-acc-bias", 1e-8},
++			                       {"process-weight-gyro-bias", 1e-8},
++			                       {"kalman-zvu-stationary-ramp", legacy ? 0. : .5},
++			                       {"kalman-zvu-stationary-gyro-scale", legacy ? 0. : .02},
++			                       {"kalman-zvu-stationary-velocity-sigma", .1},
++			                       {"kalman-zvu-motion-guard-time", .5},
++			                       {"kalman-zvu-motion-all-devices", 0},
++			                       {"kalman-align-observation-quaternion", 0}};
++			for (const auto &item : constraints_options.items()) {
++				std::string env = "SURVIVE_" + item.key();
++				for (auto &c : env)
++					c = std::toupper(static_cast<unsigned char>(c));
++				if (const char *value = std::getenv(env.c_str())) {
++					char *end = nullptr;
++					double actual = std::strtod(value, &end);
++					if (end == value || *end || actual != item.value().get<double>())
++						throw std::runtime_error("conflicting trial environment: " + env);
++				}
++				std::string flag = "--" + item.key(), value = item.value().dump();
++				bool found = false;
++				for (size_t i = 1; i + 1 < args.size(); ++i)
++					if (args[i] == flag) {
++						args[i + 1] = value;
++						found = true;
++					}
++				if (!found)
++					args.insert(args.end(), {flag, value});
++			}
++		}
+ 		if (angular_trial) {
+ 			if (std::strcmp(angular, "A") && std::strcmp(angular, "B"))
+ 				throw std::runtime_error("angular comparison must be A or B");
+@@ -317,19 +358,20 @@ survive_recording_init_context(int argc, char **argv)
+ 		std::string config_path = configuration_snapshot_path(config_argument).string();
+ 		if (std::filesystem::is_regular_file(config_path))
+ 			std::filesystem::copy_file(config_path, r->directory + "/calibration.initial.json");
+-		json settings = {{"source", "libsurvive"},
+-		                 {"configfile", config_path},
+-		                 {"configfile_argument", config_argument},
+-		                 {"bias_comparison", comparison ? json(comparison) : json(nullptr)},
+-		                 {"angular_noise_comparison", angular_trial ? json(angular) : json(nullptr)},
+-		                 {"expected_trial_options",
+-		                  angular_trial
+-		                      ? json{{"kalman-minimize-state-space", 0},
+-		                             {"process-weight-gyro-bias", 1e-8},
+-		                             {"process-weight-acc-bias", 1e-8},
+-		                             {"process-weight-ang-vel", std::strcmp(angular, "A") == 0 ? 60. : .6}}
+-		                      : json(nullptr)},
+-		                 {"estimator_settings_changed", (comparison && *comparison) || angular_trial}};
++		json settings = {
++		    {"source", "libsurvive"},
++		    {"configfile", config_path},
++		    {"configfile_argument", config_argument},
++		    {"bias_comparison", comparison ? json(comparison) : json(nullptr)},
++		    {"angular_noise_comparison", angular_trial ? json(angular) : json(nullptr)},
++		    {"tracker_constraints_comparison", constraints_trial ? json(constraints) : json(nullptr)},
++		    {"expected_trial_options",
++		     angular_trial ? json{{"kalman-minimize-state-space", 0},
++		                          {"process-weight-gyro-bias", 1e-8},
++		                          {"process-weight-acc-bias", 1e-8},
++		                          {"process-weight-ang-vel", std::strcmp(angular, "A") == 0 ? 60. : .6}}
++		                   : constraints_options},
++		    {"estimator_settings_changed", (comparison && *comparison) || angular_trial || constraints_trial}};
+ 		args.insert(args.end(),
+ 		            {"--configfile", config_argument, "--record", r->directory + "/native.rec.gz",
+ 		             "--record-imu", "1", "--record-cal-imu", "1", "--record-rawlight", "1", "--record-angle",
+-- 
+2.56.0
+

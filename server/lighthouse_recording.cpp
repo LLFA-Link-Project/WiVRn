@@ -361,7 +361,7 @@ public:
 				}
 				manifest["trial_effective_options"] = actual;
 				if (manifest["configuration"]["lh-max-extrapolation"] != 0)
-					errors.push_back("Angular noise trial requires prediction clamp 0 ms");
+					errors.push_back("Tracking comparison requires prediction clamp 0 ms");
 			}
 			if (!settings.is_object())
 				errors.push_back("libsurvive settings snapshot missing");

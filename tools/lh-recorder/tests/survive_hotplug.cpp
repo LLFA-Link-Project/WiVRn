@@ -47,10 +47,17 @@ extern "C"
 			std::fprintf(stderr, "FAIL: request IMU poses to match IMU velocities\n");
 			std::abort();
 		}
+		bool full_state = false;
+		for (int i = 1; i + 1 < argc; ++i)
+			if (!std::strcmp(argv[i], "--kalman-minimize-state-space") && !std::strcmp(argv[i + 1], "0"))
+				full_state = true;
+		if (!full_state)
+			std::abort();
 		if (!survive_recording_enabled())
 			for (int i = 1; i < argc; ++i)
 				if (!std::strcmp(argv[i], "--process-weight-ang-vel") ||
-				    !std::strcmp(argv[i], "--process-weight-gyro-bias"))
+				    !std::strcmp(argv[i], "--process-weight-gyro-bias") ||
+				    !std::strcmp(argv[i], "--kalman-zvu-stationary-ramp"))
 					std::abort();
 		if (survive_recording_enabled())
 		{
