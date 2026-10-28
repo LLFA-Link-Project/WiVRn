@@ -36,18 +36,11 @@ int main(int argc, char ** argv)
 	                                                                                                                                                          : make_synthetic_capture);
 	wivrn::start_lighthouse_recording(snapshot);
 #if WIVRN_FEATURE_SURVIVE
-	if (argc == 3 && (std::string_view(argv[2]) == "survive-empty" || std::string_view(argv[2]) == "survive-corrupt" || std::string_view(argv[2]) == "survive-reject"))
+	if (argc == 3 && (std::string_view(argv[2]) == "survive-empty" || std::string_view(argv[2]) == "survive-corrupt"))
 	{
 		char name[] = "empty-replay", playback[] = "--playback", file[] = "/dev/null", gss[] = "--globalscenesolver", yes[] = "1", state[] = "--kalman-minimize-state-space", zero[] = "0";
 		char * args[] = {name, playback, file, gss, yes, state, zero};
 		auto * ctx = survive_recording_init_context(7, args);
-		if (std::string_view(argv[2]) == "survive-reject")
-		{
-			if (ctx)
-				throw std::runtime_error("conflicting comparison unexpectedly initialized");
-			wivrn::stop_lighthouse_recording(0);
-			return 0;
-		}
 		if (!ctx)
 			throw std::runtime_error("native replay init failed");
 		survive_simple_close(ctx);

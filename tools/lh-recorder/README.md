@@ -31,7 +31,5 @@ usbmon の権限は不要です。詳しくは [libsurvive の記録・比較手
 手持ちジッターの角速度プロセス雑音 A/B と native 記録の部分文法検査は
 [比較手順](../../docs/libsurvive-handheld-jitter-ab-20261024.md)を参照。
 
-2026-10-25 の Tracker 静止拘束比較は `lh-tracker-test start new` / `mark new` を使います。
-旧拘束は `legacy`、新規較正の別試行は `start new --fresh`。
-[反映内容と実測手順](../../docs/libsurvive-tracker-constraints-20261025.txt)を参照してください。
-旧角速度比較の A/B とは異なり、角速度雑音は両条件とも 60 です。
+Tracker 静止拘束の比較手順は、使用していたオプションが現行libsurviveにないため削除しました。
+過去の実測記録は参考資料として残していますが、現行環境では同じ試行を実行できません。

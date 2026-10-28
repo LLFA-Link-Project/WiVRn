@@ -1,0 +1,25 @@
+From 7714f8cf81a8a0eeb99a5020e38911590023a9f8 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Wed, 28 Oct 2026 17:07:21 +0900
+Subject: [PATCH] survive: preserve full bias state
+
+---
+ src/xrt/drivers/survive/survive_driver.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/xrt/drivers/survive/survive_driver.c b/src/xrt/drivers/survive/survive_driver.c
+index ed778e931..b841584d0 100644
+--- a/src/xrt/drivers/survive/survive_driver.c
++++ b/src/xrt/drivers/survive/survive_driver.c
+@@ -1548,6 +1548,8 @@ survive_get_devices_internal(struct xrt_prober *xp, struct xrt_device **out_xdev
+ 	    "Monado-libsurvive", "--lighthouse-gen", (char *)debug_get_option_survive_lh_gen(),
+ 		"--globalscenesolver", (char*)debug_get_option_survive_global_scene_solver(),
+ 	    "--report-in-imu", "1",
++	    // Preserve learned IMU bias states.
++	    "--kalman-minimize-state-space", "0",
+ 	    //"--time-window", "1500000"
+ 	    //"--use-imu", "0",
+ 	    //"--use-kalman", "0"
+-- 
+2.56.0
+

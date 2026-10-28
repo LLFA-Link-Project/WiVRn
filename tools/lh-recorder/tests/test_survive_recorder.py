@@ -14,13 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 r = importlib.machinery.SourceFileLoader('survive_recorder', str(ROOT/'lh-recorder')).load_module()
 
 
-def tracking_options(mode='new'):
+def supported_trial_options():
     return {'process-weight-ang-vel':60,'kalman-minimize-state-space':0,
-            'process-weight-acc-bias':1e-8,'process-weight-gyro-bias':1e-8,
-            'kalman-zvu-stationary-ramp':0 if mode=='legacy' else .5,
-            'kalman-zvu-stationary-gyro-scale':0 if mode=='legacy' else .02,
-            'kalman-zvu-stationary-velocity-sigma':.1,'kalman-zvu-motion-guard-time':.5,
-            'kalman-zvu-motion-all-devices':0,'kalman-align-observation-quaternion':0}
+            'process-weight-acc-bias':1e-8,'process-weight-gyro-bias':1e-8}
 
 
 def fixture(path):
@@ -41,7 +37,7 @@ def fixture(path):
     with gzip.open(path/'poses.jsonl.gz', 'wt') as f:
         for p in poses: f.write(json.dumps(p)+'\n')
     with gzip.open(path/'native.rec.gz', 'wt') as f:
-        for tag in ('CONFIG', 'i', 'I', 'B', 'POSE', 'POSE_TIMING', 'POSE_STATE', 'POSE_BIAS'):
+        for tag in ('CONFIG', 'i', 'I', 'B', 'POSE'):
             payload = '{}' if tag == 'CONFIG' else ' '.join(['0']*r.NATIVE_NUMERIC_FIELDS[tag])
             f.write(f'0.01 WM5 {tag} {payload}\n')
     r.dump(path/'pose_status.json', dict(stopped=True, context_initialized=True, written=3, enqueued=3, attempted=3, dropped=0, error=''))
@@ -65,7 +61,7 @@ class ValidationTests(unittest.TestCase):
             r.dump(path/'pose_status.json', status)
             result = r.validate(path, write=False)
             self.assertFalse(result['valid'])
-            self.assertIn('missing_native_tag: POSE_STATE', result['issues'])
+            self.assertIn('missing_native_tag: POSE', result['issues'])
             self.assertIn('pose_records_dropped', result['issues'])
 
     def test_backend_mislabelling_and_zero_clamp_fail(self):
@@ -124,13 +120,11 @@ class ValidationTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('LH_SURVIVE_HARNESS'), 'requires built Monado adapter harness')
 class AdapterTests(unittest.TestCase):
-    def run_harness(self, path, clamp='0', bias=None, angular=None, constraints=None):
+    def run_harness(self, path, clamp='0', bias=None, angular=None):
         env = dict(os.environ, WIVRN_TEST_SURVIVE_RECORDER=str(path), LH_MAX_EXTRAPOLATION_MS=clamp,
                    SURVIVE_CONFIGFILE=str(path/'config.json'))
         env.pop('WIVRN_SURVIVE_BIAS_COMPARISON', None)
         env.pop('WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON', None)
-        env.pop('WIVRN_SURVIVE_TRACKER_CONSTRAINTS', None)
-        if constraints: env['WIVRN_SURVIVE_TRACKER_CONSTRAINTS'] = constraints
         if bias: env['WIVRN_SURVIVE_BIAS_COMPARISON'] = bias
         if angular: env['WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON'] = angular
         return subprocess.run([os.environ['LH_SURVIVE_HARNESS'], str(1 if clamp == '-1' else float(clamp)/1000)],
@@ -206,25 +200,10 @@ class AdapterTests(unittest.TestCase):
                 for key,value in expected.items(): self.assertEqual(float(args[args.index('--'+key)+1]),value)
 
     def test_trial_environment_ignored_without_recording(self):
-        env=dict(os.environ,WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON='B',WIVRN_SURVIVE_TRACKER_CONSTRAINTS='legacy',LH_MAX_EXTRAPOLATION_MS='50')
+        env=dict(os.environ,WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON='B',LH_MAX_EXTRAPOLATION_MS='50')
         env.pop('WIVRN_TEST_SURVIVE_RECORDER',None)
         result=subprocess.run([os.environ['LH_SURVIVE_HARNESS'],'0.05'],env=env,capture_output=True,text=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-
-    def test_tracker_constraints_compare_only_two_weights(self):
-        for mode in ('new', 'legacy'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
-                path=Path(d);(path/'config.json').write_text('fixed calibration')
-                result=self.run_harness(path,constraints=mode)
-                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-                settings=r.read(path/'survive-settings.json');argv=settings['arguments']
-                expected=tracking_options(mode)
-                self.assertEqual(settings['tracker_constraints_comparison'],mode)
-                self.assertEqual(settings['expected_trial_options'],expected)
-                self.assertEqual((path/'calibration.initial.json').read_text(),'fixed calibration')
-                for key,value in expected.items():
-                    self.assertEqual(argv.count('--'+key),1)
-                    self.assertEqual(float(argv[argv.index('--'+key)+1]),value)
 
     def test_queue_overflow_is_bounded_accounted_and_drained(self):
         with tempfile.TemporaryDirectory() as d:
@@ -271,7 +250,8 @@ class NativeLifecycleTests(unittest.TestCase):
             self.assertNotEqual(final,'"floor-offset":"0.375"\n')
             self.assertFalse((path/'config.json').exists())
             options=r.read(session/'native-options.json')
-            for key,value in tracking_options().items(): self.assertEqual(float(options[key]['value']),value)
+            defaults = supported_trial_options()
+            for key,value in defaults.items(): self.assertEqual(float(options[key]['value']),value)
 
     def test_native_seal_preserves_and_detects_nul(self):
         with tempfile.TemporaryDirectory() as d:
@@ -301,34 +281,6 @@ class NativeLifecycleTests(unittest.TestCase):
                 self.assertEqual(manifest['trial_effective_options'],expected,manifest['errors'])
                 self.assertFalse(any('Trial option mismatch' in e for e in manifest['errors']))
 
-    def test_tracker_constraints_native_effective_values(self):
-        for mode in ('new','legacy'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
-                path=Path(d)
-                r.dump(path/'owner.json',{'use-survive':True,'lh-max-extrapolation':0,'lighthouse-recording':{'enabled':True,'output-directory':str(path/'sessions')}})
-                env=dict(os.environ,SURVIVE_CONFIGFILE=str(path/'calibration.json'),WIVRN_SURVIVE_TRACKER_CONSTRAINTS=mode)
-                result=subprocess.run([os.environ['LH_STARTUP_HARNESS'],str(path/'owner.json'),'survive-empty'],env=env,capture_output=True,text=True,timeout=30)
-                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-                manifest=r.read(next((path/'sessions').iterdir())/'manifest.json')
-                self.assertEqual(manifest['trial_effective_options'],tracking_options(mode),manifest['errors'])
-
-    def test_tracker_constraints_reject_conflicting_conditions(self):
-        cases=[({'WIVRN_SURVIVE_TRACKER_CONSTRAINTS':'wrong'},'must be new or legacy'),
-               ({'WIVRN_SURVIVE_ANGULAR_NOISE_COMPARISON':'A'},'do not combine'),
-               ({'SURVIVE_PROCESS-WEIGHT-ANG-VEL':'0.6'},'conflicting trial environment'),
-               ({'SURVIVE_KALMAN-ZVU-MOTION-ALL-DEVICES':'1'},'conflicting trial environment'),
-               ({'SURVIVE_KALMAN-ALIGN-OBSERVATION-QUATERNION':'1'},'conflicting trial environment')]
-        for overrides,reason in cases:
-            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as d:
-                path=Path(d)
-                r.dump(path/'owner.json',{'use-survive':True,'lighthouse-recording':{'enabled':True,'output-directory':str(path/'sessions')}})
-                env=dict(os.environ,SURVIVE_CONFIGFILE=str(path/'calibration.json'),WIVRN_SURVIVE_TRACKER_CONSTRAINTS='new');env.update(overrides)
-                result=subprocess.run([os.environ['LH_STARTUP_HARNESS'],str(path/'owner.json'),'survive-reject'],env=env,capture_output=True,text=True,timeout=30)
-                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-                session=next((path/'sessions').iterdir())
-                self.assertIn(reason,(session/'initialization-error.txt').read_text())
-                self.assertEqual(r.read(session/'manifest.json')['status'],'abnormal')
-
     def test_real_native_no_usb_and_missing_data_not_success(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d)
@@ -349,7 +301,7 @@ class NativeLifecycleTests(unittest.TestCase):
             for obj in manifest['loaded_survive_objects']:
                 self.assertEqual(obj['sha256'], r.sha(Path(obj['path'])))
             self.assertTrue(r.native_tags(session).get('OPTION'))
-            self.assertTrue(any('POSE_STATE' in x for x in manifest['errors']))
+            self.assertTrue(any('POSE' in x for x in manifest['errors']))
             self.assertFalse(r.validate(session, write=False)['valid'])
 
 

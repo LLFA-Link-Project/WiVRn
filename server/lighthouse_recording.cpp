@@ -209,7 +209,7 @@ public:
 		int64_t effective_clamp = snapshot.lh_max_extrapolation.value_or(50);
 		if (!snapshot.lh_max_extrapolation && getenv("LH_MAX_EXTRAPOLATION_MS"))
 			effective_clamp = strtoll(getenv("LH_MAX_EXTRAPOLATION_MS"), nullptr, 10);
-		manifest = {{"schema_version", 2}, {"source", "libsurvive"}, {"pose_backend", "libsurvive"}, {"session_id", directory.filename().string()}, {"logger_version", "3.0.0"}, {"status", "recording"}, {"start_realtime_ns", timestamp(CLOCK_REALTIME)}, {"end_realtime_ns", nullptr}, {"actual_wivrn_build", WIVRN_LH_WIVRN_REV}, {"monado_revision", WIVRN_LH_MONADO_REV}, {"usb_capture_engine", nullptr}, {"raw_input", "native.rec.gz"}, {"clock_domains", {{"poses", "CLOCK_MONOTONIC"}, {"native_receive", "libsurvive recording elapsed clock"}, {"native_sensor", "device-local ticks; native POSE_TIMING specifies Hz"}}}, {"configuration", {{"lighthouse-recording", true}, {"use-survive", true}, {"lh-max-extrapolation", json(effective_clamp)}, {"inherited_clamp_env_at_start", getenv("LH_MAX_EXTRAPOLATION_MS") ? json(getenv("LH_MAX_EXTRAPOLATION_MS")) : json(nullptr)}}}, {"native_recorder", {{"synchronous", true}, {"dropped", nullptr}, {"write_error_counter", nullptr}, {"close_result", "not exposed by native recorder"}, {"logging_overhead", "not measured; do not equate recorded runs with normal uninstrumented behavior"}}}, {"files_sha256", json::object()}, {"errors", json::array()}};
+		manifest = {{"schema_version", 2}, {"source", "libsurvive"}, {"pose_backend", "libsurvive"}, {"session_id", directory.filename().string()}, {"logger_version", "3.0.0"}, {"status", "recording"}, {"start_realtime_ns", timestamp(CLOCK_REALTIME)}, {"end_realtime_ns", nullptr}, {"actual_wivrn_build", WIVRN_LH_WIVRN_REV}, {"monado_revision", WIVRN_LH_MONADO_REV}, {"usb_capture_engine", nullptr}, {"raw_input", "native.rec.gz"}, {"clock_domains", {{"poses", "CLOCK_MONOTONIC"}, {"native_receive", "libsurvive recording elapsed clock"}, {"native_sensor", nullptr}}}, {"configuration", {{"lighthouse-recording", true}, {"use-survive", true}, {"lh-max-extrapolation", json(effective_clamp)}, {"inherited_clamp_env_at_start", getenv("LH_MAX_EXTRAPOLATION_MS") ? json(getenv("LH_MAX_EXTRAPOLATION_MS")) : json(nullptr)}}}, {"native_recorder", {{"synchronous", true}, {"dropped", nullptr}, {"write_error_counter", nullptr}, {"close_result", "not exposed by native recorder"}, {"logging_overhead", "not measured; do not equate recorded runs with normal uninstrumented behavior"}}}, {"files_sha256", json::object()}, {"errors", json::array()}};
 		save(directory / "manifest.json", manifest);
 		save(directory / "wivrn-settings.json", manifest["configuration"]);
 		save(directory / "build-provenance.json", json::parse(lighthouse_build_provenance));
@@ -336,7 +336,7 @@ public:
 			if (bad_lines)
 				errors.push_back("Malformed native records: " + std::to_string(bad_lines));
 			manifest["native_tag_counts"] = tags;
-			for (const char * required: {"i", "I", "B", "POSE", "POSE_TIMING", "POSE_STATE", "POSE_BIAS"})
+			for (const char * required: {"i", "I", "B", "POSE"})
 				if (!tags.value(required, uint64_t(0)))
 					errors.push_back(std::string("Missing native diagnostic: ") + required);
 			save(directory / "native-devices.json", devices);

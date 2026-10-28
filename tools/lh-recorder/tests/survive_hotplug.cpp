@@ -56,22 +56,17 @@ extern "C"
 		if (!survive_recording_enabled())
 			for (int i = 1; i < argc; ++i)
 				if (!std::strcmp(argv[i], "--process-weight-ang-vel") ||
-				    !std::strcmp(argv[i], "--process-weight-gyro-bias") ||
-				    !std::strcmp(argv[i], "--kalman-zvu-stationary-ramp"))
+				    !std::strcmp(argv[i], "--process-weight-gyro-bias"))
 					std::abort();
 		if (survive_recording_enabled())
 		{
-			bool native = false, timing = false, state = false;
+			bool native = false;
 			for (int i = 1; i + 1 < argc; ++i)
 			{
 				if (!std::strcmp(argv[i], "--record"))
 					native = std::strstr(argv[i + 1], "native.rec.gz") != nullptr;
-				if (!std::strcmp(argv[i], "--record-pose-timing"))
-					timing = !std::strcmp(argv[i + 1], "1");
-				if (!std::strcmp(argv[i], "--record-tracking-state"))
-					state = !std::strcmp(argv[i + 1], "1");
 			}
-			if (!native || !timing || !state)
+			if (!native)
 				std::abort();
 		}
 		return &context;

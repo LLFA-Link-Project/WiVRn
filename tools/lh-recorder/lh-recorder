@@ -323,9 +323,9 @@ def validate_survive(session, write=True):
             try: effective = float(integrity['options'][key])
             except (ValueError, KeyError): effective = math.nan
             if effective != expected: issues.add('trial_option_mismatch: '+key)
-        if (settings.get('angular_noise_comparison') or settings.get('tracker_constraints_comparison')) and manifest.get('configuration', {}).get('lh-max-extrapolation') != 0:
+        if settings.get('angular_noise_comparison') and manifest.get('configuration', {}).get('lh-max-extrapolation') != 0:
             issues.add('trial_requires_zero_clamp')
-        for required in ('CONFIG', 'i', 'I', 'B', 'POSE', 'POSE_TIMING', 'POSE_STATE', 'POSE_BIAS'):
+        for required in ('CONFIG', 'i', 'I', 'B', 'POSE'):
             if not tags.get(required): issues.add('missing_native_tag: '+required)
     except (OSError, EOFError, UnicodeError) as e:
         tags = {}; issues.add('native_read_error: '+str(e))
@@ -479,7 +479,7 @@ def validate(session, write=True):
 
 def align(session):
     if read(session/'manifest.json', {}).get('source') == 'libsurvive':
-        raise ValueError('Native sensor ticks are device-local; use native POSE_TIMING and INPUT_TIME without assuming wall-clock alignment')
+        raise ValueError('This recording has no native sensor timing records to align')
     mapping = ClockMap.from_file(session/'clock_sync.jsonl')
     with gzip.open(session/'usb_timestamps.jsonl.gz', 'wt', encoding='utf-8', compresslevel=6) as output:
         for packet in pcap_records(session/'usb.pcap.gz'):

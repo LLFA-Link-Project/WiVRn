@@ -215,11 +215,11 @@ installs them under `build-survive-check/_deps/libsurvive-llfa-main-install`.
 Run it again to fetch and fast-forward that independent checkout to the latest
 local `llfa-main`. It records the exact revision in
 `build-survive-check/_deps/libsurvive-llfa-main-revision.txt`.
-The helper applies the managed Global Scene Solver shutdown fix and records its
-checksum in `libsurvive-llfa-main-patches.txt`. It removes that patch before
-updating, refuses unrelated local modifications, and skips applying the fix if
-upstream already includes it. See [the libsurvive handoff](libsurvive-shutdown-handoff.md)
-for the patch, regression test and upstream integration instructions.
+The helper builds the committed source without applying WiVRn patches and refuses
+local modifications in its dependency checkout. The Global Scene Solver shutdown
+fix is included in libsurvive `1ddd12c`; the former WiVRn patch is no longer needed.
+`libsurvive-llfa-main-patches.txt` is empty to indicate that no local patches were
+applied. See [the shutdown investigation](libsurvive-shutdown-handoff.md).
 Point WiVRn's `PKG_CONFIG_PATH` at that installation's `lib/pkgconfig` directory
 when configuring, then rebuild WiVRn. If changing an existing build to a different
 installation, clear its cached discovery paths during configuration:

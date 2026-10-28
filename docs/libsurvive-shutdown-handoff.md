@@ -1,10 +1,8 @@
 libsurvive の Codex への引き継ぎ指示書（2026-10-24）
 
-`~/libsurvive` の `llfa-main` に、Global Scene Solver の終了時デッドロック修正を取り込んでください。
-WiVRn 側では別コピーで修正・検証し、元の `~/libsurvive` の作業ツリーとブランチは変更していません。
-そちらの進行中の変更と AGENTS.md を確認し、既存の作業を保持した状態で取り込んでください。
-
-パッチ: [0002-fix-global-scene-solver-shutdown.patch](../patches/libsurvive/0002-fix-global-scene-solver-shutdown.patch)
+2026-10-28更新: Global Scene Solver の終了時デッドロック修正は、
+`~/libsurvive` の `llfa-main` に `1ddd12c` として取り込み済みです。
+WiVRn側の暫定パッチ0002と適用処理は削除しました。以下は調査・検証の記録です。
 
 - ベース: `2cdfabbcf5550a983de1c67035fcfff8ad7269cc`（作成時の `llfa-main`）。
 - 別コピーで作成したコミット: `b074556`。パッチには著者・コミットメッセージ・回帰テストを含みます。
@@ -22,14 +20,6 @@ WiVRn 側では別コピーで修正・検証し、元の `~/libsurvive` の作�
 Solver が計算後にロックを取り直せず、終了側と相互に待ち続けます。
 既存の `threaded_driver_close` と同じく、join の間だけコンテキストを解放し、join 後に取り直す修正です。
 併せて、終了後は保留中の solve を開始せず、`needsSolve` の消費を通知用ミューテックス内に移しています。
-
-取り込み例です。既存の変更と競合する場合は手動で統合し、進行中の作業を reset で消さないでください。
-
-```sh
-cd ~/libsurvive
-git status --short
-git am --3way /home/reina/WiVRn/patches/libsurvive/0002-fix-global-scene-solver-shutdown.patch
-```
 
 既存のビルドがあればそれを使用できます。独立したテスト用ビルドの例は次のとおりです。
 リプレイを使わない単体テストなので、extras データ用のディレクトリを先に作り、
@@ -59,9 +49,8 @@ ctest --test-dir build-shutdown-check -R '^global_scene_solver$' \
 その場合は、計算結果をキャリブレーションへ反映しないこと、姿勢の内部表現と共分散処理を
 中断時にも整合させること、join 前に ctx/オブジェクト/シーンを解放しないことを確認してください。
 
-WiVRn 側の `tools/update-libsurvive-backend.sh` はこのパッチを専用コピーに適用します。
-元リポジトリのチェックアウトは変更せず、更新前に自分の管理パッチだけを外します。
-パッチが upstream に統合済みなら再適用をスキップします。
+WiVRn 側の `tools/update-libsurvive-backend.sh` は、元リポジトリを変更せず、
+コミット済みの `llfa-main` を専用コピーでビルドします。追加パッチは適用しません。
 
 別件として、ユーザーは静止時のジッターをもう少し減らしたいと報告しています。
 原因は未確定です。生の位置・向き・線速度・角速度・サンプル時刻を静止中に記録し、

@@ -1,0 +1,25 @@
+From e9a244b61addcc2209c5423315d515c0efadd922 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Wed, 28 Oct 2026 17:12:05 +0900
+Subject: [PATCH] survive: omit unsupported native diagnostic options
+
+---
+ src/xrt/drivers/survive/survive_recording.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/survive/survive_recording.cpp b/src/xrt/drivers/survive/survive_recording.cpp
+index 71b107602..09606810a 100644
+--- a/src/xrt/drivers/survive/survive_recording.cpp
++++ b/src/xrt/drivers/survive/survive_recording.cpp
+@@ -333,7 +333,7 @@ survive_recording_init_context(int argc, char **argv)
+ 		args.insert(args.end(),
+ 		            {"--configfile", config_argument, "--record", r->directory + "/native.rec.gz",
+ 		             "--record-imu", "1", "--record-cal-imu", "1", "--record-rawlight", "1", "--record-angle",
+-		             "1", "--record-pose-timing", "1", "--record-tracking-state", "1", "--report-in-imu", "1"});
++		             "1", "--report-in-imu", "1"});
+ 		settings["arguments"] = args;
+ 		std::ofstream(r->directory + "/survive-settings.json") << settings.dump(2) << '\n';
+ 		std::vector<char *> pointers;
+-- 
+2.56.0
+

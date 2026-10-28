@@ -17,8 +17,8 @@ libsurviveの記録にusbmon権限は必要ありません。
   パッチSHA-256。システム提供のlibsurvive等でソースrevisionを取得できなければnull。
   オフライン検証は不明revisionを明示的に失敗扱いにします。
 - `native.rec.gz`: 実際に利用中のコンテキストから記録したraw光学・raw/calibrated IMU・
-  pose/velocity・POSE_TIMING・POSE_STATE・POSE_BIAS・POSE_BIAS_VAR。
-  quaternionはnativeでは **wxyz**。内部診断がない旧ライブラリや空記録を成功扱いにしません。
+  pose/velocity。quaternionはnativeでは **wxyz**。現行 `~/libsurvive` はPOSE_TIMING・
+  POSE_STATE・POSE_BIAS類を出力しません。これらは過去のlibsurvive拡張で記録した項目です。
 - `poses.jsonl.gz`: Monado側の非同期キューで記録。全行が `source: libsurvive`、
   `stream: libsurvive_pose`。quaternionは **xyzw**。
   `stage` は `backend_received`（単純APIが渡した予測前の値）、`history_input`
@@ -35,7 +35,7 @@ libsurviveの記録にusbmon権限は必要ありません。
 各poseには実行中のserial・role、callbackのmonotonic時刻、座標系・参照点、位置m、
 線速度m/s、角速度rad/s、validity、要求時刻・解決時刻・実効追加予測時間を保存します。
 IMU→head、head→grip、grip→palm、要求inputのoffset、手首のpalmに対する変換と
-左右のrollも保存します。floor offsetと床補正前のIMU姿勢はnative POSE_STATEを参照します。
+左右のrollも保存します。現行libsurviveではnative floor offset・センサーtick・bias状態を取得できません。
 Monadoのworld回転はnativeの (x,y,z) → (x,z,-y) です。
 
 単純APIのイベントにはセンサーtick/Hzと独立したvelocity時刻がないため、
@@ -43,8 +43,8 @@ Monadoのworld回転はnativeの (x,y,z) → (x,z,-y) です。
 姿勢のmonotonic時刻は単純APIのepoch時刻からアダプターが変換した推定です。
 アプリ出力の実効予測時間は履歴の同じlock内で取得し、clamp=0では0になります。
 補間では追加予測0となり、過去方向への予測は負です。
-INPUT_TIMEが対応POSEより後に記録される場合もあり、行順や異なる時計の差から
-入力→描画の遅延を直接計算できません。
+現行libsurviveの記録はセンサーtick・入力受信時刻を含まないため、
+入力→描画の遅延はnative記録から直接計算できません。
 
 通常の記録をONにしてもfilterやZVU、静止判定閾値は変更しません。
 native recorderが設定ファイルを記録名から自動選択する副作用を避けるため、

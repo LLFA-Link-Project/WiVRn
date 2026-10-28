@@ -1,5 +1,11 @@
 # 較正診断の更新と固定初期値による比較 (2026-10-24)
 
+# Historical note (2026-10-28)
+
+This diagnostic option and the POSE_STATE/POSE_BIAS records described below
+belong to an older libsurvive experiment branch. Current `~/libsurvive` does not
+provide them, and WiVRn no longer passes `record-tracking-state`.
+
 後続の手持ち A/B では、[20:37 の新しい固定較正と更新版バイナリ](libsurvive-handheld-jitter-ab-20261024.md)を使う。以下はそれ以前の較正診断の記録。
 
 `~/libsurvive/docs/libsurvive-calibration-diagnostics-handoff-20261024.md` の返答を反映。
